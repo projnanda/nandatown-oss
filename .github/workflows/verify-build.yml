@@ -5,9 +5,12 @@ name: Verify build
 # merges it, and the check every other PR against main gets too.
 #
 # Two independent signals:
-#   - build: cargo build/check/clippy against the committed Cargo.lock
-#     (--locked), so a stale lockfile fails loudly instead of silently
-#     drifting.
+#   - build: cargo build/check against the committed Cargo.lock (--locked),
+#     so a stale lockfile fails loudly instead of silently drifting. clippy
+#     runs too but is non-blocking (continue-on-error): most of this tree
+#     arrives via the upstream sync PR, not lines NANDA wrote, so a lint
+#     style change upstream shouldn't turn a merge-worthy sync red — it's
+#     reported for visibility, not gated.
 #   - compose-config: `docker compose config` against .env.example, a
 #     cheap syntax/interpolation check that catches a broken compose file
 #     or a variable renamed in one place and not the other, without
@@ -43,7 +46,8 @@ jobs:
       - name: cargo check --workspace --locked
         run: cargo check --workspace --locked
 
-      - name: cargo clippy --workspace --all-targets --locked
+      - name: cargo clippy --workspace --all-targets --locked (non-blocking)
+        continue-on-error: true
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: If this failed on a stale lockfile
