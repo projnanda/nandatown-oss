@@ -1,0 +1,65 @@
+name: Verify build
+
+# Proves the repo is in a buildable, runnable state — the check the
+# sync-upstream-core PR (main <- upstream-main) relies on before a human
+# merges it, and the check every other PR against main gets too.
+#
+# Two independent signals:
+#   - build: cargo build/check/clippy against the committed Cargo.lock
+#     (--locked), so a stale lockfile fails loudly instead of silently
+#     drifting.
+#   - compose-config: `docker compose config` against .env.example, a
+#     cheap syntax/interpolation check that catches a broken compose file
+#     or a variable renamed in one place and not the other, without
+#     needing real infra or secrets.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: verify-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --workspace --locked
+        run: cargo build --workspace --locked
+
+      - name: cargo check --workspace --locked
+        run: cargo check --workspace --locked
+
+      - name: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: If this failed on a stale lockfile
+        if: failure()
+        run: |
+          echo "::error::If the failure above is 'the lock file needs to be updated', Cargo.lock is stale."
+          echo "Regenerate it after any Cargo.toml change: cargo build --workspace"
+          echo "then commit the updated Cargo.lock."
+
+  compose-config:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml against .env.example
+        run: |
+          cp .env.example .env
+          docker compose config -q
