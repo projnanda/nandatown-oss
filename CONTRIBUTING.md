@@ -1,7 +1,34 @@
-# Contributing to Nasiko
+# Contributing to Nandatown
 
 Thanks for your interest in contributing! This guide covers development setup, the build/test
 commands, and the PR flow.
+
+## Which repo does your change belong in?
+
+This repository (`projnanda/nandatown-oss`) is a **tracking fork** of
+[`Nasiko-Labs/nasiko`](https://github.com/Nasiko-Labs/nasiko), the upstream Nasiko OSS core.
+Nandatown is deployed and hosted from `main` here, and the two codebases are expected to
+diverge over time.
+
+That means there are two right answers depending on what you are changing:
+
+| Your change | Where it goes |
+| --- | --- |
+| Nandatown-specific: hosting, deployment, NANDA features and integrations | **Here.** Open a PR against `main`. |
+| Core: the agent runtime, orchestrator, server, CLI, LLM router | **Upstream**, at [`Nasiko-Labs/nasiko`](https://github.com/Nasiko-Labs/nasiko). |
+
+Please send core changes upstream. Nothing merged here flows back automatically, so a core
+fix landed only in this repo stays only in this repo — and the next upstream sync may conflict
+with it. Once it merges upstream it arrives here on its own, through the daily
+`Sync upstream core` PR.
+
+Two notes on working in this repo:
+
+- **Never commit to `upstream-main`.** It is a machine-written reflection of upstream and gets
+  fast-forwarded daily; hand-made commits on it are orphaned. All local work belongs on `main`.
+- **Prefer additive divergence.** Merge conflicts only happen where both sides edit the same
+  lines, so putting Nandatown's code in its own paths — rather than editing core files in
+  place — keeps syncs painless more or less indefinitely.
 
 ## Development Setup
 
