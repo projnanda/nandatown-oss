@@ -78,9 +78,24 @@ jobs:
           git push origin "$UP_SHA:refs/heads/$TRACKING_BRANCH"
           echo "$TRACKING_BRANCH is at ${UP_SHA:0:7}" >> "$GITHUB_STEP_SUMMARY"
 
+      # The projnanda org forbids GitHub Actions from creating pull requests, and
+      # a repo-level setting cannot override an org-level prohibition. So this
+      # step prefers SYNC_PAT when present — a PAT acts as a user rather than as
+      # Actions, which the restriction does not cover. Either fix works:
+      #
+      #   a) an org owner enables "Allow GitHub Actions to create and approve
+      #      pull requests" for projnanda, and GITHUB_TOKEN suffices; or
+      #   b) add a SYNC_PAT secret: a fine-grained PAT on THIS repository only,
+      #      with Contents + Pull requests: read and write.
+      #
+      # Note (b) still needs no credential for Nasiko-Labs — upstream is fetched
+      # anonymously — so the read-only boundary toward Nasiko is unaffected.
+      #
+      # If neither is in place the run does not fail: the tracking branch is
+      # already advanced, and the step prints a compare link to open by hand.
       - name: Open or refresh the sync PR
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
           UP_SHA: ${{ steps.fetch.outputs.sha }}
           UP_SHORT: ${{ steps.fetch.outputs.short }}
         run: |
@@ -149,9 +164,29 @@ jobs:
           file \`merge=ours\` in \`.gitattributes\`.
           EOF
 
-          gh pr create \
-            --base "${GITHUB_REF_NAME}" \
-            --head "$TRACKING_BRANCH" \
-            --title "Sync upstream core through $UP_SHORT" \
-            --body-file /tmp/pr-body.md \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          COMPARE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${GITHUB_REF_NAME}...${TRACKING_BRANCH}"
+
+          if gh pr create \
+               --base "${GITHUB_REF_NAME}" \
+               --head "$TRACKING_BRANCH" \
+               --title "Sync upstream core through $UP_SHORT" \
+               --body-file /tmp/pr-body.md \
+               | tee -a "$GITHUB_STEP_SUMMARY"; then
+            exit 0
+          fi
+
+          # Could not open it automatically — see the note above this step. The
+          # tracking branch is already at $UP_SHORT either way, so no upstream
+          # work is lost; only the PR needs a human.
+          {
+            echo "### Sync PR could not be opened automatically"
+            echo
+            echo "\`$TRACKING_BRANCH\` is advanced to upstream \`$UP_SHORT\` ($BEHIND commit(s) ahead of \`${GITHUB_REF_NAME}\`)."
+            echo "Open the merge PR by hand: [$GITHUB_REF_NAME...$TRACKING_BRANCH]($COMPARE)"
+            echo
+            echo "To automate it, either enable \"Allow GitHub Actions to create and approve"
+            echo "pull requests\" for the projnanda org, or add a \`SYNC_PAT\` secret scoped to"
+            echo "this repository with Contents + Pull requests write."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::warning::Sync PR not opened automatically; tracking branch is current. See the run summary."
