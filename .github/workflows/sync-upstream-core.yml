@@ -1,0 +1,157 @@
+name: Sync upstream core
+
+# Tracks the core from Nasiko-Labs/nasiko (public, canonical) into this repo.
+#
+# This repo is a TRACKING FORK, not a mirror. `main` is NANDA's branch: it is
+# deployed and hosted from here, and contributors raise PRs against it.
+# Upstream core arrives only through a reviewed merge PR, so local divergence
+# is never overwritten — which is why nothing here force-pushes `main`.
+#
+#     Nasiko-Labs/nasiko ──fetch──▶ upstream-main ──merge PR──▶ main
+#
+# `upstream-main` is a pure reflection of upstream, written only by this
+# workflow. Never commit to it by hand: the next run fast-forwards it and any
+# hand-made commit would be orphaned. All divergence belongs on `main`.
+#
+# Contact with Nasiko is strictly read-only. Upstream is a public repo fetched
+# anonymously, and GITHUB_TOKEN is scoped to this repository, so nothing here
+# can write to Nasiko-Labs even if it tried. No PAT is needed or wanted.
+#
+# Note that nothing flows back: a core fix authored here stays here. To get it
+# into Nasiko, raise it upstream at Nasiko-Labs/nasiko by hand.
+#
+# Upstream tags are deliberately NOT mirrored (`--no-tags`). A tag push runs
+# workflows as defined at that tag, which would re-arm the upstream
+# docker-publish workflow this repo deletes on `main`. NANDA cuts its own tags.
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # daily 07:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-core
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/Nasiko-Labs/nasiko.git
+  UPSTREAM_BRANCH: main
+  TRACKING_BRANCH: upstream-main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream and advance the tracking branch
+        id: fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+          UP_SHA="$(git rev-parse FETCH_HEAD)"
+          echo "sha=$UP_SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${UP_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+          # Fast-forward only. Upstream main is append-only in normal operation,
+          # so a non-fast-forward means upstream rewrote history — that needs a
+          # human, not an automatic overwrite of the tracking branch.
+          if git ls-remote --exit-code --heads origin "$TRACKING_BRANCH" >/dev/null 2>&1; then
+            # Explicit refspec: actions/checkout configures a narrow one, so the
+            # remote-tracking ref is not guaranteed to exist otherwise.
+            git fetch origin "+refs/heads/$TRACKING_BRANCH:refs/remotes/origin/$TRACKING_BRANCH"
+            if ! git merge-base --is-ancestor "origin/$TRACKING_BRANCH" "$UP_SHA"; then
+              echo "::error::upstream/$UPSTREAM_BRANCH ($UP_SHA) is not a descendant of $TRACKING_BRANCH. Upstream history was rewritten; reconcile by hand."
+              exit 1
+            fi
+          fi
+
+          git push origin "$UP_SHA:refs/heads/$TRACKING_BRANCH"
+          echo "$TRACKING_BRANCH is at ${UP_SHA:0:7}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or refresh the sync PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UP_SHA: ${{ steps.fetch.outputs.sha }}
+          UP_SHORT: ${{ steps.fetch.outputs.short }}
+        run: |
+          set -euo pipefail
+
+          # Same reason as above: make sure origin/<base> is actually present.
+          git fetch origin "+refs/heads/${GITHUB_REF_NAME}:refs/remotes/origin/${GITHUB_REF_NAME}"
+
+          # Already merged: the base contains upstream, nothing to propose.
+          if git merge-base --is-ancestor "$UP_SHA" "origin/${GITHUB_REF_NAME}"; then
+            echo "main already contains upstream $UP_SHORT; nothing to sync." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # An open PR from the tracking branch now points at the new head,
+          # because the branch was just advanced. Refreshing it is enough.
+          EXISTING="$(gh pr list --base "${GITHUB_REF_NAME}" --head "$TRACKING_BRANCH" \
+                        --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING is open and now carries upstream $UP_SHORT." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          BEHIND="$(git rev-list --count "origin/${GITHUB_REF_NAME}..$UP_SHA")"
+
+          cat > /tmp/pr-body.md <<EOF
+          Brings the core forward to upstream \`$UP_SHORT\` from
+          [Nasiko-Labs/nasiko](https://github.com/Nasiko-Labs/nasiko) —
+          **$BEHIND commit(s)** not yet on \`main\`.
+
+          Opened automatically by \`sync-upstream-core.yml\`.
+
+          ### Merging this
+
+          Use a **merge commit**, not squash or rebase. Git records the merge
+          base, so each later sync only reconciles what is genuinely new;
+          squashing discards that and makes every future sync re-litigate the
+          entire divergence.
+
+          ### If there are conflicts
+
+          Conflicts mean upstream and NANDA touched the same lines. Resolve in
+          favour of intent, not of a side:
+
+          - The four upstream-only workflows (\`notify-private\`,
+            \`deploy-oss-demo\`, \`docker-publish\`, \`star-chart\`) are deleted
+            here on purpose. If upstream edits one, keep it **deleted**.
+          - Deployment and hosting config is NANDA's. Keep ours.
+          - Core logic is upstream's. Prefer theirs unless NANDA changed it
+            deliberately.
+
+          Resolving locally:
+
+          \`\`\`sh
+          git fetch origin
+          git switch main && git pull
+          git merge origin/$TRACKING_BRANCH
+          # resolve, then
+          git push
+          \`\`\`
+
+          Conflicts that recur every sync are a signal to make the divergence
+          additive instead — move NANDA's version into its own path, or mark the
+          file \`merge=ours\` in \`.gitattributes\`.
+          EOF
+
+          gh pr create \
+            --base "${GITHUB_REF_NAME}" \
+            --head "$TRACKING_BRANCH" \
+            --title "Sync upstream core through $UP_SHORT" \
+            --body-file /tmp/pr-body.md \
+            | tee -a "$GITHUB_STEP_SUMMARY"
