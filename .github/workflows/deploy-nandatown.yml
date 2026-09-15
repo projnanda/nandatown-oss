@@ -1,0 +1,60 @@
+name: Deploy nandatown-oss demo (nandatown.dev)
+
+# Redeploys the public demo on every push to main: rsync the checked-out tree
+# to the demo VM and rebuild+restart the server via docker compose.
+#
+# Unlike Nasiko's oss.nasiko.dev deploy (which has the VM `git fetch` a
+# *public* repo), this repo is private, so the VM has no git credential for
+# it at all. Instead CI — which already has an authenticated checkout —
+# pushes the tree over rsync/ssh. `.env`, `Caddyfile`, and
+# `docker-compose.override.yml` live only on the VM and are never touched
+# here (rsync excludes them explicitly, on top of not existing in git).
+#
+# Requires repo secrets DEPLOY_SSH_PRIVATE_KEY and DEPLOY_HOST.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-nandatown
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure deploy SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync tree to the demo VM
+        run: |
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key" \
+            --exclude='.git' \
+            --exclude='.env' \
+            --exclude='Caddyfile' \
+            --exclude='docker-compose.override.yml' \
+            ./ deploy@${{ secrets.DEPLOY_HOST }}:~/nandatown-oss/
+
+      - name: Rebuild and restart the server
+        run: |
+          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.DEPLOY_HOST }} '
+            set -e
+            cd ~/nandatown-oss
+            docker compose up -d --build server
+          '
+
+      - name: Smoke test
+        run: |
+          sleep 5
+          curl -fsS "http://${{ secrets.DEPLOY_HOST }}:80/health" || \
+          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.DEPLOY_HOST }} 'docker compose -f ~/nandatown-oss/docker-compose.yml -f ~/nandatown-oss/docker-compose.override.yml exec -T server true && curl -fsS http://localhost:8080/health'
