@@ -34,7 +34,7 @@
 
 /* 1. Design Tokens (The API)
  *
- * Source of truth: Nasiko UI Design System (yellow palette, ink neutrals,
+ * Source of truth: Nandatown UI Design System (yellow palette, ink neutrals,
  * Chivo Mono display + Inter body). DS tokens (--bg-, --fg-, --border-,
  * --s-, --r-) are canonical; the legacy --color- / --space- / --radius-
  * names below are aliases kept so existing component CSS re-skins unchanged.
@@ -48,53 +48,56 @@
 
   /* ==== Raw palette ==== */
   --white: #FFFFFF;
-  --black: #000000;
+  --black: #141312; /* Nandatown ink, not pure black — see --sand-900 below */
 
-  /* Ink neutral ramp — same hue family as --shell-bg (#242628) at ~5%
+  /* Ink neutral ramp — same hue family as --shell-bg (#141312) at ~5%
      saturation, NOT Tailwind Slate (~33% saturation on a blue hue). Dark
      surfaces come from light-dark(sand-*, neutral-*), so the old Slate values
      gave the whole dark theme a blue cast that clashed with the always-ink
-     chrome. Two deliberate relationships: --neutral-800 (#2B2D30, the dark
+     chrome. Two deliberate relationships: --neutral-800 (#302D2B, the dark
      content surface) is slightly LIGHTER than the ink shell so the content
      plane floats above the chrome exactly as the white plane does in light
-     theme, while --neutral-900 (#1A1C1E) is darker than the ink and serves as
+     theme, while --neutral-900 (#1E1C1A) is darker than the ink and serves as
      the recessed card/well surface sitting inside that plane. */
-  --neutral-50:  #F7F8F9;
-  --neutral-100: #EEF0F2;
-  --neutral-200: #DFE2E5;
-  --neutral-300: #C3C7CB;
-  /* Lightened from #90949A: muted text on the dark plane measured 4.53:1
-     (AA with no headroom); this restores 5.24:1 at the same hue. */
-  --neutral-400: #9BA0A6;
-  --neutral-500: #6B6E72;
-  --neutral-600: #4F5255;
-  --neutral-700: #3A3D40;
-  --neutral-800: #2B2D30;
-  --neutral-900: #1A1C1E;
+  --neutral-50:  #F9F8F7;
+  --neutral-100: #F2F0EE;
+  --neutral-200: #E5E2DF;
+  --neutral-300: #CBC7C3;
+  /* Lightened from #90949A originally: muted text on the dark plane measured
+     4.53:1 (AA with no headroom); this restores 5.24:1 at the same lightness. */
+  --neutral-400: #A6A09B;
+  --neutral-500: #726E6B;
+  --neutral-600: #55524F;
+  --neutral-700: #403D3A;
+  --neutral-800: #302D2B;
+  --neutral-900: #1E1C1A;
 
-  --yellow-50:  #FDF7E6;
-  --yellow-100: #FBF0CE;
-  --yellow-200: #F7E19C;
-  --yellow-300: #F2D16B;
-  --yellow-400: #EEC239;
-  --yellow-500: #EAB308;
-  --yellow-600: #BB8F06;
-  --yellow-700: #8C6B05;
-  --yellow-800: #695104;
-  --yellow-900: #463602;
+  /* Brand gold ramp — anchored on Nandatown's #FFD100 at -500, same hue/sat
+     throughout, lightness only varies. */
+  --yellow-50:  #FFFAE4;
+  --yellow-100: #FFF5CA;
+  --yellow-200: #FFEC94;
+  --yellow-300: #FFE25E;
+  --yellow-400: #FFD828;
+  --yellow-500: #FFD100;
+  --yellow-600: #C19E00;
+  --yellow-700: #917700;
+  --yellow-800: #6D5900;
+  --yellow-900: #483B00;
 
-  /* Warm sand ramp — NightOwl neutral scale (fig-tokens); the content plane,
-     cards, inputs, and table chrome all read from this ramp */
-  --sand-50:  #F5F2EC;
-  --sand-100: #EDE7DC;
-  --sand-200: #E2DAD0;
-  --sand-300: #D4CCC0;
-  --sand-400: #C2BAB0;
-  --sand-500: #A89E94;
-  --sand-600: #8C8278;
-  --sand-700: #645C52;
-  --sand-800: #3A3430;
-  --sand-900: #242628;
+  /* Warm sand ramp — blends Nandatown's cream (#F2EDE3, -50) into its ink
+     (#141312, -900); the content plane, cards, inputs, and table chrome all
+     read from this ramp */
+  --sand-50:  #F2EDE3;
+  --sand-100: #E9E1D2;
+  --sand-200: #E1D6C3;
+  --sand-300: #D4C7AF;
+  --sand-400: #C6B599;
+  --sand-500: #AD9879;
+  --sand-600: #8C795E;
+  --sand-700: #564C41;
+  --sand-800: #262320;
+  --sand-900: #141312;
 
   /* Legacy warm cream canvas ramp — superseded by --sand-*, kept as aliases */
   --cream-50:  var(--sand-50);
@@ -110,23 +113,23 @@
   --teal-400:   #2DD4BF; --teal-500:   #14B8A6;
   --green-100:  #DCFCE7; --green-300:  #86EFAC; --green-400:  #4ADE80; --green-600:  #16A34A; --green-900:  #14532D;
 
-  /* ==== NightOwl shell chrome (ink plane — not theme-switched) ==== */
-  --shell-bg:             #242628; /* flat ink: topbar + rail + backdrop */
-  --shell-control:        #3A3430; /* dark-chrome control fill (rest) */
-  --shell-control-hover:  #4A423C;
-  --shell-control-active: #242628;
+  /* ==== Nandatown shell chrome (ink plane — not theme-switched) ==== */
+  --shell-bg:             #141312; /* flat ink: topbar + rail + backdrop */
+  --shell-control:        #3A3530; /* dark-chrome control fill (rest) */
+  --shell-control-hover:  #4A433C;
+  --shell-control-active: #141312;
   --shell-fg:             #FFFFFF;
-  /* sand-500, not white@62%: the ink plane is warm (#242628 family), and a cool
+  /* sand-500, not white@62%: the ink plane is warm (#141312 family), and a cool
      grey glyph read as a different palette beside the gold selected state. */
   --shell-fg-muted:       var(--sand-500);
-  --shell-selected:       var(--yellow-200); /* pale-gold selected fill #F7E19C */
+  --shell-selected:       var(--yellow-200); /* pale-gold selected fill #FFEC94 */
   --shell-topbar-height:  52px;
   /* The rail is the 32px button column only. It floats inside --shell-gutter on
      both sides, so the card's left edge lands at 12 + 32 + 12 = 56. */
   --shell-gutter:         var(--s-12);
   --shell-rail-width:     32px;
   --shell-rail-expanded:  200px;
-  --shell-logo-glow:      drop-shadow(0 4px 16px rgba(247, 225, 156, 0.16));
+  --shell-logo-glow:      drop-shadow(0 4px 16px rgba(255, 236, 148, 0.16));
 
   /* ==== Control metrics (fig-tokens control-*) ==== */
   --control-h-sm: 28px;

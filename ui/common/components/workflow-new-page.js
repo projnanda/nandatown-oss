@@ -51,7 +51,7 @@ class WorkflowNewPage extends HTMLElement {
             <span class="count-pill" id="step-count">1 step</span>
             <span class="spacer"></span>
             <span class="drafted-note" id="drafted-note" hidden>
-              ${icons.sparkles('', 12)} Drafted by Nasiko — edit anything below</span>
+              ${icons.sparkles('', 12)} Drafted by Nandatown — edit anything below</span>
           </div>
           <div class="drafting" id="drafting" hidden>
             <div class="drafting-line">
@@ -171,7 +171,7 @@ class WorkflowNewPage extends HTMLElement {
         <a href="/agents.html">Deploy an agent</a> first, then draft steps.`;
     }
     if (err.status === 422) {
-      return `Nasiko couldn't draft steps from that description — try rephrasing it,
+      return `Nandatown couldn't draft steps from that description — try rephrasing it,
         or add the steps manually below.`;
     }
     return `Drafting failed: ${this.#esc(err.message)}`;

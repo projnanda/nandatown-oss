@@ -32,7 +32,7 @@ copying files — `common/` has exactly one copy in the repo.
 | `common/services/sse.js` | `connectSSE()` helper wrapping `EventSource` |
 | `common/utils/*.js` | `toast.js` (ephemeral feedback), `theme.js` (light/dark/system, persisted), `icons.js` (central SVG icon library), plus markdown, date, keyboard-shortcut, and async-button helpers |
 | `common/vendor/*.esm.js` | Vendored single-file ESM builds of third-party libraries (see `common/vendor/README.md`) — committed directly since there's no package manager at runtime; never hand-edit, replace wholesale on upgrade |
-| `common/fonts/`, `common/mark-nasiko.svg` | Vendored webfonts and the mark referenced by `global.css` / favicons |
+| `common/fonts/`, `common/mark-nandatown.svg` | Vendored webfonts and the mark referenced by `global.css` / favicons |
 | `web/*.html` | One page per file, each a real URL — no client-side router |
 | `web/<pagename>.preview.js`, `web/.preview/` | Preview-only fixtures (see below) — never referenced by production pages |
 

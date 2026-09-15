@@ -56,7 +56,7 @@ class McpDetailPage extends HTMLElement {
       this.innerHTML = '<p style="color:var(--color-error);padding:var(--space-xl);">Connector not found</p>';
       return;
     }
-    document.title = 'Nasiko - ' + (this.#connector.display_name || this.#connector.name);
+    document.title = 'Nandatown - ' + (this.#connector.display_name || this.#connector.name);
     await this.#loadTools();
     this.#loadAgents();
     this.#render();

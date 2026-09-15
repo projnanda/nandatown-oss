@@ -23,7 +23,7 @@ class SessionTracePage extends HTMLElement {
       this.innerHTML = `<div class="empty-state">No trace ID specified.</div>`;
       return;
     }
-    document.title = `Nasiko — Trace ${traceId.slice(0, 12)}`;
+    document.title = `Nandatown — Trace ${traceId.slice(0, 12)}`;
     this.#redirect(traceId);
   }
 

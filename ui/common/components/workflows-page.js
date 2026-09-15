@@ -154,7 +154,7 @@ class WorkflowsPage extends HTMLElement {
           <span class="empty-tile">${icons.workflow('', 32)}</span>
           <h2 class="empty-title">No workflows yet</h2>
           <p class="empty-sub">Chain agents into a repeatable sequence. Describe what you want to
-            automate and Nasiko drafts the steps for you.</p>
+            automate and Nandatown drafts the steps for you.</p>
           <div class="empty-pills">
             <span class="process-pill">${icons.editThin('', 12)} Describe</span>
             ${icons.chevronRight('empty-arrow', 12)}

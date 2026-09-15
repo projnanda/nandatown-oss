@@ -94,7 +94,7 @@ class AgentCardPage extends HTMLElement {
     this.#secretsLoaded = false;
     this.#accessLoaded = false;
     this.#configureLoaded = false;
-    document.title = `Nasiko — ${this.#agent.display_name || this.#agent.name}`;
+    document.title = `Nandatown — ${this.#agent.display_name || this.#agent.name}`;
     this.#render();
   }
 
@@ -1360,7 +1360,7 @@ class AgentCardPage extends HTMLElement {
               <label class="acp-field">
                 <span class="acp-field-label">Display name</span>
                 <input type="text" id="acp-display-name" value="${this.#escAttr(a.display_name || a.name)}" maxlength="120" />
-                <span class="acp-field-hint">Shown wherever this agent appears in Nasiko.</span>
+                <span class="acp-field-hint">Shown wherever this agent appears in Nandatown.</span>
               </label>
               <label class="acp-field">
                 <span class="acp-field-label">Description</span>
@@ -1425,7 +1425,7 @@ class AgentCardPage extends HTMLElement {
     }
     this.#agent.display_name = displayName;
     this.#agent.description = description;
-    document.title = `Nasiko — ${displayName}`;
+    document.title = `Nandatown — ${displayName}`;
     const h1 = this.querySelector('.acp-name');
     if (h1) h1.textContent = displayName;
     showToast('Agent details saved');

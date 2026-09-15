@@ -47,7 +47,7 @@ class AgentDetailPage extends HTMLElement {
       this.innerHTML = '<p style="color:var(--color-error);">Agent not found.</p>';
       return;
     }
-    document.title = `Nasiko — ${this.#agent.display_name || this.#agent.name}`;
+    document.title = `Nandatown — ${this.#agent.display_name || this.#agent.name}`;
     this.#render();
   }
 

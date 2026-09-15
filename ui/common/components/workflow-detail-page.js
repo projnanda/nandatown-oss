@@ -81,7 +81,7 @@ class WorkflowDetailPage extends HTMLElement {
       ]);
       this.#workflow = workflow;
       this.#executions = executions;
-      document.title = `Nasiko — ${workflow.name}`;
+      document.title = `Nandatown — ${workflow.name}`;
     } catch {
       this.innerHTML = `
         <div class="col">

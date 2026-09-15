@@ -50,7 +50,7 @@ class FlowDetailPage extends HTMLElement {
     const flow = data.flow || data;
     const steps = data.steps || [];
 
-    document.title = `Nasiko — Flow ${flow.flow_id.slice(0, 12)}`;
+    document.title = `Nandatown — Flow ${flow.flow_id.slice(0, 12)}`;
     const variant = STATUS_VARIANTS[flow.status] || 'neutral';
     const duration = flow.duration_ms != null
       ? (flow.duration_ms < 1000 ? `${flow.duration_ms}ms` : `${(flow.duration_ms / 1000).toFixed(1)}s`)

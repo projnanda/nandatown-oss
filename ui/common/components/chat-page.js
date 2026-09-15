@@ -35,7 +35,7 @@ class ChatPage extends HTMLElement {
     this.#contextId = params.get("context_id");
     this.#agentLabel = params.get("agent_name") || "Agent";
 
-    if (this.#agentId) document.title = `Nasiko — Chat with ${this.#agentLabel}`;
+    if (this.#agentId) document.title = `Nandatown — Chat with ${this.#agentLabel}`;
 
     // chat.html is not in the nav, so the rail has no way to work out which
     // module it belongs to — without this, opening a session leaves the rail

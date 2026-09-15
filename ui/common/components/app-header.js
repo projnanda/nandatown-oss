@@ -599,7 +599,7 @@ export class AppHeader extends HTMLElement {
       <header class="topbar" role="banner">
         ${window.nasikoChrome?.workspaceSwitcher
           ? `<workspace-switcher></workspace-switcher>`
-          : `<span class="identity-chip" title="${this.#esc(currentUser || "Nasiko")}">${this.#esc(this.#initials())}</span>`}
+          : `<span class="identity-chip" title="${this.#esc(currentUser || "Nandatown")}">${this.#esc(this.#initials())}</span>`}
         <button class="chrome-btn" data-rail-toggle aria-label="Toggle sidebar" type="button">
           ${icons.panelLeft("", 16, 1)}
         </button>

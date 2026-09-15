@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/nasiko-banner.png" alt="Nasiko" width="100%" />
+  <img src="docs/assets/nandatown-banner.png" alt="Nandatown" width="100%" />
 </p>
 
 <p align="center">

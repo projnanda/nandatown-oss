@@ -68,7 +68,7 @@ class BuildDetailPage extends HTMLElement {
     }
 
     const shortId = String(build.id).slice(0, 8);
-    document.title = `Nasiko — Build #${shortId}`;
+    document.title = `Nandatown — Build #${shortId}`;
     const variant = STATUS_VARIANTS[build.status] || 'neutral';
     const fmtTs = (v) => v ? new Date(v).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
 
