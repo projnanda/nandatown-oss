@@ -12,30 +12,30 @@
   &nbsp;•&nbsp;
   <a href="https://discord.com/invite/HmnfkTfjFv"><b>💬 Discord</b></a>
   &nbsp;•&nbsp;
-  <a href="https://github.com/Nasiko-Labs/nasiko/issues"><b>🐛 Report a bug</b></a>
+  <a href="https://github.com/projnanda/nandatown-oss/issues"><b>🐛 Report a bug</b></a>
 </p>
 
 <!-- Shieldcn badges: badge groups + colored single badges, tuned for both GitHub color schemes -->
 <p align="center">
-  <a href="https://github.com/Nasiko-Labs/nasiko/stargazers">
+  <a href="https://github.com/projnanda/nandatown-oss/stargazers">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/stars/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=amber&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/stars/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=amber&font=geist-mono" alt="GitHub stars" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=amber&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=amber&font=geist-mono" alt="GitHub stars" />
     </picture>
   </a>
-  <a href="https://github.com/Nasiko-Labs/nasiko/network/members">
+  <a href="https://github.com/projnanda/nandatown-oss/network/members">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/forks/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=blue&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/forks/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=blue&font=geist-mono" alt="GitHub forks" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/forks/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=blue&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/forks/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=blue&font=geist-mono" alt="GitHub forks" />
     </picture>
   </a>
-  <a href="https://github.com/Nasiko-Labs/nasiko/releases">
+  <a href="https://github.com/projnanda/nandatown-oss/releases">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/release/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=violet&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/release/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=violet&font=geist-mono" alt="Latest release" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/release/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=violet&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/release/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=violet&font=geist-mono" alt="Latest release" />
     </picture>
   </a>
-  <a href="https://github.com/Nasiko-Labs/nasiko/blob/main/LICENSE">
+  <a href="https://github.com/projnanda/nandatown-oss/blob/main/LICENSE">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/License-Apache_2.0-red.svg?mode=dark&font=geist-mono" />
       <img src="https://shieldcn.dev/badge/License-Apache_2.0-red.svg?mode=light&font=geist-mono" alt="License: Apache-2.0" />
@@ -43,31 +43,31 @@
   </a>
 </p>
 <p align="center">
-  <a href="https://github.com/Nasiko-Labs/nasiko">
+  <a href="https://github.com/projnanda/nandatown-oss">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/Language-Rust-orange.svg?logo=rust&mode=dark&font=geist-mono" />
       <img src="https://shieldcn.dev/badge/Language-Rust-orange.svg?logo=rust&mode=light&font=geist-mono" alt="Built with Rust" />
     </picture>
   </a>
-  <a href="https://github.com/Nasiko-Labs/nasiko/issues">
+  <a href="https://github.com/projnanda/nandatown-oss/issues">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/issues/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=cyan&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/issues/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=cyan&font=geist-mono" alt="Open issues" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/issues/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=cyan&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/issues/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=cyan&font=geist-mono" alt="Open issues" />
     </picture>
   </a>
-  <a href="https://github.com/Nasiko-Labs/nasiko/pulls">
+  <a href="https://github.com/projnanda/nandatown-oss/pulls">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/prs/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=green&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/prs/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=green&font=geist-mono" alt="Pull requests" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=green&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=green&font=geist-mono" alt="Pull requests" />
     </picture>
   </a>
-  <a href="https://github.com/Nasiko-Labs/nasiko">
+  <a href="https://github.com/projnanda/nandatown-oss">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=purple&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/ci/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=purple&font=geist-mono" alt="CI" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=purple&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/ci/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=purple&font=geist-mono" alt="CI" />
     </picture>
   </a>
-  <a href="https://github.com/Nasiko-Labs/nasiko/pulls">
+  <a href="https://github.com/projnanda/nandatown-oss/pulls">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/PRs-Welcome-pink.svg?mode=dark&font=geist-mono" />
       <img src="https://shieldcn.dev/badge/PRs-Welcome-pink.svg?mode=light&font=geist-mono" alt="PRs Welcome" />
@@ -77,7 +77,7 @@
 
 ## Table of Contents
 
-- [What is Nasiko?](#what-is-nasiko)
+- [What is Nandatown?](#what-is-nandatown)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Requirements](#requirements)
@@ -93,12 +93,12 @@
 - [Contributing](#contributing)
 - [License](#license)
 
-## What is Nasiko?
+## What is Nandatown?
 
 Running more than a couple of agents quickly turns into an operations problem: *who calls whom*,
 *which key does each agent hold*, *what did that call cost*, *why did it fail?*
 
-Nasiko is a **single control-plane process** that sits in front of every agent and answers all of that.
+Nandatown is a **single control-plane process** that sits in front of every agent and answers all of that.
 It terminates TLS, authenticates every request, and proxies all agent-to-agent traffic itself, so agents
 are **never publicly reachable** — every hop is a checkpoint for rate limits, ACLs, and tracing.
 
@@ -106,9 +106,9 @@ are **never publicly reachable** — every hop is a checkpoint for rate limits, 
 No proprietary agent format, no lock-in.
 
 <p align="center">
-  <img src="docs/assets/ui-dashboard.png" alt="Nasiko Dashboard" width="900" />
+  <img src="docs/assets/ui-dashboard.png" alt="Nandatown Dashboard" width="900" />
   <br />
-  <sub><b>Nasiko Dashboard</b> — deploy agents, route traffic, manage tools, and watch traces.</sub>
+  <sub><b>Nandatown Dashboard</b> — deploy agents, route traffic, manage tools, and watch traces.</sub>
 </p>
 
 ## Features
@@ -128,7 +128,7 @@ No proprietary agent format, no lock-in.
 | **CLI-first, no lock-in** | `nasiko new`, `run`, `chat`, `deploy`. Bring your own LLM provider. |
 ## Architecture
 
-Nasiko is a **single process** — there is no separate gateway. Every inter-agent call is proxied back
+Nandatown is a **single process** — there is no separate gateway. Every inter-agent call is proxied back
 through the server, the single chokepoint where flow limits, ACLs, and observability are enforced.
 Durable state lives in **Postgres**, **Redis**, and **S3** (RustFS), with optional observability via
 **Tempo / Loki / the OTel Collector**.
@@ -213,20 +213,20 @@ flowchart LR
 |---|---|---|
 | **Docker Engine + Compose V2** | Compose V2 plugin (the `docker compose` command — not the legacy standalone `docker-compose` v1 binary) | `docker-compose.yml` uses the extended `depends_on: condition: service_healthy` syntax; the Docker-only path needs nothing else. |
 | **Rust** | 1.85+ (stable) | The workspace targets `edition = "2024"` (see [`Cargo.toml`](Cargo.toml)), stabilized in Rust 1.85 — only needed for the CLI / Path B developer setup, not the Docker-only path. |
-| **A2A protocol** | Spec **v1.0** exactly (latest upstream release: v1.0.1, Linux Foundation) | Nasiko requires and hardcodes the `A2A-Version: 1.0` header on every request; agents on older/pre-1.0 spec versions (e.g. 0.2.x, 0.3.0) are rejected with `-32009 VersionNotSupported` (see [`docs/A2A_PROTOCOL.md`](docs/A2A_PROTOCOL.md)). Any agent speaking v1.0 works, regardless of its implementation language. |
+| **A2A protocol** | Spec **v1.0** exactly (latest upstream release: v1.0.1, Linux Foundation) | Nandatown requires and hardcodes the `A2A-Version: 1.0` header on every request; agents on older/pre-1.0 spec versions (e.g. 0.2.x, 0.3.0) are rejected with `-32009 VersionNotSupported` (see [`docs/A2A_PROTOCOL.md`](docs/A2A_PROTOCOL.md)). Any agent speaking v1.0 works, regardless of its implementation language. |
 
 ---
 
 ## Quick Start — Docker only (no Rust needed)
 
-The fastest way to run Nasiko requires **only [Docker](https://docs.docker.com/get-docker/)** (with Compose).
+The fastest way to run Nandatown requires **only [Docker](https://docs.docker.com/get-docker/)** (with Compose).
 The server builds itself from source inside Docker.
 
 ### 1. Clone and configure
 
 ```sh
-git clone https://github.com/Nasiko-Labs/nasiko.git
-cd nasiko
+git clone https://github.com/projnanda/nandatown-oss.git
+cd nandatown-oss
 cp .env.example .env
 ```
 
@@ -273,8 +273,8 @@ You have **two supported paths**:
 2. Open Docker Desktop and wait until the engine is running.
 3. In a terminal (PowerShell or Git Bash):
    ```powershell
-   git clone https://github.com/Nasiko-Labs/nasiko.git
-   cd nasiko
+   git clone https://github.com/projnanda/nandatown-oss.git
+   cd nandatown-oss
    Copy-Item .env.example .env
    # edit .env -> set OPENAI_API_KEY and ADMIN_PASSWORD
    docker compose up -d
@@ -292,8 +292,8 @@ You have **two supported paths**:
 2. Open Docker Desktop until the engine is running.
 3. In Terminal:
    ```sh
-   git clone https://github.com/Nasiko-Labs/nasiko.git
-   cd nasiko
+   git clone https://github.com/projnanda/nandatown-oss.git
+   cd nandatown-oss
    cp .env.example .env
    # edit .env -> set OPENAI_API_KEY and ADMIN_PASSWORD
    docker compose up -d
@@ -315,8 +315,8 @@ You have **two supported paths**:
    ```
 3. In a terminal:
    ```sh
-   git clone https://github.com/Nasiko-Labs/nasiko.git
-   cd nasiko
+   git clone https://github.com/projnanda/nandatown-oss.git
+   cd nandatown-oss
    cp .env.example .env
    # edit .env -> set OPENAI_API_KEY and ADMIN_PASSWORD
    docker compose up -d
@@ -534,7 +534,7 @@ docs/           Design docs (architecture, protocol, conventions)
 
 ## Troubleshooting
 
-### Quick fixes: one command
+### Quick fixes - one command
 
 | Problem | One command |
 |---|---|
@@ -599,8 +599,8 @@ docs/           Design docs (architecture, protocol, conventions)
         </picture>
       </td>
       <td align="center" valign="middle" style="padding:8px 16px">
-        <a href="https://github.com/Nasiko-Labs/nasiko/issues">
-          <img src="https://shieldcn.dev/chart/github/issues/Nasiko-Labs/nasiko.svg?theme=blue&width=520&height=220&border=true" alt="Issues over time" />
+        <a href="https://github.com/projnanda/nandatown-oss/issues">
+          <img src="https://shieldcn.dev/chart/github/issues/projnanda/nandatown-oss.svg?theme=blue&width=520&height=220&border=true" alt="Issues over time" />
         </a>
       </td>
     </tr>
@@ -610,24 +610,24 @@ docs/           Design docs (architecture, protocol, conventions)
 <br/>
 
 <div align="center">
-  <a href="https://github.com/Nasiko-Labs/nasiko/stargazers">
+  <a href="https://github.com/projnanda/nandatown-oss/stargazers">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/stars/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=red&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/stars/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=red&font=geist-mono" alt="GitHub stars" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=red&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=red&font=geist-mono" alt="GitHub stars" />
     </picture>
   </a>
   &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/Nasiko-Labs/nasiko/commits">
+  <a href="https://github.com/projnanda/nandatown-oss/commits">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/commits/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=amber&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/commits/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=amber&font=geist-mono" alt="Total commits" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/commits/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=amber&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/commits/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=amber&font=geist-mono" alt="Total commits" />
     </picture>
   </a>
   &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/Nasiko-Labs/nasiko/pulls">
+  <a href="https://github.com/projnanda/nandatown-oss/pulls">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/prs/Nasiko-Labs/nasiko.svg?variant=secondary&mode=dark&theme=violet&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/prs/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=violet&font=geist-mono" alt="Pull requests" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=violet&font=geist-mono" />
+      <img src="https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=violet&font=geist-mono" alt="Pull requests" />
     </picture>
   </a>
 </div>
@@ -658,5 +658,5 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, code conventions, and 
 **Apache-2.0** — see [`LICENSE`](LICENSE).
 
 <p align="center">
-  <sub>Built with love by the Nasiko team. Stars, issues, and PRs are always welcome.</sub>
+  <sub>Built with love by the Nandatown team. Stars, issues, and PRs are always welcome.</sub>
 </p>
