@@ -14,8 +14,14 @@ name: Sync upstream core
 # hand-made commit would be orphaned. All divergence belongs on `main`.
 #
 # Contact with Nasiko is strictly read-only. Upstream is a public repo fetched
-# anonymously, and GITHUB_TOKEN is scoped to this repository, so nothing here
-# can write to Nasiko-Labs even if it tried. No PAT is needed or wanted.
+# anonymously, so nothing here can write to Nasiko-Labs even if it tried.
+#
+# Pushing the tracking branch back to THIS repo, however, needs a PAT
+# (SYNC_PAT) whenever upstream's history touches files under
+# .github/workflows/ — a GitHub App token (GITHUB_TOKEN) is categorically
+# forbidden from writing workflow files, even with `contents: write`. See the
+# note above the "Open or refresh the sync PR" step for how to provision it;
+# the same secret covers both steps.
 #
 # Note that nothing flows back: a core fix authored here stays here. To get it
 # into Nasiko, raise it upstream at Nasiko-Labs/nasiko by hand.
@@ -53,6 +59,11 @@ jobs:
 
       - name: Fetch upstream and advance the tracking branch
         id: fetch
+        env:
+          # Falls back to GITHUB_TOKEN when no PAT is configured — same
+          # push-fails-on-workflow-files behaviour as before until SYNC_PAT is
+          # added. See the note above the "Open or refresh the sync PR" step.
+          SYNC_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           git remote add upstream "$UPSTREAM_REPO"
@@ -75,24 +86,47 @@ jobs:
             fi
           fi
 
-          git push origin "$UP_SHA:refs/heads/$TRACKING_BRANCH"
+          # Push via an explicit authenticated URL rather than the "origin"
+          # remote: actions/checkout wires an Authorization header into
+          # http.https://github.com/.extraheader for GITHUB_TOKEN, scoped to
+          # the https://github.com/ prefix — so it silently applies to this
+          # push too and overrides the URL-embedded credential unless
+          # cleared. -c scopes the override to this one invocation only.
+          git -c http.https://github.com/.extraheader= \
+            push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$UP_SHA:refs/heads/$TRACKING_BRANCH"
           echo "$TRACKING_BRANCH is at ${UP_SHA:0:7}" >> "$GITHUB_STEP_SUMMARY"
 
-      # The projnanda org forbids GitHub Actions from creating pull requests, and
-      # a repo-level setting cannot override an org-level prohibition. So this
-      # step prefers SYNC_PAT when present — a PAT acts as a user rather than as
-      # Actions, which the restriction does not cover. Either fix works:
+      # This step (PR creation) and the previous one (pushing upstream-main)
+      # both prefer SYNC_PAT when present, for two separate reasons:
+      #
+      #   - Pushing upstream-main fails under plain GITHUB_TOKEN whenever
+      #     upstream's history touches .github/workflows/* — a GitHub App
+      #     token is categorically forbidden from writing workflow files,
+      #     regardless of the `contents: write` permission above.
+      #   - The projnanda org forbids GitHub Actions from creating pull
+      #     requests, and a repo-level setting cannot override an org-level
+      #     prohibition.
+      #
+      # A PAT acts as a user rather than as Actions, which sidesteps both
+      # restrictions. Either fix works for the PR-creation half; only the PAT
+      # fixes the workflow-file push:
       #
       #   a) an org owner enables "Allow GitHub Actions to create and approve
-      #      pull requests" for projnanda, and GITHUB_TOKEN suffices; or
+      #      pull requests" for projnanda — covers PR creation only; or
       #   b) add a SYNC_PAT secret: a fine-grained PAT on THIS repository only,
-      #      with Contents + Pull requests: read and write.
+      #      with Contents + Pull requests: read and write — covers both.
       #
       # Note (b) still needs no credential for Nasiko-Labs — upstream is fetched
       # anonymously — so the read-only boundary toward Nasiko is unaffected.
       #
-      # If neither is in place the run does not fail: the tracking branch is
-      # already advanced, and the step prints a compare link to open by hand.
+      # If no PAT is in place, pushing upstream-main now fails outright
+      # whenever it touches workflow files (see previous step) — it no longer
+      # silently falls through to here. When it does succeed without a PAT
+      # (no workflow-file changes in this batch), this step's own fallback
+      # still applies: PR creation may fail, but the run does not; the
+      # tracking branch is already advanced, and this step prints a compare
+      # link to open by hand.
       - name: Open or refresh the sync PR
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
