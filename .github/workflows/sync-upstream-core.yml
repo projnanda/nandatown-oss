@@ -87,9 +87,13 @@ jobs:
           fi
 
           # Push via an explicit authenticated URL rather than the "origin"
-          # remote: actions/checkout wires "origin" to GITHUB_TOKEN through
-          # http.extraheader, which SYNC_TOKEN must override when it's a PAT.
-          git push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+          # remote: actions/checkout wires an Authorization header into
+          # http.https://github.com/.extraheader for GITHUB_TOKEN, scoped to
+          # the https://github.com/ prefix — so it silently applies to this
+          # push too and overrides the URL-embedded credential unless
+          # cleared. -c scopes the override to this one invocation only.
+          git -c http.https://github.com/.extraheader= \
+            push "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "$UP_SHA:refs/heads/$TRACKING_BRANCH"
           echo "$TRACKING_BRANCH is at ${UP_SHA:0:7}" >> "$GITHUB_STEP_SUMMARY"
 
