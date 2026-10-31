@@ -67,7 +67,7 @@ test('Harnesses and the status page', async ({ page }) => {
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible()
   await expectAccessible(page)
   // `/status`, not `/`: `backend-state` is rendered by the status route
-  // (common/src/routes/_app/status.tsx) and exists nowhere else, so this
+  // (shared/app-shell/src/routes/_app/status.tsx) and exists nowhere else, so this
   // waited 20s on the Overview page for an element that was never coming.
   await page.goto('/status')
   await expect(page.getByTestId('backend-state')).toHaveText('connected')

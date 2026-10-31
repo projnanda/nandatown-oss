@@ -4,13 +4,15 @@
 //! properties that must hold before any of it is wired into a request path: nothing grows, and
 //! nothing is classified as something it is not.
 
-use nasiko_compress::{ContentType, Level, Policy, TypeMask, compress, contains_marker, detect};
+use nasiko_compress::{
+    ContentType, Level, Policy, TypeMask, compress, contains_marker, detect, expand_tables,
+};
 
 struct Fixture {
     name: &'static str,
     body: &'static str,
     expect_type: ContentType,
-    /// Whether the default policy (`json,log,diff`) should shrink it.
+    /// Whether the default policy (`json,log,diff,test`) should shrink it.
     expect_shrinks: bool,
 }
 
@@ -46,6 +48,18 @@ fn corpus() -> Vec<Fixture> {
             body: include_str!("fixtures/dashboard.html"),
             expect_type: ContentType::Markup,
             expect_shrinks: false,
+        },
+        Fixture {
+            name: "django_runtests_ok.txt",
+            body: include_str!("fixtures/django_runtests_ok.txt"),
+            expect_type: ContentType::TestOutput,
+            expect_shrinks: true,
+        },
+        Fixture {
+            name: "django_runtests_error.txt",
+            body: include_str!("fixtures/django_runtests_error.txt"),
+            expect_type: ContentType::TestOutput,
+            expect_shrinks: true,
         },
         Fixture {
             name: "incident_summary.md",
@@ -140,11 +154,24 @@ fn the_search_fixture_keeps_its_diagnostic_hit_when_enabled() {
     assert!(out.text().contains("FIXME"), "dropped the diagnostic hit");
 }
 
+/// A shrunk output either says what it dropped, or dropped nothing: a JSON document rewritten
+/// without a recovery handle (whitespace gone, lists tabled) must expand back to exactly the
+/// original value.
 #[test]
-fn every_shrunk_fixture_says_so_in_the_text() {
+fn every_shrunk_fixture_says_so_in_the_text_or_lost_nothing() {
     for f in corpus() {
         let out = compress(f.body, &default_on());
-        if out.is_changed() {
+        if !out.is_changed() {
+            continue;
+        }
+        if let Ok(before) = serde_json::from_str::<serde_json::Value>(f.body) {
+            assert_eq!(
+                expand_tables(out.text()),
+                Some(before),
+                "{} lost data",
+                f.name
+            );
+        } else {
             assert!(
                 contains_marker(out.text()),
                 "{} shrank silently — the model cannot tell data is missing",

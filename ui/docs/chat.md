@@ -1,6 +1,6 @@
 # Chat (v1a direct chat, v1b routed chat, v1c layout)
 
-Chat talks to your agents in the browser. **Direct chat** (v1a) talks to one agent you pick. **Routed chat** (v1b) lets **the Orchestrator** choose: it calls agents as tools and writes the reply. Specs: `plans/feat-chat.md` (v1a, state/action matrix §7.7), `plans/feat-chat-v1b.md` (v1b; end states §5.5, errors §5.6) and `plans/feat-chat-v1c.md` (v1c; §1-§9 bind). Supported server: nasiko-cloud-rs `cb3aaf0c`. Recorded harness chats are read-only.
+Chat talks to your agents in the browser. **Direct chat** (v1a) talks to one agent you pick. **Routed chat** (v1b) lets **the Orchestrator** choose: it calls agents as tools and writes the reply. Specs: `plans/feat-chat.md` (v1a, state/action matrix §7.7), `plans/feat-chat-v1b.md` (v1b; end states §5.5, errors §5.6) and `plans/feat-chat-v1c.md` (v1c; §1-§9 bind). Supported server: the one in this repository. Recorded harness chats are read-only.
 
 Routes:
 - `/chat`: a new chat. Choose where to send with the chip in the composer or the **Choose where to send** list: the Orchestrator or an agent (see [New chat](#new-chat-v1c));
@@ -14,8 +14,8 @@ Entry points: the Chat nav link, and **Try it** on a running agent's page.
 
 Needs Node 24 (`.nvmrc`; `engines` allows 22.18+).
 
-1. `npm ci`
-2. `npm run dev` (http://localhost:3000, full mock mode, logged in as admin)
+1. `pnpm install` (`corepack enable` once)
+2. `pnpm run dev` (http://localhost:3000, full mock mode, logged in as admin)
 3. Open http://localhost:3000/chat?auto=1
 4. Type "Summarise last week's incidents" and press Enter.
 5. You see "Working on your request…", then "Asking seed-support-bot…", the reply, "Answered by the Orchestrator, using seed-support-bot", and a collapsed **Activity · 1 agent**.
@@ -24,7 +24,7 @@ The seed has a direct chat with a saved reply (c001), one whose last message nev
 
 ### Mock scenarios
 
-Every stream scenario from `common/src/mocks/chat.ts` works with `?mock=` (full mock mode only). Direct scenarios need an agent: open `/chat`, pick one, then add `&mock=<name>` (or use a chat from the rail). A test keeps this table in step with `CHAT_SCENARIOS`; an unknown name shows a dev-only banner listing the valid ones.
+Every stream scenario from `shared/mocks/src/chat.ts` works with `?mock=` (full mock mode only). Direct scenarios need an agent: open `/chat`, pick one, then add `&mock=<name>` (or use a chat from the rail). A test keeps this table in step with `CHAT_SCENARIOS`; an unknown name shows a dev-only banner listing the valid ones.
 
 | Scenario | URL | Do | You see |
 |---|---|---|---|
@@ -72,7 +72,7 @@ Every stream scenario from `common/src/mocks/chat.ts` works with `?mock=` (full 
 
 Dev aids (dev and mock builds only; production strips them):
 - `&debug=turn` shows the raw frames this tab received and, on a routed turn, its mode, operation, attempt, settle key (the trace id) and the agents asked. **Copy details** on a notice points here.
-- `?tune=<key>:<ms>` (repeatable) or `localStorage['ui-lab:chat-tuning'] = '{"LOST_REPLY_AFTER_MS":5000}'` override the timings in `common/src/features/chat/tuning.ts`.
+- `?tune=<key>:<ms>` (repeatable) or `localStorage['ui-lab:chat-tuning'] = '{"LOST_REPLY_AFTER_MS":5000}'` override the timings in `shared/features/src/chat/tuning.ts`.
 
 ## Partial live
 
@@ -169,7 +169,7 @@ The one-running-agent preselect can't be set up from the URL; `ChatPage.v1c.test
 
 ### Page variants
 
-`?mock=` takes a comma list: at most one stream scenario plus any page variants, e.g. `/chat?mock=many-chats,no-agents` (the same convention as `VITE_NASIKO_MOCK`). The dev banner names each unknown entry. Tests set them with `configureChatMock({ manyChats: true })` or `configureMocks({ variant: 'no-agents' })`. A test keeps `CHAT_PAGE_VARIANT_KEYS` (`common/src/features/chat/scenarioKeys.ts`) equal to `CHAT_PAGE_VARIANTS` (`common/src/mocks/handlers.ts`).
+`?mock=` takes a comma list: at most one stream scenario plus any page variants, e.g. `/chat?mock=many-chats,no-agents` (the same convention as `VITE_NASIKO_MOCK`). The dev banner names each unknown entry. Tests set them with `configureChatMock({ manyChats: true })` or `configureMocks({ variant: 'no-agents' })`. A test keeps `CHAT_PAGE_VARIANT_KEYS` (`shared/features/src/chat/scenarioKeys.ts`) equal to `CHAT_PAGE_VARIANTS` (`shared/mocks/src/handlers.ts`).
 
 | Variant | Effect |
 |---|---|
@@ -191,7 +191,7 @@ Clear the localStorage keys starting `ui-lab:chat-draft:` (drafts and the rememb
 import { screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it } from 'vitest'
-import { renderApp } from '@/test/renderApp'
+import { renderApp } from '@nasiko/testing/renderApp'
 
 it('no target: Enter opens the Send to list and keeps the text', async () => {
   renderApp('/chat')
@@ -211,9 +211,9 @@ Run one file with `npx vitest run src/features/chat/ChatPage.v1c.test.tsx`.
 
 ## Stack quickstart (8 steps, under 10 minutes)
 
-nasiko-cloud-rs is used read-only.
+The server side is used read-only.
 
-1. Preflight. In nasiko-cloud-rs, `just infra && just run-oss`, then `curl -fsS http://localhost:8080/health` prints `ok`. The server needs an LLM key (`OPENAI_API_KEY` in `oss/server/.env`) for titles and the orchestrator.
+1. Preflight. From the repository root, `just infra && just run-oss`, then `curl -fsS http://localhost:8080/health` prints `ok`. The server needs an LLM key (`OPENAI_API_KEY` in `oss/server/.env`) for titles and the orchestrator.
 2. `nasiko upload oss/agents/currency-agent` (server-side build and deploy; it converts currencies at fixed rates, with no LLM and no network calls, so its answer is predictable).
 3. `nasiko ps` lists `currency-agent` as running.
 4. Here, `npm run dev:live`.
@@ -228,13 +228,13 @@ If the upload's build fails on your stack (it returned `not_found` on 2026-09-27
 
 `nasiko upload oss/agents/simulated-agent`, then its page's **Try it** or `/chat?agent=<its uuid>`. You see "Starting chat…" for about 2 s (the LLM title), "Waiting for Simulated Agent…", lorem ipsum streaming in, then a duration chip and **View trace**. Clean up with `nasiko rm --name simulated-agent` and `npm run seed:reset`.
 
-The live streams are shaped differently from A2A 1.0 in ways the mocks didn't cover at first: one artifact per chunk, agent frames still in their JSON-RPC envelope, and a second, server-owned task that closes after the agent's. The recorded streams are replay fixtures in `common/src/features/chat/__fixtures__/`.
+The live streams are shaped differently from A2A 1.0 in ways the mocks didn't cover at first: one artifact per chunk, agent frames still in their JSON-RPC envelope, and a second, server-owned task that closes after the agent's. The recorded streams are replay fixtures in `shared/features/src/chat/__fixtures__/`.
 
 ## Routed smoke (X6)
 
 `node scripts/smoke-chat-routed.ts` runs the routed flow the UI uses (create → user row → dispatch) against a live server and checks the server half: the orchestrator called the expected agent, the server saved exactly one assistant row with the turn's trace id, and the script never POSTed an assistant row. `--help` lists the options:
 - `--runs 5` is the release bar (5 of 5);
-- `--record` writes the scrubbed stream to `common/src/features/chat/__fixtures__/live-routed.json`;
+- `--record` writes the scrubbed stream to `shared/features/src/chat/__fixtures__/live-routed.json`;
 - `--agent`/`--prompt` pick another running agent;
 - auth: `NASIKO_URL` + `NASIKO_TOKEN`, then `--cluster <name>`, then the active cluster in `~/.nasiko/config.json`. It never prints the token.
 
@@ -325,7 +325,7 @@ The smoke names the stage it failed at, with the chat and trace ids:
 ## Notes
 
 - **Two tabs in one chat:** the server interleaves them; each tab settles only on its own reply (by trace id).
-- **Ownership:** the page only sends to a chat whose history loaded, which the server checks is yours. That prevents accidental cross-writes, not a hand-made request (server issue Nasiko-Labs/nasiko-cloud-rs#492).
+- **Ownership:** the page only sends to a chat whose history loaded, and the server refuses a chat that is not yours (`/api/orchestrator/a2a` checks the session's owner before reading or writing it).
 - **Old chats:** a chat that isn't in the rail's first pages is looked up on its own (up to 20 pages). Past that, the page says "Couldn't find this chat's details" and keeps Send off unless it knows the chat's kind.
 
 ## v1b → v1c (M0)

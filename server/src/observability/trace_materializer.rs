@@ -184,14 +184,42 @@ pub(crate) async fn upsert_row(
     session_resolver: &dyn SessionIdResolver,
     row: &TraceUsageRow,
 ) -> Result<(), String> {
-    // Resolve agent_id from agent_name.
-    let agent_id: Option<uuid::Uuid> =
-        sqlx::query_scalar("SELECT id FROM agents WHERE name = $1 AND deleted_at IS NULL LIMIT 1")
-            .bind(&row.agent_name)
-            .fetch_optional(db)
-            .await
-            .ok()
-            .flatten();
+    // Resolve the agent. Self-instrumenting agents are attributed by their service
+    // name, so `row.agent_name` is the agent name. A coding agent (no self-emitted
+    // spans) is attributed off the router's `gen_ai.agent.id`, so `row.agent_name`
+    // may instead be that UUID — resolve it to the real name/id so the row keys on
+    // the agent name like every other, and the FinOps dashboard (which groups by
+    // `agent_name`) picks it up.
+    let (agent_id, agent_name): (Option<uuid::Uuid>, String) = {
+        let by_name: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM agents WHERE name = $1 AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(&row.agent_name)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        match by_name {
+            Some(id) => (Some(id), row.agent_name.clone()),
+            None => match uuid::Uuid::parse_str(&row.agent_name) {
+                Ok(uuid) => {
+                    let name: Option<String> = sqlx::query_scalar(
+                        "SELECT name FROM agents WHERE id = $1 AND deleted_at IS NULL LIMIT 1",
+                    )
+                    .bind(uuid)
+                    .fetch_optional(db)
+                    .await
+                    .ok()
+                    .flatten();
+                    match name {
+                        Some(n) => (Some(uuid), n),
+                        None => (None, row.agent_name.clone()),
+                    }
+                }
+                Err(_) => (None, row.agent_name.clone()),
+            },
+        }
+    };
 
     // Backfill session_id from the DB index if the span didn't carry it.
     let session_id = match &row.session_id {
@@ -212,8 +240,12 @@ pub(crate) async fn upsert_row(
         None => None,
     };
 
+    let row = TraceUsageRow {
+        agent_name,
+        ..row.clone()
+    };
     let mut tx = db.begin().await.map_err(|e| e.to_string())?;
-    write_usage_row(&mut tx, row, session_id.as_deref(), agent_id, user_id)
+    write_usage_row(&mut tx, &row, session_id.as_deref(), agent_id, user_id)
         .await
         .map_err(|e| e.to_string())?;
     tx.commit().await.map_err(|e| e.to_string())?;

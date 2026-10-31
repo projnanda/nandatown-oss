@@ -167,7 +167,7 @@ mod tests {
     #[test]
     fn instrumented_adapters_have_independent_install_versions() {
         assert_eq!(Agent::Claude.install_version(), Some(4));
-        assert_eq!(Agent::OpenCode.install_version(), Some(7));
+        assert_eq!(Agent::OpenCode.install_version(), Some(8));
         assert_eq!(Agent::Codex.install_version(), Some(2));
         assert_eq!(Agent::Cursor.install_version(), Some(2));
     }

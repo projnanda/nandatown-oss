@@ -1,0 +1,29 @@
+{
+  "name": "@nasiko/app-shell",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The app shell: mount, router, routes, sidebar, sign-in and the route error states.",
+  "dependencies": {
+    "@hookform/resolvers": "^5.9.1",
+    "@nasiko/app-core": "workspace:*",
+    "@nasiko/data-access": "workspace:*",
+    "@nasiko/features": "workspace:*",
+    "@nasiko/mocks": "workspace:*",
+    "@nasiko/ui": "workspace:*",
+    "@tanstack/react-query": "^5.103.3",
+    "@tanstack/react-router": "^1.170.39",
+    "lucide-react": "^1.48.0",
+    "motion": "^13.4.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-hook-form": "^7.89.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "msw": "^2.15.0",
+    "vitest": "^4.1.11"
+  }
+}

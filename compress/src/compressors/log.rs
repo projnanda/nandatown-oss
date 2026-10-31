@@ -6,8 +6,6 @@
 use crate::marker;
 use crate::policy::Policy;
 
-const SEVERE: [&str; 5] = ["ERROR", "WARN", "WARNING", "FATAL", "PANIC"];
-
 pub(super) fn compress(input: &str, policy: &Policy<'_>) -> Option<String> {
     let lines: Vec<&str> = input.lines().collect();
     let (head, tail) = policy.level.log_head_tail();
@@ -36,7 +34,7 @@ pub(super) fn compress(input: &str, policy: &Policy<'_>) -> Option<String> {
     Some(render(&lines, &keep, policy))
 }
 
-fn render(lines: &[&str], keep: &[bool], policy: &Policy<'_>) -> String {
+pub(super) fn render(lines: &[&str], keep: &[bool], policy: &Policy<'_>) -> String {
     let mut out = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum::<usize>());
     let mut dropped = 0usize;
 
@@ -61,8 +59,14 @@ fn render(lines: &[&str], keep: &[bool], policy: &Policy<'_>) -> String {
 }
 
 fn is_severe(line: &str) -> bool {
-    let prefix = crate::text::take_chars(line, 120);
-    SEVERE.iter().any(|lvl| prefix.contains(lvl))
+    // A traceback header is the failure it is about to narrate; the frames that follow it must
+    // stay attached to it, and it carries no level word of its own.
+    crate::levels::is_severe(line) || starts_with_traceback(line)
+}
+
+fn starts_with_traceback(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("Traceback") || trimmed.starts_with("Caused by")
 }
 
 fn is_stack_frame(line: &str) -> bool {
@@ -127,6 +131,21 @@ mod tests {
     }
 
     #[test]
+    fn keeps_stack_frames_attached_to_their_traceback() {
+        // Tracebacks arrive without any log-level line, so the only retention signal is the
+        // traceback header itself.
+        let mut input = noisy(&[], 10);
+        input.push_str("Traceback (most recent call last):\n");
+        input.push_str("  File \"/app/src/main.py\", line 9, in <module>\n");
+        input.push_str("    run()\n");
+
+        let out = compress(&input, &policy()).unwrap();
+
+        assert!(out.contains("Traceback (most recent call last)"));
+        assert!(out.contains("File \"/app/src/main.py\""));
+    }
+
+    #[test]
     fn keeps_stack_frames_attached_to_their_error() {
         let mut input = noisy(&[], 100);
         input.push_str("2026-01-01T00:00:00Z ERROR boom\n");
@@ -138,6 +157,33 @@ mod tests {
 
         assert!(out.contains("at src/main.rs:42"));
         assert!(out.contains("at src/lib.rs:7"));
+    }
+
+    #[test]
+    fn keeps_lower_case_and_structured_errors_from_the_middle() {
+        let mut lines: Vec<String> = (0..200)
+            .map(|i| {
+                format!(
+                    "[Sun Dec 04 05:{:02}:00 2005] [notice] child {i} started",
+                    i % 60
+                )
+            })
+            .collect();
+        lines[100] =
+            "[Sun Dec 04 05:15:09 2005] [error] [client 222.166.160.184] Directory index forbidden"
+                .into();
+        lines[120] = "ts=05:20:00 level=fatal msg=\"disk full\"".into();
+        lines[140] = "[Sun Dec 04 05:30:00 2005] [notice] parity error corrected".into();
+        let input = lines.join("\n");
+
+        let out = compress(&input, &policy()).unwrap();
+
+        assert!(out.contains("222.166.160.184"), "dropped the [error] line");
+        assert!(out.contains("disk full"), "dropped the level=fatal line");
+        assert!(
+            !out.contains("parity error corrected"),
+            "kept a notice that only mentions an error"
+        );
     }
 
     #[test]

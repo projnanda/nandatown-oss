@@ -1,5 +1,5 @@
 {
-  "//": "Shared by every edition's tsc program (oss/tsconfig.json, ee/web/tsconfig.json).",
+  "//": "Shared by every edition's tsc program (oss/app/tsconfig.json, and each private edition's). Each sets its own `paths`: the shared packages' (@nasiko/<name>/* -> shared/<name>/src/*, as vite.shared.ts PACKAGE_ALIASES) plus its own.",
   "compilerOptions": {
     "target": "es2023",
     "lib": [

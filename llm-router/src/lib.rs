@@ -37,6 +37,7 @@ pub mod inbound;
 pub mod inject;
 pub mod ir;
 pub mod providers;
+mod range_view;
 pub mod recovery;
 pub mod resolver;
 pub mod routing;
@@ -46,7 +47,7 @@ pub mod usage;
 pub use config::GatewayConfig;
 pub use error::GatewayError;
 pub use inbound::InboundFormat;
-pub use inject::{LlmInjectCtx, inject_llm_env};
+pub use inject::{LlmInjectCtx, inject_llm_base_url, inject_llm_env};
 pub use resolver::{ConfigCache, ResolvedConfig, ResolvedEmbeddingConfig};
 pub use routing::{
     AllowAllGate, CellStore, ClassifierSalienceGate, DecisionCache, InMemoryCellStore, NoopCache,

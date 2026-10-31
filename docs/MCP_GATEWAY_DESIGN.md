@@ -244,7 +244,7 @@ An agent is **untrusted, user-authored code**. It is deployed once but serves re
 
 ### 7.2 Two factors: agent credential + flow-bound user identity
 
-The server solves this with two independent factors that each travel for free (design rationale and security analysis: the "MCP Gateway Agent Auth" design doc):
+The server solves this with two independent factors that each travel for free:
 
 - **Agent identity** — a per-agent gateway credential minted at deploy time and injected into the container env as `MCP_GATEWAY_TOKEN` (alongside `MCP_GATEWAY_URL`). Only its SHA-256 hash is stored (`agent_gateway_tokens`); the plaintext exists solely in the container env. Every redeploy rotates it; destroying the agent tombstones it. The agent configures its MCP client **once at startup** with `Authorization: Bearer $MCP_GATEWAY_TOKEN` — no per-request plumbing.
 - **User identity** — resolved server-side from the request's `traceparent`: its trace id names the `flows` row (carrying `user_id`) the platform wrote synchronously when it dispatched the flow, and the `flow_participants` record proves the flow was actually dispatched *to this agent*. The caller's real session credential (`Authorization`, `Cookie`) is still stripped before any request reaches an agent container — an agent can never replay a user's platform credentials.
@@ -351,7 +351,9 @@ CREATE TABLE mcp_connectors (
     oauth_authorization_endpoint  TEXT,
     oauth_token_endpoint          TEXT,
     oauth_client_id               TEXT,
-    oauth_client_secret            TEXT,   -- encrypted at rest
+    oauth_client_secret            TEXT,   -- encrypted at rest; only for confidential clients
+    oauth_scopes                  TEXT,   -- explicit space-separated scope; replaces automatic selection when set
+    oauth_send_resource           BOOLEAN, -- RFC 8707 `resource` on authorize: NULL = discovery decides, true/false = forced
 
     created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -560,7 +562,8 @@ flowchart TD
     → record INITIATED connection"]
     T -->|bearer / basic / url_param| CR["Store per-user credential
     (encrypted) → connected immediately"]
-    T -->|oauth2 custom server| OD["Discover OAuth endpoints (once per server)
+    T -->|oauth2 custom server| OD["Discover authorization server + requested access
+    (endpoints and client stored on first use)
     → PKCE + signed state
     → return authorization URL"]
     T -->|none| OK[Connected immediately]
@@ -571,6 +574,56 @@ flowchart TD
     verify ACTIVE status
     → record connected-account id"]
 ```
+
+**OAuth discovery for custom servers** (`oauth.rs`):
+
+1. A bare `initialize` must answer 401. Its `WWW-Authenticate` may name the resource
+   metadata URL and a `scope`; otherwise RFC 9728's well-known URLs are tried.
+2. The first `authorization_servers` issuer's metadata is looked up at every RFC 8414
+   URL (path-inserted, then appended to the issuer) before any OpenID Connect Discovery
+   URL (inserted, then appended). A server that publishes both is treated as RFC 8414;
+   some identity providers publish only OpenID Connect discovery (Entra ID 404s every
+   RFC 8414 URL). If no resource metadata document is usable (the pointer is unusable
+   and there is no RFC 9728 document), the MCP server's own origin is tried as the
+   authorization server, RFC 8414 URLs then OpenID Connect URLs. Confirmed live: Azure
+   API Management publishes the authorization-server document at the API origin while
+   its resource-metadata URL is itself behind the JWT policy.
+3. **Scope**: the challenge's `scope`, else every scope in the resource's
+   `scopes_supported`, else none, plus `offline_access` when the authorization server
+   offers it, since some providers (Entra ID) issue a refresh token only on request.
+   On the origin path (step 2) the authorization server's own `scopes_supported` is
+   used when its `issuer` is a different origin (a proxy publishing a third-party
+   IdP's metadata, e.g. Entra ID behind APIM), since such IdPs reject a scope-less
+   request. When the `issuer` is the MCP server's own origin (the 2025-03-26 style
+   self-hosted authorization server, e.g. Atlassian) only the challenge's `scope` is
+   used, else none, because a self-hosted server's `scopes_supported` lists everything
+   it can issue, not what this resource needs. `oauth_scopes` on the connector
+   replaces this selection, but `offline_access` is still appended when the
+   selection wanted it, so the grant stays refreshable.
+4. **Resource** (RFC 8707): the connector URL, omitted when the authorization server
+   is known only through OpenID Connect discovery: Entra ID rejects a `resource` that
+   differs from the requested scope's own resource. It is also omitted on the origin
+   path, where no resource identifier was published. `oauth_send_resource` forces it on
+   (`true`, the connector URL) or off (`false`); `NULL` leaves it to discovery; on update, an omitted field is unchanged and an explicit
+   `null` returns to automatic. Metadata
+   alone cannot classify some providers behind proxies, such as Entra ID behind Azure
+   API Management, which need a scope and reject `resource`.
+5. **Client**: the user's own client id when supplied (required where the authorization
+   server has no `registration_endpoint`), else RFC 7591 dynamic registration. A client
+   secret is required only for confidential clients. Public clients (PKCE, with
+   `token_endpoint_auth_methods_supported` containing `none`) need only the client id;
+   Entra ID accepts public clients. A user-supplied secret is kept as long as
+   authorization uses the client id it was registered with.
+
+The probe response (`POST /api/mcp/connectors/probe`) reports `public_client`: `true`
+when the authorization server accepts clients without a secret, `null` when unknown.
+
+A discovery failure is a 502 (`authorization error`, or `could not reach MCP server`
+when the server is down), with the cause in the gateway log; for a connector that is
+already configured, authorization falls back to the request it used before scope
+selection existed. Refresh sends the same request as before; only if the provider
+rejects it with a 400 is it retried once with the granted scope (RFC 6749 §6), which
+Entra ID needs when one app registration is both the client and the protected API.
 
 ### 9.4 Sharing a custom MCP server
 
@@ -765,7 +818,7 @@ owner or a superuser via `DELETE`.
 | GET | `/api/mcp/connections` | List the caller's own connections |
 | DELETE | `/api/mcp/connections/{connector_id}` | Disconnect / revoke |
 | GET / POST | `/api/mcp/connectors` | List connectors visible to the caller / register a custom MCP server |
-| POST | `/api/mcp/connectors/probe` | Detect a candidate server's required auth type before registering |
+| POST | `/api/mcp/connectors/probe` | Detect a candidate server's required auth type before registering; for OAuth also `supports_dcr` and `public_client` (the authorization server accepts clients without a secret) |
 | PATCH / DELETE | `/api/mcp/connectors/{id}` | Update / delete an owned connector |
 | GET / POST / DELETE | `/api/mcp/connectors/{id}/share` | List, grant, or revoke a username's (or everyone's) access to an owned connector |
 | POST / DELETE | `/api/mcp/connectors/{id}/credential` | Store / remove a credential (write-only) |

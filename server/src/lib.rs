@@ -19,6 +19,7 @@ pub mod build;
 pub mod capabilities;
 pub mod catalog;
 pub mod chat;
+pub mod coding;
 pub mod coding_agent_backlog;
 pub mod coding_agent_ingest_guard;
 pub mod coding_agent_onboarding;
@@ -35,6 +36,7 @@ pub mod hitl;
 pub mod llm_configs;
 pub mod llm_router;
 pub mod maf;
+pub mod maf_policy;
 pub mod mcp;
 pub mod multipart_util;
 pub mod observability;
@@ -53,7 +55,9 @@ pub mod seed;
 pub mod seed_mirror;
 pub mod seed_registry_ready;
 pub mod settings;
-pub mod spa;
+/// The SPA serving shared by every binary that embeds a UI bundle.
+pub use nasiko_spa as spa;
+pub mod spend_gate;
 pub mod state;
 pub mod telemetry;
 pub mod titling;
@@ -174,10 +178,14 @@ where
     // panicking: MAF routes still work (create/list/run) without a key, jobs
     // just queue in Redis unprocessed until one is configured.
     if let Some(api_key) = state.config.openai_api_key.clone() {
-        let llm_config = nasiko_orchestrator::maf::LlmConfig {
-            api_key,
-            base_url: state.config.openai_base_url.clone(),
-            model: state.config.openai_model.clone(),
+        let worker_config = nasiko_orchestrator::maf::WorkerConfig {
+            llm: nasiko_orchestrator::maf::LlmConfig {
+                api_key,
+                base_url: state.config.openai_base_url.clone(),
+                model: state.config.openai_model.clone(),
+            },
+            concurrency: state.config.maf_worker_concurrency,
+            heartbeat: std::time::Duration::from_secs(state.config.maf_heartbeat_secs),
         };
         // The MAF worker's LLM calls carry the agent-call budget at the client
         // level. Their own pool, deliberately: a background worker's traffic
@@ -207,8 +215,9 @@ where
             // MAF step's agent call is bounded by exactly the cascade limits
             // every other inter-agent call already is.
             std::sync::Arc::new(state.flow_guard.clone()),
-            llm_config,
+            worker_config,
             state.hitl_store.clone(),
+            state.maf_executor.clone(),
         );
     } else {
         tracing::warn!(
@@ -493,8 +502,9 @@ where
         .fallback_service(ui_pages)
         .layer(cors)
         // Default span-making records the full request URI, which would publish
-        // the agent credential carried by `/api/mcp/s/{token}` into every span
-        // and log line. Redact that one route; everything else is unchanged.
+        // credentials into every span and log line: the agent credential in
+        // `/api/mcp/s/{token}`, and query values such as the SSO `?token=`
+        // session JWT or an OAuth `code`/`state`. See `redact_credential_uri`.
         .layer(TraceLayer::new_for_http().make_span_with(
             |req: &axum::http::Request<axum::body::Body>| {
                 let span = tracing::info_span!(

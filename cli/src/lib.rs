@@ -3,6 +3,7 @@ pub mod commands;
 pub mod config;
 pub mod hitl;
 pub mod oci;
+pub mod session_store;
 pub mod skill;
 pub mod util;
 pub mod version_prompt;
@@ -121,6 +122,25 @@ pub enum AgentOpsCommands {
         /// Non-interactive: auto-accept the suggested version instead of prompting
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Register as an ACP coding agent (e.g. OpenCode): driven over a stdio
+        /// turn instead of HTTP, and deployed port-less with a workspace volume.
+        /// Overrides any `workloadKind` in AgentCard.json.
+        #[arg(long)]
+        coding_agent: bool,
+        /// Deprecated / redundant: HITL is ON by default for coding agents, so
+        /// each tool call pauses for a decision via the HITL API. Accepted for
+        /// back-compat; pass --no-hitl to run the agent unattended instead.
+        #[arg(long)]
+        hitl: bool,
+        /// Opt out of human-approval gating: the coding agent's tool use runs
+        /// unattended (autonomous/batch), auto-approving every request. Only
+        /// meaningful with --coding-agent; HITL is on by default otherwise.
+        #[arg(long, conflicts_with = "hitl")]
+        no_hitl: bool,
+        /// Show what would be deployed (version, image, env keys) without building, pushing,
+        /// or deploying anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Push image to cluster OCI registry (without deploying)
     Push {
@@ -135,6 +155,21 @@ pub enum AgentOpsCommands {
         /// Non-interactive: auto-accept the suggested version instead of prompting
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Mark the registered agent as an ACP coding agent (e.g. OpenCode).
+        /// Overrides any `workloadKind` in AgentCard.json. `push` only registers
+        /// the image; `nasiko deploy` then brings it up port-less.
+        #[arg(long)]
+        coding_agent: bool,
+        /// Deprecated / redundant: HITL is ON by default for coding agents.
+        /// Accepted for back-compat; pass --no-hitl to register the agent for
+        /// unattended (auto-approving) use instead.
+        #[arg(long)]
+        hitl: bool,
+        /// Opt out of human-approval gating: register the coding agent for
+        /// unattended use. Only meaningful with --coding-agent; HITL is on by
+        /// default otherwise.
+        #[arg(long, conflicts_with = "hitl")]
+        no_hitl: bool,
     },
     /// Upload source directory or .zip and let the server build + deploy (no local Docker needed)
     #[command(
@@ -169,6 +204,11 @@ pub enum AgentOpsCommands {
         /// the mount hides whatever the image ships at that path
         #[arg(long, value_name = "PATH")]
         writable_path: Option<String>,
+        /// Register as an ACP coding agent (e.g. OpenCode): built, then deployed
+        /// port-less with a workspace volume and driven over a stdio turn.
+        /// Overrides any `workloadKind` in AgentCard.json.
+        #[arg(long)]
+        coding_agent: bool,
     },
     /// Deploy an agent from an OCI/artifact-registry reference
     ///
@@ -184,8 +224,11 @@ pub enum AgentOpsCommands {
     /// List running agents
     Ps {
         /// Output as JSON
-        #[arg(short = 'j', long)]
+        #[arg(short = 'j', long, conflicts_with = "watch")]
         json: bool,
+        /// Refresh the list every 2s until Ctrl-C
+        #[arg(short = 'w', long)]
+        watch: bool,
     },
     /// Stream agent container logs
     Logs {
@@ -195,6 +238,20 @@ pub enum AgentOpsCommands {
         /// Live-tail: stream new log lines as they arrive (SSE)
         #[arg(short = 'f', long)]
         follow: bool,
+        /// Only lines at exactly this level (WARN does not include WARNING)
+        #[arg(
+            long,
+            ignore_case = true,
+            value_parser = ["DEBUG", "TRACE", "INFO", "WARN", "WARNING", "ERROR", "CRITICAL", "FATAL"]
+        )]
+        level: Option<String>,
+        /// Only lines whose message contains this text (case-insensitive)
+        #[arg(long)]
+        search: Option<String>,
+        /// Only lines from this far back: 30m, 2h, 1d, or an ISO-8601 time. Raw container
+        /// output carries no timestamps, so its latest lines are always shown
+        #[arg(long, conflicts_with = "follow")]
+        since: Option<String>,
     },
     /// Stop agent container
     Stop { agent: String },
@@ -256,11 +313,11 @@ pub enum AgentOpsCommands {
     },
     /// Terminate + deregister agent
     Rm {
-        /// Agent UUID (preferred; use --name to look up by name instead)
-        #[arg(conflicts_with = "name")]
-        id: Option<String>,
-        /// Delete by agent name (resolved to UUID via the CP registry)
-        #[arg(long, short = 'n', conflicts_with = "id")]
+        /// Agent name or UUID
+        #[arg(required_unless_present = "name", conflicts_with = "name")]
+        agent: Option<String>,
+        /// Older spelling of the positional argument, kept so existing scripts keep working
+        #[arg(long, short = 'n', hide = true)]
         name: Option<String>,
         #[arg(short, long)]
         force: bool,
@@ -280,9 +337,19 @@ pub enum AgentOpsCommands {
         /// Resume a previous session by ID (TUI mode)
         #[arg(long)]
         resume: Option<String>,
-        /// Route message to an existing session (one-shot mode)
+        /// Switch to a specific existing conversation by ID. Omit to continue the
+        /// current conversation for this agent (the default); it also becomes the
+        /// new current one.
         #[arg(long)]
         session_id: Option<String>,
+        /// Start a fresh conversation instead of continuing the current one, and
+        /// make it the new current conversation.
+        #[arg(long)]
+        new: bool,
+        /// Assert the target is an ACP coding agent — fail loudly if it isn't.
+        /// A guardrail only; the server still drives the turn by the agent's kind.
+        #[arg(long)]
+        coding_agent: bool,
     },
     /// List chat sessions
     Sessions {
@@ -719,9 +786,11 @@ pub enum MafExecutionCommands {
 
 #[derive(Subcommand)]
 pub enum AgentsCommands {
-    /// Discover coding agents installed on this machine
+    /// Discover coding agents installed on this machine (now: `status`)
+    #[command(hide = true)]
     Discover,
-    /// Install session reporting for a local coding agent
+    /// Install session reporting for a local coding agent (now: `connect <agent> --reporting`)
+    #[command(hide = true)]
     Install {
         /// Agent to install (e.g. claude or opencode)
         agent: String,
@@ -729,7 +798,8 @@ pub enum AgentsCommands {
         #[arg(long)]
         no_content: bool,
     },
-    /// Remove session reporting for a local coding agent
+    /// Remove session reporting for a local coding agent (now: `disconnect <agent> --reporting`)
+    #[command(hide = true)]
     Uninstall {
         /// Agent to uninstall (e.g. claude or opencode)
         agent: String,
@@ -868,6 +938,14 @@ pub enum ObserveCommands {
     /// Show full detail for a session (traces, tokens, cost)
     Session {
         /// Session ID (trace ID)
+        session_id: String,
+        /// Output the raw API response as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show per-turn tokens + cost for a session (from the billing ledger)
+    Turns {
+        /// Session ID (ses_...)
         session_id: String,
         /// Output the raw API response as JSON
         #[arg(long)]
@@ -1088,6 +1166,10 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             writable_path,
             version,
             yes,
+            coding_agent,
+            hitl: _,
+            no_hitl,
+            dry_run,
         } => commands::deploy::deploy_with_version_flags(
             &image,
             name.as_deref(),
@@ -1100,12 +1182,19 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             },
             writable,
             writable_path.as_deref(),
+            coding_agent,
+            // HITL is on by default for coding agents; --no-hitl opts out.
+            coding_agent && !no_hitl,
+            dry_run,
         ),
         AgentOpsCommands::Push {
             image,
             name,
             version,
             yes,
+            coding_agent,
+            hitl: _,
+            no_hitl,
         } => commands::push::push_with_version_flags(
             &image,
             name.as_deref(),
@@ -1113,6 +1202,9 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 version: version.as_deref(),
                 yes,
             },
+            coding_agent,
+            // HITL is on by default for coding agents; --no-hitl opts out.
+            coding_agent && !no_hitl,
         ),
         AgentOpsCommands::Upload {
             source,
@@ -1123,6 +1215,7 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             env,
             writable,
             writable_path,
+            coding_agent,
         } => commands::upload::upload(
             &source,
             name.as_deref(),
@@ -1132,14 +1225,27 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             &env,
             writable,
             writable_path.as_deref(),
+            coding_agent,
         ),
         AgentOpsCommands::Import { reference } => commands::import::from_registry(&reference),
-        AgentOpsCommands::Ps { json } => commands::agents::ps(json),
+        AgentOpsCommands::Ps { json, watch } => commands::agents::ps(json, watch),
         AgentOpsCommands::Logs {
             agent,
             tail,
             follow,
-        } => commands::agents::logs(&agent, tail, follow),
+            level,
+            search,
+            since,
+        } => commands::agents::logs(
+            &agent,
+            tail,
+            follow,
+            &commands::agents::LogFilters {
+                level,
+                search,
+                since,
+            },
+        ),
         AgentOpsCommands::Stop { agent } => commands::agents::stop(&agent),
         AgentOpsCommands::Start { agent } => commands::agents::start(&agent),
         AgentOpsCommands::Restart { agent } => commands::agents::restart(&agent),
@@ -1178,8 +1284,10 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             version.as_deref(),
             reason.as_deref(),
         ),
-        AgentOpsCommands::Rm { id, name, force } => {
-            commands::agents::rm(id.as_deref(), name.as_deref(), force)
+        AgentOpsCommands::Rm { agent, name, force } => {
+            // Parsing guarantees exactly one of the two is set.
+            let agent = agent.or(name).unwrap_or_default();
+            commands::agents::rm(&agent, force)
         }
         AgentOpsCommands::Chat {
             url,
@@ -1188,6 +1296,8 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             tui,
             resume,
             session_id,
+            new,
+            coding_agent,
         } => {
             // `nasiko chat "some message"` — a lone positional *containing
             // whitespace* is a natural-language message for the orchestrator,
@@ -1221,21 +1331,31 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 .or(url.as_deref())
                 .unwrap_or("")
                 .to_string();
-            let resolved = match (url, agent) {
-                // `url` is documented to accept a full URL, an agent
-                // UUID/name, or "orchestrator" — `resolve_chat_target`
-                // is what actually implements that (URL passthrough,
-                // orchestrator special-case, agent lookup by id/name);
-                // using `u` as-is here skipped that resolution entirely,
-                // so `nasiko chat <agent-name>` sent the literal name as
-                // the HTTP endpoint instead of resolving it first.
-                (Some(u), _) => commands::agents::resolve_chat_target(&u)?,
-                (None, Some(a)) => commands::agents::resolve_chat_target(&a)?,
+            // Resolve to (endpoint, workload_kind). `resolve_chat_target_with_kind`
+            // accepts a full URL, an agent UUID/name, or "orchestrator"; the kind
+            // is `None` for a URL / the orchestrator (neither is one catalog agent).
+            let (resolved, kind) = match (url, agent) {
+                (Some(u), _) => commands::agents::resolve_chat_target_with_kind(&u)?,
+                (None, Some(a)) => commands::agents::resolve_chat_target_with_kind(&a)?,
                 (None, None) => {
                     let base = config::active_url()?;
-                    format!("{}/api/orchestrator/a2a", base.trim_end_matches('/'))
+                    (
+                        format!("{}/api/orchestrator/a2a", base.trim_end_matches('/')),
+                        None,
+                    )
                 }
             };
+            // `--coding-agent` guardrail: assert the resolved target really is an
+            // ACP coding agent, so a wrong name/id fails loudly instead of silently
+            // chatting the wrong (or a normal) agent. It changes nothing on the wire
+            // — the server drives the turn by the agent's stored `workload_kind`.
+            if coding_agent && kind.as_deref() != Some("acp_coding_agent") {
+                let got = kind.as_deref().unwrap_or("unknown (URL/orchestrator)");
+                anyhow::bail!(
+                    "--coding-agent was given but '{target_label}' resolves to a '{got}' target, \
+                     not an ACP coding agent. Drop the flag, or check the name with `nasiko ps`."
+                );
+            }
             if tui || resume.is_some() {
                 commands::tui::run_tui(&resolved, resume.as_deref(), &target_label)
             } else {
@@ -1243,7 +1363,9 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                     &resolved,
                     message.as_deref(),
                     session_id.as_deref(),
+                    new,
                     &target_label,
+                    kind.as_deref(),
                 )
             }
         }
@@ -1269,14 +1391,14 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             }
         },
         AgentOpsCommands::Agents { command } => match command {
-            AgentsCommands::Discover => commands::integration::status(),
-            AgentsCommands::Install { agent, no_content } => {
-                commands::integration::install(commands::integration::InstallOptions {
-                    agent_id: &agent,
-                    no_content,
-                })
+            AgentsCommands::Discover => {
+                commands::local_agents::note_renamed("agents discover", "status");
+                commands::local_agents::print_overview()
             }
-            AgentsCommands::Uninstall { agent } => commands::integration::uninstall(&agent),
+            AgentsCommands::Install { agent, no_content } => {
+                install_reporting_renamed("agents", &agent, no_content)
+            }
+            AgentsCommands::Uninstall { agent } => uninstall_reporting_renamed("agents", &agent),
             AgentsCommands::Sync { retry_rejected } => commands::integration::sync(retry_rejected),
             AgentsCommands::Setup {
                 yes,
@@ -1334,6 +1456,9 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             }
             ObserveCommands::Session { session_id, json } => {
                 commands::observe::session_detail(&session_id, json)
+            }
+            ObserveCommands::Turns { session_id, json } => {
+                commands::observe::turns(&session_id, json)
             }
             ObserveCommands::TraceDetail { trace_id, json } => {
                 commands::observe::trace_detail(&trace_id, json)
@@ -1564,6 +1689,43 @@ pub fn dispatch_registry(cmd: RegistrySubCommands) -> Result<()> {
 
 // ─── Coding-agent integrations ──────────────────────────────────────────────
 
+/// `agents install` / `integration install`, now `connect <agent> --no-routing --reporting`:
+/// runs exactly the command the note names. The old command reported prompt and response text
+/// unless `--no-content`, so the new one says which explicitly.
+/// `old` is the group the caller used (`agents` or `integration`), for the note.
+pub fn install_reporting_renamed(old: &str, agent: &str, no_content: bool) -> Result<()> {
+    let content = if no_content {
+        " --no-content"
+    } else {
+        " --content"
+    };
+    commands::local_agents::note_renamed(
+        &format!("{old} install"),
+        &format!("connect {agent} --no-routing --reporting{content} -y"),
+    );
+    // Exactly the command the note names, so the two never behave differently.
+    commands::local_agents::connect(
+        Some(agent),
+        &commands::local_agents::ConnectOptions {
+            no_routing: true,
+            reporting: true,
+            content: !no_content,
+            no_content,
+            yes: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// `agents uninstall` / `integration uninstall`, now `disconnect <agent> --reporting`.
+pub fn uninstall_reporting_renamed(old: &str, agent: &str) -> Result<()> {
+    commands::local_agents::note_renamed(
+        &format!("{old} uninstall"),
+        &format!("disconnect {agent} --reporting"),
+    );
+    commands::integration::uninstall(agent)
+}
+
 #[derive(Subcommand)]
 pub enum IntegrationSubCommands {
     /// Show which coding agents are on this machine and their reporting status
@@ -1593,14 +1755,16 @@ pub enum IntegrationSubCommands {
 
 pub fn dispatch_integration(cmd: IntegrationSubCommands) -> Result<()> {
     match cmd {
-        IntegrationSubCommands::Status => commands::integration::status(),
-        IntegrationSubCommands::Install { agent, no_content } => {
-            commands::integration::install(commands::integration::InstallOptions {
-                agent_id: &agent,
-                no_content,
-            })
+        IntegrationSubCommands::Status => {
+            commands::local_agents::note_renamed("integration status", "status");
+            commands::local_agents::print_overview()
         }
-        IntegrationSubCommands::Uninstall { agent } => commands::integration::uninstall(&agent),
+        IntegrationSubCommands::Install { agent, no_content } => {
+            install_reporting_renamed("integration", &agent, no_content)
+        }
+        IntegrationSubCommands::Uninstall { agent } => {
+            uninstall_reporting_renamed("integration", &agent)
+        }
         IntegrationSubCommands::Report { agent } => commands::integration::report(&agent),
         IntegrationSubCommands::Sync => commands::integration::sync(false),
     }
@@ -1648,7 +1812,7 @@ pub enum McpSubCommands {
     /// Manage custom MCP server connectors
     Connector {
         #[command(subcommand)]
-        command: McpConnectorCommands,
+        command: Box<McpConnectorCommands>,
     },
     /// Manage a per-connector stored credential
     Credential {
@@ -1760,6 +1924,12 @@ pub enum McpConnectorCommands {
         /// OAuth client secret
         #[arg(long)]
         oauth_client_secret: Option<String>,
+        /// OAuth scope to request, space separated (overrides automatic selection, offline_access is still added when the server offers it; empty string on update clears it)
+        #[arg(long)]
+        oauth_scopes: Option<String>,
+        /// Send the RFC 8707 resource parameter on authorize: true, false, or auto to let discovery decide (set false for Entra ID behind a proxy)
+        #[arg(long, value_enum)]
+        oauth_send_resource: Option<commands::mcp::SendResourceArg>,
     },
     /// Edit a connector's fields (owner/admin only)
     Update {
@@ -1786,6 +1956,12 @@ pub enum McpConnectorCommands {
         logo_url: Option<String>,
         #[arg(long)]
         active: Option<bool>,
+        /// OAuth scope to request, space separated (overrides automatic selection, offline_access is still added when the server offers it; empty string on update clears it)
+        #[arg(long)]
+        oauth_scopes: Option<String>,
+        /// Send the RFC 8707 resource parameter on authorize: true, false, or auto to let discovery decide (set false for Entra ID behind a proxy)
+        #[arg(long, value_enum)]
+        oauth_send_resource: Option<commands::mcp::SendResourceArg>,
     },
     /// Delete a connector (owner/admin only)
     Delete {
@@ -2057,7 +2233,7 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 commands::mcp::toolkit_delete(&connector_id, yes)
             }
         },
-        McpSubCommands::Connector { command } => match command {
+        McpSubCommands::Connector { command } => match *command {
             McpConnectorCommands::List { json } => commands::mcp::connector_list(json),
             McpConnectorCommands::Probe { url, json } => commands::mcp::connector_probe(&url, json),
             McpConnectorCommands::Register {
@@ -2075,6 +2251,8 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 logo_url,
                 oauth_client_id,
                 oauth_client_secret,
+                oauth_scopes,
+                oauth_send_resource,
             } => commands::mcp::connector_register(
                 &name,
                 &url,
@@ -2090,6 +2268,8 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 logo_url.as_deref(),
                 oauth_client_id.as_deref(),
                 oauth_client_secret.as_deref(),
+                oauth_scopes.as_deref(),
+                oauth_send_resource,
             ),
             McpConnectorCommands::Update {
                 connector_id,
@@ -2104,6 +2284,8 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 display_name,
                 logo_url,
                 active,
+                oauth_scopes,
+                oauth_send_resource,
             } => commands::mcp::connector_update(
                 &connector_id,
                 name.as_deref(),
@@ -2117,6 +2299,8 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 display_name.as_deref(),
                 logo_url.as_deref(),
                 active,
+                oauth_scopes.as_deref(),
+                oauth_send_resource,
             ),
             McpConnectorCommands::Delete { connector_id, yes } => {
                 commands::mcp::connector_delete(&connector_id, yes)

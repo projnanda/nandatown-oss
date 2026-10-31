@@ -16,7 +16,7 @@ import { pathToFileURL } from 'node:url'
 import { parseArgs as parseArgv } from 'node:util'
 import { Failure, isLoopbackUrl, SECRET } from './lib/live.ts'
 
-const FIXTURE = 'common/src/features/chat/__fixtures__/live-routed.json'
+const FIXTURE = 'shared/features/src/chat/__fixtures__/live-routed.json'
 const DEFAULT_PROMPT = 'Use the currency agent to convert 100 USD to EUR.'
 const DEFAULT_AGENT = 'currency-agent'
 const TIMEOUT = {

@@ -17,8 +17,8 @@ import {
   spanAttributes,
   type GenSpan,
   type MockSession,
-} from '../../common/src/mocks/spanBuilder.ts'
-import type { Seed, SeedTrace } from '../../common/src/mocks/seed.ts'
+} from '../../shared/mocks/src/spanBuilder.ts'
+import type { Seed, SeedTrace } from '../../shared/mocks/src/seed.ts'
 
 /**
  * Days of seed traces sent to Tempo, counted back from the anchor: inside Tempo's 7-day search limit

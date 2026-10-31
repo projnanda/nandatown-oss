@@ -1,6 +1,6 @@
 // One runner for every edition (docs/lab-vs-react-migration-review.md §10.6):
 //   node scripts/app.ts dev [edition] [-- vite args]   (default: oss)
-//   node scripts/app.ts build [edition]                (default: every edition found)
+//   node scripts/app.ts build [edition]                (default: every edition found, through Turbo)
 //   node scripts/app.ts preview [edition]
 //   node scripts/app.ts typecheck                      (one tsc program per edition, plus tooling and e2e)
 // Editions are found by folder (scripts/editions.ts), so this file names none but the core's own.
@@ -14,9 +14,15 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const editions = findEditions(ROOT)
 const [cmd, name, ...rest] = process.argv.slice(2)
 
-function run(bin: string, args: string[]) {
-  const r = spawnSync(bin, args, { cwd: ROOT, stdio: 'inherit' })
+function run(bin: string, args: string[], env: NodeJS.ProcessEnv = process.env) {
+  const r = spawnSync(bin, args, { cwd: ROOT, stdio: 'inherit', env })
   if (r.status !== 0) process.exit(r.status ?? 1)
+}
+function hasPnpm() {
+  return (
+    spawnSync('pnpm', ['--version'], { stdio: 'ignore', shell: process.platform === 'win32' })
+      .status === 0
+  )
 }
 function pick(fallback: 'oss' | 'all') {
   if (name && !name.startsWith('-')) {
@@ -47,6 +53,16 @@ switch (cmd) {
     break
   }
   case 'build':
+    // Every edition, no extra Vite arguments: Turbo (turbo.json), which rebuilds only an app whose inputs changed.
+    // Filtered to the edition apps (a desktop packager's `build` builds the desktop app). Turbo runs each app's
+    // script through `pnpm`, which `corepack enable` puts on PATH; without it, the editions build one by one.
+    if ((!name || name.startsWith('-')) && extra.length === 0 && hasPnpm()) {
+      run('npx', ['turbo', 'run', 'build', ...editions.map((e) => `--filter=./${e.dir}`)], {
+        ...process.env,
+        TURBO_TELEMETRY_DISABLED: '1',
+      })
+      break
+    }
     for (const e of pick('all'))
       run('npx', ['vite', 'build', '--config', `${e.dir}/vite.config.ts`, ...extra])
     break

@@ -1,0 +1,16 @@
+{
+  "name": "@nasiko/web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The OSS control plane app.",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@nasiko/app-core": "workspace:*",
+    "@nasiko/app-shell": "workspace:*",
+    "@nasiko/ui": "workspace:*",
+    "vite": "^8.3.0"
+  }
+}

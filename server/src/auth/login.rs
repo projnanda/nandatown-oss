@@ -40,6 +40,14 @@ pub fn non_login_public_router(login_limiter: crate::rate_limit::RateLimiter) ->
 pub fn public_router(login_limiter: crate::rate_limit::RateLimiter) -> Router<AppState> {
     Router::new()
         .route("/api/auth/login", post(login))
+        // Central-dashboard delegation: a BFF-signed assertion is exchanged
+        // for a delegated token (ui/docs/adr/0001a §2.2). Unauthenticated
+        // by nature (the assertion IS the credential) and therefore under the
+        // same global limiter as login.
+        .route(
+            "/api/auth/delegate/assertion",
+            post(super::assertion::exchange_assertion),
+        )
         .layer(axum::middleware::from_fn_with_state(
             login_limiter,
             crate::rate_limit::limit_globally,
@@ -65,6 +73,9 @@ pub fn protected_router(
 
     Router::new()
         .merge(credential_routes)
+        // Short-lived, scoped, audience-bound token for a server-side renderer
+        // (ui/docs/adr/0001a). Session callers only; see auth/delegate.rs.
+        .route("/auth/delegate", post(super::delegate::delegate))
         .route("/auth/logout", post(logout))
         .route("/auth/system/users-for-search", get(users_for_search))
         .route("/auth/users/{id}", get(get_user_profile))
@@ -217,21 +228,47 @@ struct SsoSessionQuery {
 ///
 /// An SSO arrival is the tail of a cross-site redirect chain (the marketplace,
 /// then the management plane, then here). Browsers withhold `Strict` cookies for
-/// every hop of such a chain, so a server redirect to `/` would arrive without
-/// the cookie just set, hit the page gate, and bounce to the login screen — the
-/// very failure this endpoint exists to fix. A navigation started by *this* page
-/// is same-site with no cross-site chain, so the cookie rides it.
+/// every hop of such a chain — and keep withholding it even once the chain lands
+/// back on this origin, because modern browsers taint the *whole* redirect chain
+/// as cross-site once any hop in it was, specifically to close the open-redirect
+/// bypass of `SameSite=Strict`/`Lax`. So a server redirect to `/` would arrive
+/// without the cookie just set, hit the page gate, and bounce to the login
+/// screen — the very failure this endpoint exists to fix. A navigation started
+/// by *this* page's own script, by contrast, is a fresh top-level navigation
+/// whose initiator is a document already on this origin, so the cookie rides it.
 ///
-/// (EE's OIDC callback redirects directly and is fine: there the control plane
-/// and dashboard share one registrable domain, so the chain is same-site. A
-/// tenant control plane on its own hostname has no such luxury.)
-const SSO_HANDOFF_HTML: &str = r#"<!doctype html>
-<meta charset="utf-8">
-<title>Signing in…</title>
-<meta http-equiv="refresh" content="0;url=/">
-<script>location.replace('/')</script>
-<p>Signing you in… <a href="/">continue</a></p>
-"#;
+/// (EE's OIDC callback hit exactly this: its single-tenant, same-origin
+/// `redirect_to` branch used a raw `Location` redirect — see
+/// `ee/server/src/oidc.rs`'s `success_redirect`, fixed to call
+/// [`same_origin_handoff_html`] instead. Its multi-tenant branch is unaffected:
+/// there the cookie is picked up later by the dashboard's own credentialed
+/// same-site *fetch*, not by this redirect, so no chain-tainted hop ever needs
+/// to carry it.)
+pub fn same_origin_handoff_html(target: &str) -> String {
+    // HTML-context escaping for the `<meta>` and `<a href>` attributes.
+    let html_target = target
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    // JS-string-context escaping for the `location.replace('...')` argument.
+    // `<` becomes a unicode escape (not just HTML-escaped) so a target
+    // containing a literal "</script>" can't close the script element early —
+    // the HTML parser runs before the JS one, so HTML-escaping alone wouldn't
+    // stop that.
+    let js_target = target
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('<', "\\u003C");
+    format!(
+        "<!doctype html>\n\
+         <meta charset=\"utf-8\">\n\
+         <title>Signing in…</title>\n\
+         <meta http-equiv=\"refresh\" content=\"0;url={html_target}\">\n\
+         <script>location.replace('{js_target}')</script>\n\
+         <p>Signing you in… <a href=\"{html_target}\">continue</a></p>\n"
+    )
+}
 
 async fn sso_session(
     State(state): State<AppState>,
@@ -241,7 +278,11 @@ async fn sso_session(
     match crate::auth::middleware::validate_session_token(&state, &query.token).await {
         Ok(_) => {
             let cookie = set_token_cookie(&query.token, request_is_https(&headers));
-            ([(header::SET_COOKIE, cookie)], Html(SSO_HANDOFF_HTML)).into_response()
+            (
+                [(header::SET_COOKIE, cookie)],
+                Html(same_origin_handoff_html("/")),
+            )
+                .into_response()
         }
         // Logged, because a silent bounce to the login page is indistinguishable
         // from the SSO bug this endpoint fixes — the reason is the whole
@@ -501,6 +542,26 @@ async fn initialize_admin(
     }
 }
 
+/// Serializes concurrent `initialize-admin` calls, so two requests racing on an
+/// empty database cannot both pass the "no admin yet" check.
+const BOOTSTRAP_LOCK_KEY: i64 = 0x6e61_7369_6b6f_0001;
+
+fn init_admin_internal_error() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "internal error"})),
+    )
+        .into_response()
+}
+
+/// Bootstrap the first administrator. Unauthenticated by design, so the gate
+/// must only ever open on a database that has never had one.
+///
+/// Any `role = 'admin'` or superuser row closes it, deleted or not, active or
+/// not: counting only `role = 'admin'` reopened it on a database whose
+/// administrators are superusers with another role. A failed check fails
+/// closed. The check and both inserts run in one transaction under an advisory
+/// lock, so concurrent callers cannot both create an admin.
 #[allow(clippy::result_large_err)]
 async fn initialize_admin_inner(
     state: &AppState,
@@ -508,15 +569,28 @@ async fn initialize_admin_inner(
     email: &str,
     https: bool,
 ) -> Result<axum::response::Response, axum::response::Response> {
-    // Check if admin exists
-    let admin_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL",
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let internal = |stage: &'static str| {
+        move |e: sqlx::Error| {
+            tracing::error!(%e, stage, "initialize_admin failed");
+            init_admin_internal_error()
+        }
+    };
 
-    if admin_count > 0 {
+    let mut tx = state.db.begin().await.map_err(internal("begin"))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(BOOTSTRAP_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal("lock"))?;
+
+    let admin_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE role = 'admin' OR is_superuser)",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal("admin check"))?;
+
+    if admin_exists {
         // 409: initializing an admin when one already exists is a conflict, not an
         // authorization failure.
         return Err((
@@ -532,11 +606,7 @@ async fn initialize_admin_inner(
         .await
         .map_err(|e| {
             tracing::error!(%e, "initialize_admin: password hash failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal error"})),
-            )
-                .into_response()
+            init_admin_internal_error()
         })?;
 
     let result: Result<(uuid::Uuid,), _> = sqlx::query_as(
@@ -546,7 +616,7 @@ async fn initialize_admin_inner(
     )
     .bind(username)
     .bind(email)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await;
 
     let user_id = match result {
@@ -575,16 +645,11 @@ async fn initialize_admin_inner(
     .bind(user_id)
     .bind(&access_key)
     .bind(&access_secret_hash)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!(%e, %user_id, "initialize_admin: insert credentials failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal error"})),
-        )
-            .into_response()
-    })?;
+    .map_err(internal("insert credentials"))?;
+
+    tx.commit().await.map_err(internal("commit"))?;
 
     // `issue_token` records the JWT's JTI in auth_tokens, so the admin token minted
     // here is revocable (previously init-admin tokens were unrevocable).
@@ -596,11 +661,7 @@ async fn initialize_admin_inner(
 
     let token = state.auth.issue_token(&identity).await.map_err(|e| {
         tracing::error!(%e, %user_id, "initialize_admin: issue token failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal error"})),
-        )
-            .into_response()
+        init_admin_internal_error()
     })?;
 
     // Belt-and-suspenders record (ON CONFLICT DO NOTHING) so counting/revocation work.
@@ -853,5 +914,35 @@ async fn get_user_profile(
             tracing::error!(%e, %id, "get_user_profile: db error");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_origin_handoff_html;
+
+    /// A `redirect_to` crafted to close the `<script>` element early must not
+    /// succeed: the HTML parser runs before the JS one, so HTML-escaping `<`
+    /// in the `<meta>`/`<a>` attributes isn't enough — the `<script>` body
+    /// itself must never contain a raw `<` either.
+    #[test]
+    fn handoff_html_cannot_be_used_to_break_out_of_its_own_script_tag() {
+        let evil = "/x\"></script><script>alert(1)</script>";
+        let html = same_origin_handoff_html(evil);
+        let start = html.find("<script>").unwrap() + "<script>".len();
+        let end = html[start..].find("</script>").unwrap();
+        let script_body = &html[start..start + end];
+        assert!(
+            !script_body.contains('<'),
+            "script body still contains a raw '<': {script_body}"
+        );
+    }
+
+    #[test]
+    fn handoff_html_targets_the_given_path() {
+        let html = same_origin_handoff_html("/budgets");
+        assert!(html.contains("location.replace('/budgets')"));
+        assert!(html.contains("content=\"0;url=/budgets\""));
+        assert!(html.contains("href=\"/budgets\""));
     }
 }

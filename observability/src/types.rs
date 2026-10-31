@@ -328,21 +328,56 @@ pub struct RouterSpanLinks<'a> {
 /// detectable downstream, which is why this pairing has to happen before any
 /// aggregation rather than being patched afterwards.
 ///
-/// The router's span sits under the HTTP span for the agent's request, whose
-/// parent is the agent's own LLM span, so the nearest ancestor from a different
-/// service is the calling agent, and that ancestor's usage is the duplicate.
+/// The router's span usually sits under the HTTP span for the agent's request,
+/// whose parent is the agent's own LLM span, so the nearest ancestor from a
+/// different service is the calling agent, and that ancestor's usage is the
+/// duplicate.
 ///
-/// A router span with no such ancestor is dropped instead. It reaches a trace at
-/// all only because some caller propagated span context, and in this platform
-/// that caller is an agent recording the same call on a span of its own — just a
-/// sibling rather than an ancestor, because it propagated the context it was
-/// called with instead of its own. Keeping it would double the tokens and book
-/// them against the control plane, which is not an agent; dropping it costs only
-/// the model correction, which is where things stood before any of this.
+/// Some instrumentation doesn't nest that way: an agent's own legacy
+/// instrumentation (pre-GenAI-semconv spans such as `ChatCompletion`) can
+/// record the same call as a **sibling** of the router's span — both rooted
+/// under the agent's own request handling rather than one inside the other.
+/// Ancestry can't see a sibling, so [`find_sibling_duplicate`] is the fallback:
+/// it matches on the one signal that survives both instrumentation styles
+/// unchanged — the output token count — inside the same wall-clock window, so
+/// two unrelated calls of the same length elsewhere in the trace are not
+/// mistaken for one. Found this way, a span is still booked once, against the
+/// agent, exactly as the nested case is: trusting the router's count (it is
+/// cache-aware; legacy spans routinely are not) and dropping the duplicate.
+///
+/// A router span matched neither way depends on what else the trace holds:
+///
+/// * **A span from another service reports token usage** (a self-instrumenting
+///   agent whose span could not be paired, e.g. it propagated the context it
+///   was *called* with rather than its own LLM span's). The agent has already
+///   recorded the call, so the router's copy is dropped: keeping it would
+///   double the tokens. Dropping it costs only the model correction.
+/// * **No span from another service reports usage** (an ACP coding agent such
+///   as OpenCode, which emits no spans of its own). Nothing else accounts for
+///   the call, so it is attributed to the agent id the router stamped on it
+///   (`gen_ai.agent.id`) instead of being lost.
+///
+/// "Another service" means another service than the router span's own, the
+/// same test the ancestor walk uses to recognise an agent. The control plane's
+/// own LLM spans (the orchestrator's routing and ReAct calls) share the
+/// router's service, so they never make a coding agent's call look already
+/// recorded. The check does not try to match a span to one particular agent:
+/// a coding agent's legacy spans do not reliably carry its agent id as their
+/// service name, so matching on it would double-count exactly the agents this
+/// dedupe exists for. When both kinds of agent share a trace, the cost is an
+/// undercount, never a double count.
 pub fn link_router_spans(spans: &[Span]) -> RouterSpanLinks<'_> {
     let by_id: HashMap<&str, &Span> = spans.iter().map(|s| (s.span_id.as_str(), s)).collect();
     let mut attributed = HashMap::new();
     let mut excluded = HashSet::new();
+    // The services (other than the router's) that report token usage in this
+    // trace. Decides what an unpaired router span means (see the doc comment).
+    let usage_services: HashSet<&str> = spans
+        .iter()
+        .filter(|s| !is_router_llm_span(s) && !s.service_name.is_empty())
+        .filter(|s| !extract_usage_attrs(&s.attributes).is_empty())
+        .map(|s| s.service_name.as_str())
+        .collect();
     for span in spans {
         if !is_router_llm_span(span) {
             continue;
@@ -357,6 +392,9 @@ pub fn link_router_spans(spans: &[Span]) -> RouterSpanLinks<'_> {
             }
             parent = ancestor.parent_span_id.as_deref();
         }
+        if agent.is_none() {
+            agent = find_sibling_duplicate(span, spans);
+        }
         match agent {
             Some(agent) => {
                 attributed.insert(span.span_id.as_str(), agent.service_name.as_str());
@@ -365,7 +403,28 @@ pub fn link_router_spans(spans: &[Span]) -> RouterSpanLinks<'_> {
                 }
             }
             None => {
-                excluded.insert(span.span_id.as_str());
+                // No agent span to pair with. If a span from another service
+                // reports usage, an agent recorded this call itself and the
+                // router's copy would double it: drop it. Otherwise the router's
+                // span is the only record of the call (an ACP coding agent such as
+                // OpenCode emits no spans of its own), so attribute it to the agent
+                // id the router stamped on it; downstream resolves that id.
+                let agent_reports_usage = usage_services
+                    .iter()
+                    .any(|service| *service != span.service_name);
+                let agent_id = span
+                    .attributes
+                    .get("gen_ai.agent.id")
+                    .and_then(|v| v.as_str())
+                    .filter(|id| !id.is_empty());
+                match agent_id {
+                    Some(agent_id) if !agent_reports_usage => {
+                        attributed.insert(span.span_id.as_str(), agent_id);
+                    }
+                    _ => {
+                        excluded.insert(span.span_id.as_str());
+                    }
+                }
             }
         }
     }
@@ -373,6 +432,36 @@ pub fn link_router_spans(spans: &[Span]) -> RouterSpanLinks<'_> {
         attributed,
         excluded,
     }
+}
+
+/// The sibling case `link_router_spans` can't reach by walking ancestry: a
+/// same-trace, different-service span reporting the identical output token
+/// count, whose time window overlaps the router span's. Output is the match
+/// key because it is unaffected by prompt caching, so it reads the same from
+/// both an instrumentation that reports cache-aware input and one that
+/// doesn't; input is checked too, but only to confirm an exact (uncached)
+/// match, never to rule one out, since a legacy span's larger, cache-blind
+/// input is exactly the discrepancy this function exists to find.
+fn find_sibling_duplicate<'a>(router_span: &Span, spans: &'a [Span]) -> Option<&'a Span> {
+    let usage = extract_usage_attrs(&router_span.attributes);
+    if usage.is_empty() {
+        return None;
+    }
+    spans.iter().find(|candidate| {
+        candidate.span_id != router_span.span_id
+            && !candidate.service_name.is_empty()
+            && candidate.service_name != router_span.service_name
+            && spans_overlap(router_span, candidate)
+            && extract_usage_attrs(&candidate.attributes).output == usage.output
+    })
+}
+
+/// Whether two spans' wall-clock windows overlap at all. A span with no
+/// recorded end is treated as a point in time at its start.
+fn spans_overlap(a: &Span, b: &Span) -> bool {
+    let a_end = a.ended_at.unwrap_or(a.started_at);
+    let b_end = b.ended_at.unwrap_or(b.started_at);
+    a.started_at <= b_end && b.started_at <= a_end
 }
 
 impl TraceDetails {
@@ -585,7 +674,7 @@ fn is_error(span: &Span) -> bool {
 /// sibling (same parent) that started after it *ended* and succeeded.
 ///
 /// This is the SE-3 rule, and it is deliberately identical to the UI's
-/// `unrecoveredErrors` (`ui/common/src/features/observability/spans.ts`), which
+/// `unrecoveredErrors` (`ui/shared/features/src/observability/spans.ts`), which
 /// is what `/sessions` has always shown. A retry that eventually worked is not a
 /// failure; an overlapping parallel call with the same name is not a retry, so
 /// the comparison is against the failed span's *end*, not its start.
@@ -621,6 +710,144 @@ pub fn latency_percentiles(mut durations: Vec<u64>) -> (Option<f64>, Option<f64>
     let p50 = nearest_rank(50);
     let p99 = nearest_rank(99);
     (p50, p99)
+}
+
+#[cfg(test)]
+mod link_router_spans_tests {
+    use super::*;
+
+    fn span(id: &str, parent: Option<&str>, service: &str, attrs: &[(&str, &str)]) -> Span {
+        Span {
+            span_id: id.to_string(),
+            parent_span_id: parent.map(str::to_string),
+            name: "s".into(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            duration_ms: None,
+            service_name: service.to_string(),
+            kind: 3,
+            status_code: 0,
+            status_message: String::new(),
+            attributes: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                .collect(),
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unlinkable_router_span_is_attributed_by_gen_ai_agent_id() {
+        // A coding agent (e.g. OpenCode) emits no spans of its own, so the router's
+        // span is the only token-bearing one and has no agent-span ancestor. It must
+        // be attributed off `gen_ai.agent.id`, not dropped — otherwise its tokens
+        // never reach `trace_usage`/FinOps.
+        let spans = vec![span(
+            "r1",
+            None,
+            "nasiko-cp",
+            &[
+                ("gen_ai.agent.id", "agent-uuid"),
+                ("gen_ai.usage.total_tokens", "100"),
+            ],
+        )];
+        let links = link_router_spans(&spans);
+        assert_eq!(links.attributed.get("r1"), Some(&"agent-uuid"));
+        assert!(!links.excluded.contains("r1"), "must not be dropped");
+    }
+
+    #[test]
+    fn unlinkable_router_span_is_dropped_when_an_agent_span_reports_the_usage() {
+        // A self-instrumenting agent recorded the call on its own span, but the
+        // router's span can't be paired with it (no cross-service ancestor, no
+        // overlapping sibling). Attributing the router's copy too would count the
+        // call twice, so it is dropped and the agent's span stands.
+        let spans = vec![
+            span(
+                "a1",
+                None,
+                "devops-agent",
+                &[
+                    ("gen_ai.usage.input_tokens", "300"),
+                    ("gen_ai.usage.output_tokens", "50"),
+                ],
+            ),
+            span(
+                "r1",
+                Some("elsewhere"),
+                "nasiko-cp",
+                &[
+                    ("gen_ai.agent.id", "agent-uuid"),
+                    ("gen_ai.usage.input_tokens", "440"),
+                    ("gen_ai.usage.output_tokens", "67"),
+                ],
+            ),
+        ];
+        let links = link_router_spans(&spans);
+        assert!(!links.attributed.contains_key("r1"));
+        assert!(
+            links.excluded.contains("r1"),
+            "the router's copy is dropped"
+        );
+        assert!(
+            !links.excluded.contains("a1"),
+            "the agent's own span stands"
+        );
+    }
+
+    #[test]
+    fn the_control_planes_own_llm_spans_do_not_hide_a_coding_agents_call() {
+        // The orchestrator's own LLM call (routing, ReAct) reports usage on a span
+        // from the control plane's service -- the same service as the router's
+        // span. That is not an agent recording this call, so the coding agent's
+        // only record of it must still be attributed, not dropped.
+        let spans = vec![
+            span(
+                "o1",
+                None,
+                "nasiko-cp",
+                &[
+                    ("gen_ai.usage.input_tokens", "900"),
+                    ("gen_ai.usage.output_tokens", "40"),
+                ],
+            ),
+            span(
+                "r1",
+                Some("o1"),
+                "nasiko-cp",
+                &[
+                    ("gen_ai.agent.id", "agent-uuid"),
+                    ("gen_ai.usage.input_tokens", "440"),
+                    ("gen_ai.usage.output_tokens", "67"),
+                ],
+            ),
+        ];
+        let links = link_router_spans(&spans);
+        assert_eq!(links.attributed.get("r1"), Some(&"agent-uuid"));
+        assert!(!links.excluded.contains("r1"), "must not be dropped");
+        assert!(
+            !links.excluded.contains("o1"),
+            "the orchestrator's call stands"
+        );
+    }
+
+    #[test]
+    fn router_span_with_agent_ancestor_still_attributes_by_service_name() {
+        // Regression guard: a self-instrumenting agent's own span is the ancestor,
+        // so the router span is still attributed to the agent's service name (the
+        // common path is unchanged).
+        let spans = vec![
+            span("a1", None, "my-agent", &[]),
+            span(
+                "r1",
+                Some("a1"),
+                "nasiko-cp",
+                &[("gen_ai.agent.id", "agent-uuid")],
+            ),
+        ];
+        let links = link_router_spans(&spans);
+        assert_eq!(links.attributed.get("r1"), Some(&"my-agent"));
+    }
 }
 
 #[cfg(test)]

@@ -45,7 +45,7 @@ const file = join(dir, 'openapi.json')
 writeFileSync(file, JSON.stringify(doc))
 execFileSync(
   'npx',
-  ['--yes', 'openapi-typescript@7.13.0', file, '-o', 'common/src/lib/api/schema.gen.ts'],
+  ['--yes', 'openapi-typescript@7.13.0', file, '-o', 'shared/data-access/src/schema.gen.ts'],
   { stdio: 'inherit' },
 )
 console.info(

@@ -150,34 +150,62 @@ pub async fn agent_proxy(
             nasiko_agent_proxy::ResolveError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         })?;
 
-    let (agent_base, forward_headers) = match state
-        .runtime
-        .forwarding_endpoint(&nasiko_runtime::ContainerId::from_uuid(agent_id))
+    // Coding agents have no HTTP endpoint — they're driven over a per-session
+    // stdio turn, not reverse-proxied — so resolve that discriminator first and
+    // skip the endpoint lookup for them. The shared session/flow setup below
+    // still runs, then the request is diverted to the coding-agent turn path just
+    // before the HTTP forward.
+    let coding_target = crate::coding::proxy::load_target(&state.db, agent_id)
         .await
-    {
-        Ok(target) => (target.url.trim_end_matches('/').to_string(), target.headers),
-        Err(e) => {
-            let Some(stored) = &agent.endpoint else {
-                tracing::error!(
+        .map_err(|e| {
+            tracing::error!(error = %e, %agent_id, "agent proxy: coding-agent lookup failed");
+            match e {
+                // The agent is a coding agent but its image is not a kind we can
+                // drive — a deploy-time misconfiguration, not a transient fault.
+                crate::coding::proxy::LoadTargetError::UnrecognizedImage { .. } => {
+                    StatusCode::BAD_GATEWAY
+                }
+                crate::coding::proxy::LoadTargetError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        })?;
+
+    // A coding agent is diverted to the ACP turn path below, so it needs no HTTP
+    // endpoint and no forward headers. Every other agent resolves its live
+    // forwarding endpoint — the injection proxy when memory/L1A is enabled, which
+    // also returns the headers to attach — falling back to the stored `agents.url`
+    // on a transient runtime lookup failure.
+    let (agent_base, forward_headers) = if coding_target.is_some() {
+        (String::new(), Vec::new())
+    } else {
+        match state
+            .runtime
+            .forwarding_endpoint(&nasiko_runtime::ContainerId::from_uuid(agent_id))
+            .await
+        {
+            Ok(target) => (target.url.trim_end_matches('/').to_string(), target.headers),
+            Err(e) => {
+                let Some(stored) = &agent.endpoint else {
+                    tracing::error!(
+                        error = %e, %agent_id,
+                        "agent proxy: live endpoint lookup failed and no stored agents.url to fall back to"
+                    );
+                    return Err(StatusCode::BAD_GATEWAY);
+                };
+                // Falls back to the plain stored address, bypassing whatever `forwarding_endpoint()`
+                // would otherwise route through (the injection proxy, when memory is enabled) — so
+                // this forward gets no L1A. Rare (only on a transient runtime lookup failure) and
+                // fails toward availability rather than blocking the call entirely, but worth a line
+                // in the logs: a silent L1A skip looks identical to "L1A had nothing to say."
+                tracing::warn!(
                     error = %e, %agent_id,
-                    "agent proxy: live endpoint lookup failed and no stored agents.url to fall back to"
+                    "agent proxy: live endpoint lookup failed, falling back to stored agents.url \
+                     (bypasses the injection proxy — this forward gets no L1A)"
                 );
-                return Err(StatusCode::BAD_GATEWAY);
-            };
-            // Falls back to the plain stored address, bypassing whatever `forwarding_endpoint()`
-            // would otherwise route through (the injection proxy, when memory is enabled) — so
-            // this forward gets no L1A. Rare (only on a transient runtime lookup failure) and
-            // fails toward availability rather than blocking the call entirely, but worth a line
-            // in the logs: a silent L1A skip looks identical to "L1A had nothing to say."
-            tracing::warn!(
-                error = %e, %agent_id,
-                "agent proxy: live endpoint lookup failed, falling back to stored agents.url \
-                 (bypasses the injection proxy — this forward gets no L1A)"
-            );
-            (
-                format!("http://{}:{}", stored.host, stored.port),
-                Vec::new(),
-            )
+                (
+                    format!("http://{}:{}", stored.host, stored.port),
+                    Vec::new(),
+                )
+            }
         }
     };
     // The forwarded path. See `resolve_forwarded_path`'s doc comment for the root-mount case.
@@ -351,6 +379,50 @@ pub async fn agent_proxy(
         crate::flows::record_participant(&state.db, &flow_ctx.flow_id, agent_id).await;
     }
 
+    // Coding-agent branch: drive an ACP turn and translate its events into the
+    // standard message/stream SSE, instead of HTTP-forwarding. The shared setup
+    // above (ensure_chat_session, user-message persist, flow row + participant)
+    // already ran, so a coding-agent turn is attributed exactly like any other.
+    if let Some(target) = coding_target {
+        // A coding agent is driven only by chat turns. A non-message request
+        // (agent-card fetch, GetTask, …) has no turn to run and no HTTP container
+        // to serve it, so answer those gracefully instead of a bare 501: a
+        // synthetic card for discovery, a well-formed JSON-RPC error otherwise.
+        let Some(info) = persist_info.as_ref() else {
+            return Ok(coding_non_chat_response(
+                &target,
+                agent_id,
+                &forwarded_path,
+                &body_bytes,
+            ));
+        };
+        let context_id = info.session_id.clone();
+        let task_id = nasiko_types::a2a::new_task_id();
+
+        // The shared helper mints the session-bound token (NAS-839, bound to the
+        // same `flow_id` the `flows` + `flow_participants` rows above were written
+        // under), wires the agent's env, runs the ACP turn, and streams it back —
+        // identically to the orchestrator-dispatch path (see `coding::entry`).
+        return crate::coding::entry::run_coding_turn_sse(
+            &state,
+            agent_id,
+            &target,
+            claims.user_uuid().ok(),
+            &context_id,
+            &info.user_text,
+            &flow_ctx.flow_id,
+            &task_id,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, %agent_id, "coding-agent turn failed to start");
+            match e {
+                crate::coding::turn::CodingTurnError::Busy => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_GATEWAY,
+            }
+        });
+    }
+
     // Explicit allowlist, not a denylist: the agent container is unvetted, so anything not named
     // here is dropped rather than forwarded by default. In particular this drops
     // `authorization`/`cookie` (the caller's platform credentials — a hostile agent could
@@ -409,39 +481,33 @@ pub async fn agent_proxy(
     // Best-effort: record the session ↔ trace correlation so observability
     // can map Tempo traces back to chat sessions for agents that don't set
     // session.id on their spans (anything not running the Python patch).
-    // Fire-and-forget so it never delays the proxy; ensure_chat_session above
-    // already guaranteed the chat_sessions row, so the FK holds.
-    if !body_bytes.is_empty()
-        && let Ok(body_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        && !(agent.is_internal && is_ephemeral(&body_json))
-    {
-        let context_id = body_json
-            .pointer("/params/message/contextId")
-            .or_else(|| body_json.pointer("/params/contextId"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        if let Some(ctx_id) = context_id {
-            let trace_id = flow_ctx.flow_id.clone();
-            let agent_name = agent.name.clone();
-            let db = state.db.clone();
-            tokio::spawn(async move {
-                if let Err(e) = sqlx::query(
-                    "INSERT INTO session_traces (session_id, trace_id, agent_id, agent_name)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (session_id, trace_id) DO NOTHING",
-                )
-                .bind(&ctx_id)
-                .bind(&trace_id)
-                .bind(agent_id)
-                .bind(&agent_name)
-                .execute(&db)
-                .await
-                {
-                    tracing::warn!(error = %e, session_id = %ctx_id, %trace_id, "agent proxy: session trace record failed");
-                }
-            });
-        }
+    // Fire-and-forget so it never delays the proxy.
+    //
+    // Only the session `ensure_chat_session` verified belongs to the caller.
+    // The raw `contextId` of other methods (`tasks/get`, `tasks/cancel`, …) is
+    // unchecked caller input: recording it let anyone who knew another user's
+    // session id attach traces to that user's session view.
+    if let Some(info) = persist_info.as_ref() {
+        let ctx_id = info.session_id.clone();
+        let trace_id = flow_ctx.flow_id.clone();
+        let agent_name = agent.name.clone();
+        let db = state.db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sqlx::query(
+                "INSERT INTO session_traces (session_id, trace_id, agent_id, agent_name)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (session_id, trace_id) DO NOTHING",
+            )
+            .bind(&ctx_id)
+            .bind(&trace_id)
+            .bind(agent_id)
+            .bind(&agent_name)
+            .execute(&db)
+            .await
+            {
+                tracing::warn!(error = %e, session_id = %ctx_id, %trace_id, "agent proxy: session trace record failed");
+            }
+        });
     }
 
     if !body_bytes.is_empty() {
@@ -718,6 +784,56 @@ const MESSAGE_SEND_METHODS: &[&str] = &[
     "message/send",
     "message/stream",
 ];
+
+/// Answer a non-chat A2A request to a coding agent, which has no HTTP server of
+/// its own to forward to. Discovery (`agent-card` / `.well-known`) gets a
+/// minimal, valid synthetic AgentCard; any other method gets a well-formed
+/// JSON-RPC `method not found` error (echoing the request id) rather than a bare
+/// 501, so clients degrade gracefully.
+fn coding_non_chat_response(
+    target: &crate::coding::proxy::CodingAgentTarget,
+    agent_id: Uuid,
+    forwarded_path: &str,
+    body: &[u8],
+) -> Response {
+    use axum::response::IntoResponse;
+
+    if forwarded_path.contains("agent-card") || forwarded_path.contains(".well-known") {
+        let card = serde_json::json!({
+            "protocolVersion": "0.3.0",
+            "name": target.name,
+            "description": "ACP coding agent — driven over a stdio turn; accepts message/send and message/stream only.",
+            "url": format!("/api/agents/{agent_id}"),
+            "preferredTransport": "JSONRPC",
+            "version": "1.0.0",
+            "capabilities": { "streaming": true },
+            "defaultInputModes": ["text/plain"],
+            "defaultOutputModes": ["text/plain"],
+            "skills": [],
+        });
+        return axum::Json(card).into_response();
+    }
+
+    // Any other A2A method: echo the JSON-RPC id and return a method-not-found
+    // error (-32601). A2A JSON-RPC errors ride a 200, not an HTTP error status.
+    let rpc: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
+    let id = rpc.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = rpc
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("this method");
+    let err = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": format!(
+                "{method} is not supported for ACP coding agents — use message/send or message/stream"
+            ),
+        },
+    });
+    axum::Json(err).into_response()
+}
 
 const EPHEMERAL_METADATA_KEY: &str = "nasiko_ephemeral";
 

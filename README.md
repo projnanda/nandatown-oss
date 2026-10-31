@@ -591,7 +591,7 @@ Python, Rust, Go, or TypeScript. At runtime they must speak
 [A2A](https://github.com/a2aproject/a2a-spec) v1.0 exactly; source deployments also include an
 `AgentCard.json` and `Dockerfile` for metadata and packaging. Nasiko hardcodes the
 `A2A-Version: 1.0` header on every outbound A2A request, so the target agent must accept the v1.0
-wire format. See `[docs/A2A_PROTOCOL.md](docs/A2A_PROTOCOL.md)` for the detail. There is no
+wire format. See [docs/A2A_PROTOCOL.md](docs/A2A_PROTOCOL.md) for the detail. There is no
 proprietary agent format and no SDK to adopt.
 
 This path needs **Rust** to build the CLI from source (it is a separate `cli/` crate).
@@ -630,14 +630,17 @@ pull from the artifact registry.
 | ------------------------------------------------- | --------------------------------------------------------------------- |
 | `nasiko connect <url>`                            | Register a control plane and switch to it                             |
 | `nasiko auth login`                               | Authenticate with the active cluster                                  |
+| `nasiko doctor`                                   | Check Docker, cluster, login, and registry setup                      |
+| `nasiko completions <shell>` / `nasiko man`       | Shell tab-completion script / man page                                |
 | `nasiko new [template] [name]`                    | Scaffold a new agent project                                          |
 | `nasiko build` / `nasiko run`                     | Build the agent image / build + run it locally                        |
 | `nasiko push` / `nasiko deploy <image>`           | Push image / build-push-deploy to the cluster                         |
+| `nasiko deploy <dir> --dry-run`                   | Show what a deploy would do, without doing it                         |
 | `nasiko upload [source]`                          | Upload source; the server builds it (no local Docker)                 |
 | `nasiko ps`                                       | List running agents                                                   |
 | `nasiko logs <agent> -f`                          | Stream (and follow) agent logs                                        |
 | `nasiko stop` / `start` / `restart` / `scale <n>` | Agent lifecycle                                                       |
-| `nasiko rm --name <agent>`                        | Terminate + deregister an agent (positional `id` only accepts a UUID) |
+| `nasiko rm <agent>`                               | Terminate + deregister an agent (by name or UUID)                     |
 | `nasiko chat <agent>`                             | Interactive or one-shot A2A chat                                      |
 | `nasiko secrets set`                              | Configure encrypted per-agent secrets                                 |
 | `nasiko mcp`                                      | Manage MCP Gateway connectors and tool permissions                    |
@@ -987,7 +990,7 @@ docs/           Design docs (architecture, protocol, conventions)
 ## Documentation & Links
 
 - **Official docs**: **[docs.nasiko.com](https://docs.nasiko.com)** — guides, API reference, and concepts
-- **Design docs**: `[docs/](docs/)`: architecture, the A2A protocol, agent lifecycle, MCP Gateway internals, CLI design, networking
+- **Design docs**: [docs/](docs/): the A2A protocol and registry, agent lifecycle, routing, the MCP Gateway, CLI design, API conventions
 - **A2A protocol**: [https://github.com/a2aproject/a2a-spec](https://github.com/a2aproject/a2a-spec)
 - **Rust toolchain**: [https://rustup.rs](https://rustup.rs)
 - **Docker**: [https://docs.docker.com/get-docker/](https://docs.docker.com/get-docker/)
@@ -1003,10 +1006,10 @@ Questions, ideas, or stuck on setup? Join the community on Discord:
 
 ## Contributing
 
-See `[CONTRIBUTING.md](CONTRIBUTING.md)` for local setup, code conventions, and the PR flow.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, code conventions, and the PR flow.
 
 ## License
 
-**Apache-2.0**. See `[LICENSE](LICENSE)`.
+**Apache-2.0**. See [LICENSE](LICENSE).
 
 Built with love by the Nasiko team. Stars, issues, and PRs are always welcome.

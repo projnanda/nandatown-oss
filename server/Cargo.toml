@@ -38,9 +38,19 @@ nasiko-compress.workspace = true
 nasiko-orchestrator.workspace = true
 nasiko-types.workspace = true
 nasiko-utils.workspace = true
+# Decodes query-string keys before log redaction (src/mcp/mod.rs).
+percent-encoding = { workspace = true }
 nasiko-config.workspace = true
 nasiko-observability.workspace = true
 nasiko-llm-router.workspace = true
+# Coding-agent (ACP) turn execution: the ACP client speaks JSON-RPC to the
+# agent, `agent-client-protocol` supplies the `ByteStreams` transport + schema
+# types, and `tokio-util`'s compat shim bridges the runtime's tokio stdio halves
+# to the SDK's futures-io transport.
+nasiko-acp-client.workspace = true
+nasiko-session-token.workspace = true
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
 
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -71,9 +81,9 @@ aes-gcm = "0.10"
 hkdf = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
+nasiko-spa = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
-percent-encoding = { workspace = true }
 hex = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }

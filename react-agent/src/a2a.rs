@@ -516,6 +516,13 @@ impl A2aClient {
             // streamed statusUpdate, not just the streaming branch below.
             let value = a2a.result.clone().unwrap_or(serde_json::Value::Null);
             for sse in nasiko_types::a2a::classify_sse_event(&value) {
+                // As the SSE branch below: a failed task is a failure, not empty text.
+                if let nasiko_types::a2a::SseEvent::Failed { reason } = &sse {
+                    return Err(A2aClientError::A2aProtocol {
+                        code: -1,
+                        message: reason.clone(),
+                    });
+                }
                 if let nasiko_types::a2a::SseEvent::AwaitingHuman {
                     kind,
                     message,
@@ -575,6 +582,12 @@ impl A2aClient {
                 let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
                     continue;
                 };
+
+                // How the a2a SDKs end a stream whose task raised (`event: error`).
+                // Skipped, it leaves no text and the call reads as an empty success.
+                if let Some(err) = event.get("error") {
+                    return Err(protocol_error(err));
+                }
 
                 for sse in nasiko_types::a2a::classify_sse_event(&event) {
                     use nasiko_types::a2a::SseEvent;
@@ -780,18 +793,7 @@ impl A2aClient {
                 };
 
                 if let Some(err) = event.get("error") {
-                    let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) as i32;
-                    let message = err
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("error")
-                        .to_string();
-                    let _ = tx
-                        .send(RawAgentFrame::Error(A2aClientError::A2aProtocol {
-                            code,
-                            message,
-                        }))
-                        .await;
+                    let _ = tx.send(RawAgentFrame::Error(protocol_error(err))).await;
                     continue;
                 }
                 if let Some(result) = event.get("result") {
@@ -1261,6 +1263,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_task_in_a_plain_json_reply_is_an_error_not_empty_text() {
+        let mut server = mockito::Server::new_async().await;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "result": {"task": {
+                "id": "task-1",
+                "contextId": "ctx-1",
+                "status": {
+                    "state": "TASK_STATE_FAILED",
+                    "message": {"parts": [{"text": "upstream refused the model call"}]}
+                }
+            }}
+        });
+        server
+            .mock("POST", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+
+        let result = A2aClient::new()
+            .send_message_streaming(&server.url(), "hi", Some("sent-ctx"), None, &[], &[], &[])
+            .await;
+
+        assert!(
+            matches!(result, Err(A2aClientError::A2aProtocol { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn non_streaming_input_required_reply_also_yields_awaiting_human() {
         // An agent that never opens an event stream is not exempt from the same task-lifecycle
         // states — the plain-JSON fallback path must classify a pause exactly like the SSE path.
@@ -1301,6 +1336,18 @@ mod tests {
                 metadata: serde_json::Value::Null,
             })
         );
+    }
+}
+
+/// A JSON-RPC `error` object received mid-stream, as the client's error.
+fn protocol_error(err: &serde_json::Value) -> A2aClientError {
+    A2aClientError::A2aProtocol {
+        code: err.get("code").and_then(|c| c.as_i64()).unwrap_or(-1) as i32,
+        message: err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("error")
+            .to_string(),
     }
 }
 

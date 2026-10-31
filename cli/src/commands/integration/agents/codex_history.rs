@@ -258,6 +258,7 @@ fn parse_rollout(
                         input: total.input + usage.input,
                         output: total.output + usage.output,
                         cache_read: total.cache_read + usage.cache_read,
+                        cache_write: total.cache_write + usage.cache_write,
                     });
                 }
             }
@@ -285,6 +286,9 @@ fn parse_rollout(
         }
     }
     let session_id = session_id.unwrap_or_else(|| fallback_id.to_string());
+    let model_provider = session_meta
+        .as_ref()
+        .and_then(|meta| nonempty(meta["model_provider"].as_str()));
     let parent = session_meta
         .and_then(|meta| codex::spawned_by(&session_id, &meta))
         .or_else(|| {
@@ -296,7 +300,7 @@ fn parse_rollout(
         title: known.titles.get(&session_id).cloned(),
         turns: turns
             .into_iter()
-            .filter_map(|turn| finished_turn(&session_id, turn))
+            .filter_map(|turn| finished_turn(&session_id, model_provider.as_deref(), turn))
             .collect(),
         session_id,
     })
@@ -315,7 +319,8 @@ fn turn_index(turns: &mut Vec<TurnRecord>, turn_id: Option<&str>) -> Option<usiz
     Some(turns.len() - 1)
 }
 
-fn finished_turn(session_id: &str, turn: TurnRecord) -> Option<Turn> {
+/// `model_provider` is the provider id the rollout's `session_meta` names, if any.
+fn finished_turn(session_id: &str, model_provider: Option<&str>, turn: TurnRecord) -> Option<Turn> {
     if !turn.completed {
         return None;
     }
@@ -334,12 +339,12 @@ fn finished_turn(session_id: &str, turn: TurnRecord) -> Option<Turn> {
         ended_at,
         calls: vec![LlmCall {
             uuid: format!("{session_id}:{}:llm", turn.id),
-            provider: provider_for(&model).to_string(),
+            provider: provider_for(&model, model_provider).to_string(),
             model,
-            input_tokens: usage.input,
+            input_tokens: usage.fresh_input(),
             output_tokens: usage.output,
             cache_read_tokens: usage.cache_read,
-            cache_creation_tokens: 0,
+            cache_creation_tokens: usage.cache_write,
             accounting: None,
             started_at,
             ended_at,
@@ -426,6 +431,7 @@ fn usage_record(usage: &Value) -> Option<TokenUsage> {
         input: usage["input_tokens"].as_u64()?,
         output: usage["output_tokens"].as_u64()?,
         cache_read: usage["cached_input_tokens"].as_u64().unwrap_or(0),
+        cache_write: usage["cache_write_input_tokens"].as_u64().unwrap_or(0),
     })
 }
 
@@ -554,14 +560,15 @@ mod tests {
         assert_eq!(first.calls[0].uuid, "sess-1:t1:llm");
         assert_eq!(first.calls[0].model, "gpt-5-codex");
         assert_eq!(first.calls[0].provider, "openai");
-        // The first turn's usage is the whole cumulative count so far.
+        // The first turn's usage is the whole cumulative count so far, its input
+        // without the cached tokens Codex counts inside it.
         assert_eq!(
             (
                 first.calls[0].input_tokens,
                 first.calls[0].output_tokens,
                 first.calls[0].cache_read_tokens
             ),
-            (100, 10, 40)
+            (60, 10, 40)
         );
 
         // The second turn's usage is the delta of the cumulative counts.
@@ -572,7 +579,7 @@ mod tests {
                 second.calls[0].output_tokens,
                 second.calls[0].cache_read_tokens
             ),
-            (150, 20, 60)
+            (90, 20, 60)
         );
         assert_eq!(second.tool_calls.len(), 1);
         let tool = &second.tool_calls[0];
@@ -582,6 +589,25 @@ mod tests {
         assert_eq!(tool.status, CodingAgentToolCallStatus::Succeeded);
         assert_eq!(tool.duration_ms, Some(2000));
         assert_eq!(tool.association, CodingAgentToolAssociation::Turn);
+    }
+
+    #[test]
+    fn turns_are_labelled_with_the_provider_the_rollout_names() {
+        let bedrock = fixture().replacen(
+            r#"{"id":"sess-1"}"#,
+            r#"{"id":"sess-1","model_provider":"amazon-bedrock"}"#,
+            1,
+        );
+        assert_ne!(bedrock, fixture(), "the fixture's meta line was rewritten");
+
+        let snapshot = parse_rollout(&bedrock, "fallback", &KnownThreads::default()).unwrap();
+
+        assert!(
+            snapshot
+                .turns
+                .iter()
+                .all(|turn| turn.calls[0].provider == "aws-bedrock")
+        );
     }
 
     #[test]
@@ -615,7 +641,7 @@ mod tests {
                 call.output_tokens,
                 call.cache_read_tokens
             ),
-            (7, 3, 2)
+            (5, 3, 2)
         );
         assert_eq!(call.model, "unknown");
     }

@@ -1223,6 +1223,27 @@ pub enum EnsureSessionOutcome {
     Conflict,
 }
 
+/// One turn's token/cost usage within a chat session, from the authoritative
+/// billing ledger (`token_usage` joined to `flows` — one flow == one turn).
+/// Independent of Tempo/the materializer.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct TurnUsage {
+    /// The user's message for this turn (`flows.title`), when known.
+    pub title: Option<String>,
+    /// The turn's flow id — what `token_usage.session_id` actually stores.
+    pub flow_id: String,
+    /// LLM model calls the agent made in this turn.
+    pub calls: i64,
+    pub tokens: i64,
+    pub cost_usd: f64,
+    pub turn_start: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct SessionTurnsResponse {
+    pub turns: Vec<TurnUsage>,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct FinopsAccess<'a> {
     pub user_ids: Option<&'a [uuid::Uuid]>,
@@ -1237,6 +1258,39 @@ struct ScopeBinds {
 }
 
 impl ObservabilityService {
+    /// Per-turn tokens + cost for a chat session (its A2A contextId), read from
+    /// the `token_usage` ledger joined to `flows`, grouped by flow (one row per
+    /// turn). Scoped to `user_id` unless `is_superuser`. This is the authoritative
+    /// per-turn view and does not depend on the Tempo materializer.
+    pub async fn get_session_turns(
+        &self,
+        context_id: &str,
+        user_id: &str,
+        is_superuser: bool,
+    ) -> Result<SessionTurnsResponse, ObservabilityError> {
+        let turns = sqlx::query_as::<_, TurnUsage>(
+            r#"SELECT f.title                         AS title,
+                      t.session_id                    AS flow_id,
+                      count(*)::bigint                AS calls,
+                      sum(t.total_tokens)::bigint     AS tokens,
+                      round(sum(t.cost_usd), 6)::float8 AS cost_usd,
+                      min(t.created_at)               AS turn_start
+               FROM token_usage t
+               JOIN flows f ON f.flow_id = t.session_id
+               WHERE f.metadata->>'context_id' = $1
+                 AND ($3 OR f.user_id = $2::uuid)
+               GROUP BY f.flow_id, f.title, t.session_id
+               ORDER BY turn_start"#,
+        )
+        .bind(context_id)
+        .bind(user_id)
+        .bind(is_superuser)
+        .fetch_all(&self.db)
+        .await
+        .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
+        Ok(SessionTurnsResponse { turns })
+    }
+
     pub fn from_state(state: &crate::state::AppState) -> Self {
         Self {
             provider: state.observability.clone(),
@@ -1387,26 +1441,62 @@ impl ObservabilityService {
             .map(|_| ())
     }
 
+    /// The session a trace belongs to, for authorizing the trace view.
+    ///
+    /// The server's own `session_traces` record is the authority: every server
+    /// path that starts or forwards a turn writes it after checking the caller
+    /// owns the session. Span attributes are written by agents, and any agent
+    /// in a flow can set `session.id` to a session its own owner controls, so
+    /// a span's claim is used only when the server recorded nothing. Even then
+    /// it is refused when the trace is a flow the server knows belongs to
+    /// someone other than that session's owner.
     async fn trace_session_id(
         &self,
         trace_id: &str,
         trace: &nasiko_observability::TraceDetails,
     ) -> Result<String, ObservabilityError> {
-        if let Some(session_id) = trace.spans.iter().find_map(|span| {
-            span.attributes
-                .get("session.id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        }) {
+        let internal = |e: sqlx::Error| ObservabilityError::Internal(e.to_string());
+        let not_found = || ObservabilityError::NotFound("trace not found".into());
+
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT session_id FROM session_traces WHERE trace_id = $1 LIMIT 1")
+                .bind(trace_id)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(internal)?;
+        if let Some(session_id) = recorded {
             return Ok(session_id);
         }
 
-        sqlx::query_scalar("SELECT session_id FROM session_traces WHERE trace_id = $1")
-            .bind(trace_id)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(|e| ObservabilityError::Internal(e.to_string()))?
-            .ok_or_else(|| ObservabilityError::NotFound("trace not found".into()))
+        let claimed = trace
+            .spans
+            .iter()
+            .find_map(|span| {
+                span.attributes
+                    .get("session.id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .ok_or_else(not_found)?;
+
+        // A known flow must belong to the claimed session's owner.
+        let consistent: bool = sqlx::query_scalar(
+            r#"SELECT NOT EXISTS (
+                   SELECT 1 FROM flows f
+                    WHERE f.flow_id = $1
+                      AND NOT EXISTS (SELECT 1 FROM chat_sessions c
+                                       WHERE c.session_id = $2 AND c.user_id = f.user_id))"#,
+        )
+        .bind(trace_id)
+        .bind(&claimed)
+        .fetch_one(&self.db)
+        .await
+        .map_err(internal)?;
+        if !consistent {
+            tracing::warn!(%trace_id, session_id = %claimed, "trace's session.id conflicts with its flow owner");
+            return Err(not_found());
+        }
+        Ok(claimed)
     }
 
     // ── 1. session/list ──────────────────────────────────────────────────────
