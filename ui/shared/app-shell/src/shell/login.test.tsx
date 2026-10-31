@@ -284,7 +284,7 @@ describe('the failed-logout notice', () => {
     it('a stale ?signout=failed after a newer sign-in shows no notice', async () => {
       // No barrier stored: someone signed in since (the barrier would be '1' otherwise).
       renderApp('/login?signout=failed')
-      await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+      await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
       expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
     })
 
@@ -324,7 +324,7 @@ describe('layout', () => {
   it('keeps the decorative showcase out of the accessibility tree and off narrow screens', async () => {
     configureMocks({ loggedIn: false })
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
     const panel = screen.getByTestId('login-showcase')
     expect(panel).toHaveAttribute('aria-hidden', 'true')
     expect(panel).toHaveClass('hidden', 'md:flex')
@@ -334,13 +334,13 @@ describe('layout', () => {
     expect(panel.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(panel.querySelector('svg[role="img"]')).toBeNull()
     expect(panel.querySelector('svg')).not.toBeNull()
-    expect(screen.getByRole('img', { name: 'Nasiko' })).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: 'Nandatown' })).toBeInTheDocument()
   })
 
   it('offers no password reset or remember-me the server cannot honour', async () => {
     configureMocks({ loggedIn: false })
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
     expect(screen.queryByText(/forgot password/i)).toBeNull()
     expect(screen.queryByText(/keep me signed in/i)).toBeNull()
   })
@@ -362,7 +362,7 @@ describe('layout', () => {
   it('has no mode switch: the page follows the stored choice or the system', async () => {
     configureMocks({ loggedIn: false })
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
     expect(screen.queryByRole('radiogroup', { name: 'Mode' })).toBeNull()
   })
 

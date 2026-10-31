@@ -313,7 +313,7 @@ describe('TokenOps page', () => {
   it('no session: redirects to login with a relative redirect and no "expired" copy', async () => {
     configureMocks({ loggedIn: false })
     const { router } = renderApp('/tokenops?preset=7d')
-    expect(await screen.findByRole('heading', { name: 'Sign in to Nasiko' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Sign in to Nandatown' })).toBeInTheDocument()
     expect((router.state.location.search as { redirect?: string }).redirect).toMatch(
       /^\/tokenops\?preset=7d/,
     )
@@ -324,7 +324,7 @@ describe('TokenOps page', () => {
     configureMocks({ loggedIn: false })
     const user = userEvent.setup()
     const { router } = renderApp('/tokenops?open=all&preset=7d')
-    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
     await user.type(screen.getByLabelText('Username'), 'admin')
     await user.type(screen.getByLabelText('Password'), 'x')
     await user.click(screen.getByRole('button', { name: 'Sign in' }))

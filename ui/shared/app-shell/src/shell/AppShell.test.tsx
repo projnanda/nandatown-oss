@@ -138,7 +138,7 @@ describe('sidebar items', () => {
 
   it('renders /login without the sidebar', async () => {
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
     expect(screen.queryByRole('navigation', { name: 'Main' })).toBeNull()
   })
 
@@ -155,7 +155,7 @@ describe('sidebar items', () => {
   it.each(['/', '/status'])('sends a signed-out visitor from %s to /login', async (url) => {
     configureMocks({ loggedIn: false })
     const { router } = renderApp(url)
-    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
     expect(router.state.location.pathname).toBe('/login')
     expect(router.state.location.search).toMatchObject({ redirect: url })
   })

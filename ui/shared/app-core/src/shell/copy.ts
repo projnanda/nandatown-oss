@@ -1,6 +1,6 @@
 /** Every user-facing string of the app shell (sidebar, theme menu, sign out). */
 export const copy = {
-  brand: 'Nasiko',
+  brand: 'Nandatown',
   brandTooltip: '',
   navLabel: 'Main',
   // The drill-in panel's way back (Chat, Settings): it reads "Back"; its name (and tooltip) says where to: the page
@@ -134,9 +134,9 @@ export const copy = {
     sidebarTour: 'Tour the sidebar',
   },
   login: {
-    title: 'Sign in to Nasiko',
+    title: 'Sign in to Nandatown',
     // The decorative showcase beside the form (aria-hidden; the h1 names the page). Its chips are `nav` labels.
-    showcaseTitle: 'Nasiko',
+    showcaseTitle: 'Nandatown',
     // nasiko.com's hero: the lead, then each word in turn, looping (LoginShowcase). In the prototype's order; the
     // chips and the layer stack carry the same words.
     showcaseLead: 'The OpenRuntime for',
@@ -156,7 +156,7 @@ export const copy = {
     // nasiko.com's own summary (its meta description). Mock mode pre-fills the form and the sidebar badge says MOCK
     // DATA; the local live login (admin / changeme) is in CLAUDE.md.
     tagline:
-      'Nasiko helps enterprises account for what their AI agents cost, can access, and do, across every model and provider.',
+      'Nandatown helps enterprises account for what their AI agents cost, can access, and do, across every model and provider.',
     passwordChanged: 'Password changed. Please sign in again with your new password.',
     wrongCredentials: 'Wrong username or password.',
     rateLimited: 'Too many attempts. Wait a minute and try again.',
