@@ -1,4 +1,4 @@
-name: Deploy nandatown-oss demo (nandatown.dev)
+name: Deploy nandatown-oss demo (nandatown-oss.projectnanda.org)
 
 # Redeploys the public demo on every push to main: rsync the checked-out tree
 # to the demo VM and rebuild+restart the server via docker compose.
@@ -55,8 +55,15 @@ jobs:
             docker compose up -d --build server
           '
 
+      # Through the public hostname, so it covers DNS, Caddy's TLS and the
+      # proxy hop as well as the server itself.
       - name: Smoke test
         run: |
-          sleep 5
-          curl -fsS "http://${{ secrets.DEPLOY_HOST }}:80/health" || \
-          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.DEPLOY_HOST }} 'docker compose -f ~/nandatown-oss/docker-compose.yml -f ~/nandatown-oss/docker-compose.override.yml exec -T server true && curl -fsS http://localhost:8080/health'
+          for i in $(seq 1 24); do
+            if curl -fsS "https://nandatown-oss.projectnanda.org/health"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "nandatown-oss.projectnanda.org never became healthy after 120s" >&2
+          exit 1
