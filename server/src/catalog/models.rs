@@ -32,10 +32,30 @@ pub struct Agent {
     pub metadata: sqlx::types::Json<serde_json::Value>,
     pub status: String,
     pub image: Option<String>,
+    /// Workload kind: `agent` (default), `mcp_connector`, or `acp_coding_agent`.
+    /// Exposed so clients can tell a coding agent apart from a normal one (e.g.
+    /// `nasiko chat` labels it, and `--coding-agent` asserts on it).
+    #[serde(default)]
+    pub workload_kind: String,
     /// Path of the agent's advertised JSON-RPC transport (e.g. "/jsonrpc"),
     /// extracted from its AgentCard `supportedInterfaces` at deploy time.
     /// Clients chat via `{base}/api/agents/{id}{transport_path}`.
     pub transport_path: Option<String>,
+    /// Drives the control plane's own minimal-code ladder injection at A2A
+    /// dispatch time (a2a_dispatch.rs), not a secret — unlike the old
+    /// CODING_AGENT_MINIMAL_CODE env var this replaces, this column has a
+    /// real read-back route, which is what lets the Settings-tab switch show
+    /// its actual current state instead of a per-browser guess.
+    pub minimal_code_enabled: bool,
+    /// Per-agent opt-in for structural payload compression on this agent's LLM calls
+    /// (`nasiko-compress`, applied in the LLM router). Off unless explicitly enabled.
+    #[serde(default)]
+    pub compress_enabled: bool,
+    /// Whether this coding agent gates its tool use behind human approval
+    /// (NAS-842). Off unless explicitly enabled; only meaningful for
+    /// `workload_kind = acp_coding_agent`.
+    #[serde(default)]
+    pub hitl_enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -49,6 +69,28 @@ pub struct Skill {
     pub tags: Vec<String>,
     #[serde(default)]
     pub examples: Vec<serde_json::Value>,
+}
+
+/// Whether an agent's card reads as code work, and so should be offered minimal-code mode.
+///
+/// The single implementation behind all three consumers: the A2A dispatch path (which decides
+/// whether to inject the ladder), the agent detail response (which decides whether the
+/// settings page renders the toggle), and through that response, the settings page itself.
+/// They previously each derived this for themselves — a Postgres `ILIKE '%code%'` and a
+/// mirrored JavaScript `/code/i` — and both were wrong in the same two ways, because a
+/// substring match on "code" misses `coding` entirely while matching `encode`.
+///
+/// `description` is deliberately not searched: it is prose, and matching it would classify a
+/// documentation agent that merely mentions code as a coding agent.
+pub fn has_coding_skills(skills: &[Skill]) -> bool {
+    skills.iter().any(|skill| {
+        nasiko_coding_policy::mentions_coding(&skill.id)
+            || nasiko_coding_policy::mentions_coding(&skill.name)
+            || skill
+                .tags
+                .iter()
+                .any(|tag| nasiko_coding_policy::mentions_coding(tag))
+    })
 }
 
 /// Lightweight projection returned by the by-skill discovery endpoint.
@@ -91,10 +133,16 @@ pub struct CreateAgent {
     pub skills: Option<Vec<Skill>>,
     pub tags: Option<Vec<String>>,
     pub metadata: Option<serde_json::Value>,
-    /// `push`/`deploy` already send this; previously silently dropped since
-    /// this struct had no field to catch it, leaving `agents.image` NULL
-    /// until the first update/reupload set it.
     pub image: Option<String>,
+    /// Workload kind for this agent: `agent` (default), `mcp_connector`, or
+    /// `acp_coding_agent`. Set to `acp_coding_agent` to register an ACP coding
+    /// agent so the proxy drives it over a stdio turn instead of HTTP. Omitted
+    /// defaults to `agent`.
+    pub workload_kind: Option<String>,
+    /// Enable human-in-the-loop approval for this coding agent's tool use
+    /// (NAS-842): each ACP permission request is routed to a human instead of
+    /// auto-approved. Omitted = off. Only meaningful for `acp_coding_agent`.
+    pub hitl_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -111,6 +159,8 @@ pub struct UpdateAgent {
     pub metadata: Option<serde_json::Value>,
     pub status: Option<String>,
     pub image: Option<String>,
+    /// Toggle payload compression for this agent. Omitted = leave as-is.
+    pub compress_enabled: Option<bool>,
     /// `true` (the default) for a real deploy — the new version becomes
     /// active, archiving whatever was running before. `nasiko push` sets
     /// this `false`: it only makes an image available in the registry
@@ -118,6 +168,15 @@ pub struct UpdateAgent {
     /// active or archive the version that's genuinely still running.
     #[serde(default = "default_activate_version")]
     pub activate_version: bool,
+    pub minimal_code_enabled: Option<bool>,
+    /// Workload kind: `agent`, `mcp_connector`, or `acp_coding_agent`. Omitted =
+    /// leave as-is (so an ordinary metadata edit never clears it); present =
+    /// overwrite, which is how `nasiko deploy --coding-agent` promotes an
+    /// already-registered agent to a coding agent.
+    pub workload_kind: Option<String>,
+    /// Toggle human-in-the-loop approval for this coding agent (NAS-842).
+    /// Omitted = leave as-is, so an ordinary metadata edit never flips it.
+    pub hitl_enabled: Option<bool>,
 }
 
 fn default_activate_version() -> bool {

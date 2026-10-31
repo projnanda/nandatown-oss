@@ -2,7 +2,13 @@ use async_trait::async_trait;
 use chrono::Utc;
 use sqlx::PgPool;
 
+use crate::DelegatedIdentity;
 use crate::{AuthError, AuthService, Identity, LoginResult, TOKEN_EXPIRY_SECS};
+
+/// Lock account after this many consecutive failed login attempts.
+const LOGIN_LOCKOUT_THRESHOLD: i32 = 3;
+/// Lockout duration in seconds (15 minutes).
+const LOGIN_LOCKOUT_DURATION_SECS: u64 = 15 * 60;
 
 /// DB-backed implementation of AuthService.
 /// Handles user lookup, password verification, token issuance, and revocation.
@@ -58,10 +64,155 @@ impl AuthServiceImpl {
     }
 }
 
+/// How many usernames `insert_oauth_user` tries: the provider's own, then
+/// `-2` up to `-{MAX_OAUTH_USERNAME_ATTEMPTS}`.
+const MAX_OAUTH_USERNAME_ATTEMPTS: u32 = 20;
+
+impl AuthServiceImpl {
+    /// Creates the account for a first-time external sign-in and returns its
+    /// id. When the provider's username is already taken
+    /// by another account (live or soft-deleted), a numbered variant is used
+    /// instead; the existing account is never touched.
+    async fn insert_oauth_user(
+        &self,
+        username: &str,
+        provider: &str,
+        verified_email: Option<&str>,
+    ) -> Result<uuid::Uuid, AuthError> {
+        for attempt in 1..=MAX_OAUTH_USERNAME_ATTEMPTS {
+            let candidate = if attempt == 1 {
+                username.to_owned()
+            } else {
+                format!("{username}-{attempt}")
+            };
+            // Persist the real verified email when present; otherwise a
+            // synthetic placeholder keeps the NOT NULL UNIQUE `email` column
+            // satisfied (single-tenant path).
+            let email = verified_email
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{candidate}@{provider}.users"));
+            // DO NOTHING on any unique conflict (username or email): no
+            // existing row is updated, and RETURNING yields nothing.
+            let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+                "INSERT INTO users (username, email, is_superuser, is_active, last_login) \
+                 VALUES ($1, $2, false, true, now()) \
+                 ON CONFLICT DO NOTHING \
+                 RETURNING id",
+            )
+            .bind(&candidate)
+            .bind(&email)
+            .fetch_optional(&self.db)
+            .await?;
+            if let Some((id,)) = row {
+                return Ok(id);
+            }
+        }
+        Err(AuthError::Conflict(format!(
+            "no free username derived from '{username}'"
+        )))
+    }
+}
+
 #[async_trait]
 impl AuthService for AuthServiceImpl {
     async fn validate_token(&self, token: &str) -> Result<Identity, AuthError> {
         crate::jwt::decode_jwt(&self.jwt_secret, token)
+    }
+
+    /// A superuser, or an active, non-deleted user with `role = 'admin'`. The
+    /// role is read from the database rather than the token, so a demotion
+    /// takes effect at once. A failed lookup denies.
+    async fn can_manage_users(&self, identity: &Identity) -> bool {
+        if identity.is_superuser {
+            return true;
+        }
+        let Ok(user_id) = identity.user_id.parse::<uuid::Uuid>() else {
+            return false;
+        };
+        // A lookup error denies (`unwrap_or(None)`); this crate has no logger,
+        // and the caller answers 403 either way.
+        let is_admin: Option<bool> = sqlx::query_scalar(
+            "SELECT role = 'admin' FROM users \
+             WHERE id = $1 AND is_active AND deleted_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await
+        .unwrap_or(None);
+        is_admin == Some(true)
+    }
+
+    async fn issue_delegated_token(
+        &self,
+        identity: &Identity,
+        request: &crate::DelegationRequest,
+    ) -> Result<crate::IssuedDelegation, AuthError> {
+        let scopes = crate::check_delegation_scopes(&request.scopes)?;
+        let ttl = request.ttl_secs.clamp(1, crate::DELEGATION_MAX_TTL_SECS);
+        let (token, jti) = crate::jwt::encode_delegated_jwt(
+            &self.jwt_secret,
+            ttl,
+            identity,
+            &request.audience,
+            &scopes,
+            &request.parent_jti,
+        )?;
+        // Recorded with the user's id and its OWN short expiry, so
+        // revoke_tokens_for_user / revoke_token(jti) cover it and the row
+        // ages out quickly.
+        let user_uuid = identity
+            .user_id
+            .parse::<uuid::Uuid>()
+            .map_err(|_| AuthError::NotFound)?;
+        let expires = Utc::now() + chrono::Duration::seconds(ttl as i64);
+        sqlx::query(
+            "INSERT INTO auth_tokens (user_id, token_hash, expires_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (token_hash) DO NOTHING",
+        )
+        .bind(user_uuid)
+        .bind(crate::jwt::hash_jti(&jti))
+        .bind(expires)
+        .execute(&self.db)
+        .await
+        .map_err(AuthError::Database)?;
+        Ok(crate::IssuedDelegation {
+            token,
+            jti,
+            expires_in: ttl,
+            scopes,
+        })
+    }
+
+    async fn validate_delegated_token(
+        &self,
+        token: &str,
+        expected_audience: &str,
+    ) -> Result<DelegatedIdentity, AuthError> {
+        let d = crate::jwt::decode_delegated_jwt(&self.jwt_secret, token, expected_audience)?;
+        // Same revocation + caller-exists rule as a session (fail closed).
+        let caller_id = d.identity.user_id.parse::<uuid::Uuid>().ok();
+        let (revoked, caller_exists): (bool, bool) = sqlx::query_as(
+            "SELECT
+                 EXISTS(SELECT 1 FROM auth_tokens
+                         WHERE token_hash = $1 AND revoked_at IS NOT NULL),
+                 EXISTS(SELECT 1 FROM users
+                         WHERE id = $2 AND deleted_at IS NULL)",
+        )
+        .bind(crate::jwt::hash_jti(&d.jti))
+        .bind(caller_id)
+        .fetch_one(&self.db)
+        .await
+        .map_err(AuthError::Database)?;
+        if revoked {
+            return Err(AuthError::Revoked);
+        }
+        if caller_id.is_none() || !caller_exists {
+            return Err(AuthError::InvalidToken(
+                "delegated user no longer exists".into(),
+            ));
+        }
+        Ok(d)
     }
 
     async fn issue_token(&self, identity: &Identity) -> Result<String, AuthError> {
@@ -84,11 +235,13 @@ impl AuthService for AuthServiceImpl {
             is_superuser: bool,
             is_active: bool,
             access_secret_hash: String,
+            failed_login_attempts: i32,
+            locked_until: Option<chrono::DateTime<chrono::Utc>>,
         }
 
         let row: Option<CredRow> = sqlx::query_as(
             r#"SELECT u.id, u.username, u.is_superuser, u.is_active,
-                      uc.access_secret_hash
+                      uc.access_secret_hash, u.failed_login_attempts, u.locked_until
                FROM users u
                JOIN user_credentials uc ON uc.user_id = u.id
                WHERE (uc.access_key = $1 OR u.username = $1) AND u.deleted_at IS NULL"#,
@@ -97,20 +250,65 @@ impl AuthService for AuthServiceImpl {
         .fetch_optional(&self.db)
         .await?;
 
-        let row = row.ok_or(AuthError::InvalidCredentials)?;
+        let row = row.ok_or(AuthError::InvalidCredentials {
+            remaining_attempts: None,
+        })?;
 
         if !row.is_active {
             return Err(AuthError::Disabled);
         }
 
-        if !crate::verify_password_async(password, &row.access_secret_hash).await {
-            return Err(AuthError::InvalidCredentials);
-        }
-
-        let _ = sqlx::query("UPDATE users SET last_login = now() WHERE id = $1")
+        // Check lockout: 3 consecutive failures → locked for 15 minutes.
+        if let Some(locked_until) = row.locked_until {
+            let now = chrono::Utc::now();
+            if now < locked_until {
+                let remaining = (locked_until - now).num_seconds().max(0) as u64;
+                return Err(AuthError::AccountLocked {
+                    retry_after_secs: remaining,
+                });
+            }
+            // Lockout expired — clear it so the attempt proceeds.
+            let _ = sqlx::query(
+                "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1",
+            )
             .bind(row.id)
             .execute(&self.db)
             .await;
+        }
+
+        if !crate::verify_password_async(password, &row.access_secret_hash).await {
+            let attempts = row.failed_login_attempts + 1;
+            if attempts >= LOGIN_LOCKOUT_THRESHOLD {
+                let _ = sqlx::query(
+                    "UPDATE users SET failed_login_attempts = $2, \
+                     locked_until = now() + interval '15 minutes' WHERE id = $1",
+                )
+                .bind(row.id)
+                .bind(attempts)
+                .execute(&self.db)
+                .await;
+                return Err(AuthError::AccountLocked {
+                    retry_after_secs: LOGIN_LOCKOUT_DURATION_SECS,
+                });
+            }
+            let _ = sqlx::query("UPDATE users SET failed_login_attempts = $2 WHERE id = $1")
+                .bind(row.id)
+                .bind(attempts)
+                .execute(&self.db)
+                .await;
+            let remaining = LOGIN_LOCKOUT_THRESHOLD - attempts;
+            return Err(AuthError::InvalidCredentials {
+                remaining_attempts: Some(remaining),
+            });
+        }
+
+        // Successful login — reset failed attempts and update last_login.
+        let _ = sqlx::query(
+            "UPDATE users SET last_login = now(), failed_login_attempts = 0, locked_until = NULL WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&self.db)
+        .await;
 
         let identity = Identity {
             user_id: row.id.to_string(),
@@ -215,15 +413,29 @@ impl AuthService for AuthServiceImpl {
         username: &str,
         verified_email: Option<&str>,
     ) -> Result<LoginResult, AuthError> {
-        let existing: Option<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT user_id FROM user_identities WHERE provider = $1 AND provider_id = $2",
+        // Join `users`: `user_identities.user_id` cascades only on a *hard* delete
+        // (0001_schema.sql), so a soft-deleted user keeps every identity row
+        // pointing at it. Reading the identity alone would hand back a
+        // deprovisioned user_id, and the `is_superuser` read at the end of this
+        // function — filtered on `deleted_at IS NULL` — would then fail as
+        // RowNotFound, surfacing a deactivated account as an opaque 500-class
+        // error. Reject here instead, before any row is touched.
+        let existing: Option<(uuid::Uuid, bool, bool)> = sqlx::query_as(
+            "SELECT u.id, u.is_active, (u.deleted_at IS NULL) \
+             FROM user_identities ui JOIN users u ON u.id = ui.user_id \
+             WHERE ui.provider = $1 AND ui.provider_id = $2",
         )
         .bind(provider)
         .bind(provider_id)
         .fetch_optional(&self.db)
         .await?;
 
-        let user_id = if let Some((uid,)) = existing {
+        let user_id = if let Some((uid, is_active, not_deleted)) = existing {
+            // Same bar as the password path (`login` above): a deactivated or
+            // deprovisioned account cannot trade an IdP assertion for a token.
+            if !not_deleted || !is_active {
+                return Err(AuthError::Disabled);
+            }
             let _ = sqlx::query("UPDATE users SET last_login = now() WHERE id = $1")
                 .bind(uid)
                 .execute(&self.db)
@@ -236,37 +448,39 @@ impl AuthService for AuthServiceImpl {
             // this is how one person keeps a single CP user across Google + GitHub.
             // Synthetic placeholders (`{username}@{provider}.users`) are never
             // matched: callers only pass emails they have verified.
-            let linked: Option<(uuid::Uuid,)> = match verified_email {
-                Some(email) => {
-                    sqlx::query_as("SELECT id FROM users WHERE email = $1 AND deleted_at IS NULL")
-                        .bind(email)
-                        .fetch_optional(&self.db)
-                        .await?
-                }
-                None => None,
-            };
+            // `is_active` comes back with the id rather than being folded into the
+            // WHERE: a deactivated owner of this email must be *rejected*, not
+            // skipped. Filtering it out here would fall through to the INSERT
+            // below and trip the UNIQUE `email` constraint instead.
+            let linked: Option<(uuid::Uuid, bool)> =
+                match verified_email {
+                    Some(email) => sqlx::query_as(
+                        "SELECT id, is_active FROM users WHERE email = $1 AND deleted_at IS NULL",
+                    )
+                    .bind(email)
+                    .fetch_optional(&self.db)
+                    .await?,
+                    None => None,
+                };
 
-            let user_id = if let Some((uid,)) = linked {
+            let user_id = if let Some((uid, is_active)) = linked {
+                if !is_active {
+                    return Err(AuthError::Disabled);
+                }
                 let _ = sqlx::query("UPDATE users SET last_login = now() WHERE id = $1")
                     .bind(uid)
                     .execute(&self.db)
                     .await;
                 uid
             } else {
-                // Brand-new user. Persist the real verified email when present;
-                // otherwise fall back to the synthetic placeholder so the NOT NULL
-                // UNIQUE `email` column stays satisfied (single-tenant path, unchanged).
-                let email = verified_email
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("{}@{}.users", username, provider));
-                let row: (uuid::Uuid,) = sqlx::query_as(
-                    "INSERT INTO users (username, email, is_superuser, is_active, last_login) VALUES ($1, $2, false, true, now()) RETURNING id",
-                )
-                .bind(username)
-                .bind(&email)
-                .fetch_one(&self.db)
-                .await?;
-                row.0
+                // Brand-new user. Never adopt an existing row because its username
+                // matches: the username comes from the identity provider and is
+                // chosen by whoever owns that account, so matching on it would
+                // hand a local account (a seeded admin, say) to anyone who
+                // registers the same login. Linking to an existing user goes only
+                // through the verified-email branch above.
+                self.insert_oauth_user(username, provider, verified_email)
+                    .await?
             };
 
             // Link this provider identity to the user (new or existing). ON CONFLICT
@@ -294,13 +508,27 @@ impl AuthService for AuthServiceImpl {
         // "creator is admin" path a no-op. A brand-new SSO user was just INSERTed
         // above with `is_superuser=false`, so this reads false for them: the
         // "new SSO users land as members" default is unchanged.
-        let is_superuser: bool = sqlx::query_scalar(
-            "SELECT is_superuser FROM users WHERE id = $1 AND deleted_at IS NULL",
+        //
+        // `fetch_optional` + `Disabled`, never `fetch_one`: this read is filtered
+        // on `deleted_at IS NULL`, so `fetch_one` turns every deprovisioned
+        // account into `Database(RowNotFound)` — a 500-class error for what is an
+        // ordinary, expected rejection. The branches above reject early; this is
+        // the backstop that keeps any future one from reintroducing the crash.
+        let live: Option<(bool, bool, String)> = sqlx::query_as(
+            "SELECT is_superuser, is_active, username FROM users WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(user_id)
-        .fetch_one(&self.db)
+        .fetch_optional(&self.db)
         .await?;
 
+        let (is_superuser, is_active, stored_username) = live.ok_or(AuthError::Disabled)?;
+        if !is_active {
+            return Err(AuthError::Disabled);
+        }
+
+        // The account's own username, not the provider's: they differ when the
+        // account was created under a de-duplicated name or linked by email.
+        let username = stored_username.as_str();
         let identity = Identity {
             user_id: user_id.to_string(),
             username: username.to_owned(),

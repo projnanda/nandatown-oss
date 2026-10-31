@@ -204,6 +204,7 @@ fn minimal_spec() -> DeploymentSpec {
         image: "my-registry/agent:latest".to_owned(),
         min_replicas: 1,
         max_replicas: 3,
+        replica_target: None,
         env_vars: HashMap::new(),
         ports: vec![8080],
         resources: None,
@@ -215,6 +216,7 @@ fn minimal_spec() -> DeploymentSpec {
         writable: false,
         writable_path: None,
         owner_id: uuid::Uuid::nil(),
+        force_pull: false,
     }
 }
 
@@ -243,6 +245,7 @@ fn deployment_spec_with_all_fields() {
         image: "harbor.example.io/agents/full-agent:v1.2.3".to_owned(),
         min_replicas: 2,
         max_replicas: 5,
+        replica_target: None,
         env_vars,
         ports: vec![8080, 9090],
         resources: Some(ResourceLimits {
@@ -257,6 +260,7 @@ fn deployment_spec_with_all_fields() {
         writable: true,
         writable_path: None,
         owner_id: uuid::Uuid::nil(),
+        force_pull: false,
     };
 
     assert_eq!(spec.min_replicas, 2);
@@ -291,6 +295,26 @@ fn deployment_spec_validate_port_zero_fails() {
     let mut spec = minimal_spec();
     spec.ports = vec![0];
     assert!(spec.validate().is_err());
+}
+
+#[test]
+fn coding_agent_may_have_no_ports() {
+    use nasiko_runtime::WorkloadKind;
+    // A coding agent is driven over stdio and exposes no inbound HTTP port, so
+    // an empty `ports` list is valid for it — unlike every other workload.
+    let mut spec = minimal_spec();
+    spec.workload_kind = WorkloadKind::AcpCodingAgent;
+    spec.ports = vec![];
+    assert!(
+        spec.validate().is_ok(),
+        "coding agent with no ports should validate"
+    );
+    // A declared port is still checked when present.
+    spec.ports = vec![0];
+    assert!(
+        spec.validate().is_err(),
+        "port 0 is invalid even for a coding agent"
+    );
 }
 
 #[test]
@@ -454,6 +478,25 @@ fn workload_kind_default_is_agent() {
 }
 
 #[test]
+fn workload_kind_db_str_roundtrips_and_matches_check_constraint() {
+    use nasiko_runtime::WorkloadKind;
+    // These exact strings are the `agents.workload_kind` CHECK set
+    // (migration 0054); if a variant's token drifts, an INSERT would be
+    // rejected at runtime, so pin them here.
+    for (kind, token) in [
+        (WorkloadKind::Agent, "agent"),
+        (WorkloadKind::McpConnector, "mcp_connector"),
+        (WorkloadKind::AcpCodingAgent, "acp_coding_agent"),
+    ] {
+        assert_eq!(kind.as_db_str(), token);
+        assert_eq!(WorkloadKind::from_db_str(token), Some(kind));
+    }
+    // Anything outside the CHECK set is rejected rather than silently mapped.
+    assert_eq!(WorkloadKind::from_db_str("bogus"), None);
+    assert_eq!(WorkloadKind::from_db_str(""), None);
+}
+
+#[test]
 fn writable_path_validation_rules() {
     use nasiko_runtime::validate_writable_path as v;
     // Accepted: absolute, dedicated state directories.
@@ -485,4 +528,36 @@ fn writable_mount_path_defaults_to_workspace() {
     assert_eq!(spec.writable_mount_path(), "/workspace");
     spec.writable_path = Some("/app/data".to_owned());
     assert_eq!(spec.writable_mount_path(), "/app/data");
+}
+
+#[test]
+fn workspace_relative_path_validation_rules() {
+    use nasiko_runtime::validate_workspace_relative_path as v;
+    // Accepted: anything that stays inside the agent's own directory.
+    assert!(v("add_numbers.py").is_ok());
+    assert!(v("sub/dir/file.py").is_ok());
+    assert!(v("a b/c-d_e.tar.gz").is_ok());
+    // Rejected: every shape that could escape it, plus the degenerate ones.
+    assert!(v("").is_err(), "empty");
+    assert!(v("/etc/passwd").is_err(), "absolute");
+    assert!(v("../x").is_err(), "traversal");
+    assert!(v("a/../../etc/passwd").is_err(), "nested traversal");
+    assert!(v("./x").is_err(), "single-dot segment");
+    assert!(v("a//b").is_err(), "empty segment");
+    assert!(v("a:b").is_err(), "colon");
+    assert!(v("a\\b").is_err(), "backslash");
+    assert!(v("a\nb").is_err(), "control char");
+    assert!(v(&"x".repeat(300)).is_err(), "over-long");
+}
+
+#[test]
+fn workspace_ref_subpath_matches_the_volume_layout() {
+    use nasiko_runtime::{ContainerId, WorkspaceRef};
+    let r = WorkspaceRef {
+        owner_id: uuid::Uuid::from_u128(0x42),
+        container_id: ContainerId::new("agent-1"),
+    };
+    // Must stay byte-identical to what the backends mount, or a read would
+    // look in a directory nothing writes to.
+    assert_eq!(r.subpath(), format!("{}/agent-1", r.owner_id));
 }

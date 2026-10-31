@@ -11,6 +11,28 @@
 //! DNS-rebinding gap between validation and the later connection is closed by
 //! [`GuardedResolver`], installed on the generic-backend client so reqwest
 //! connects only to addresses that pass the same check at resolution time.
+//!
+//! A `GenericMcpProvider` also holds a **second, unguarded** client — this is
+//! not a bypass of the guard above. It exists solely for `MCPServerConfig`s
+//! whose `trusted` flag is `true`, meaning the connector's `url` was never
+//! typed by a user in the first place. Two distinct cases set it: (1) an
+//! `uploaded_build` MCP-server connector, whose address was resolved by the
+//! platform's own `ContainerRuntime::endpoint()` after building and deploying
+//! the user's uploaded source, and (2) a `provider_type = 'system'`
+//! connector — a platform-owned backend the control plane serves itself on
+//! loopback, never registered through any user-facing path
+//! (`connectors::register_connector` hardcodes `provider_type =
+//! 'mcp_server'`; `update_connector`/the share endpoints reject any row
+//! that isn't `mcp_server`). Both addresses are necessarily internal/private
+//! (a container on the platform's own Docker network, or the control plane's
+//! own loopback), which is exactly what this guard exists to reject for
+//! *user-supplied* URLs — so live traffic to either kind of `trusted`
+//! connector must route around the guard, not through it. `trusted` is
+//! computed in exactly one place (`credentials::build_server_config`) from
+//! the connector's `source_kind`/`provider_type` columns and is never
+//! accepted as external input anywhere (not in `NewConnectorInput`, the HTTP
+//! `CreateConnector` body, or any CLI argument) — see
+//! `provider/generic.rs::GenericMcpProvider`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;

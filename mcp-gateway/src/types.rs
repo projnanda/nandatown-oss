@@ -11,9 +11,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-/// MCP protocol version advertised in the `initialize` handshake. Matches the
-/// version the PoC negotiated and the streamable-HTTP transport expects.
-pub const PROTOCOL_VERSION: &str = "2024-11-05";
+/// Versions this gateway implements. Order = preference. The first entry is
+/// what we answer when the client asks for something we don't know.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
+/// What `handle_initialize` answers with when the client didn't ask for a
+/// version we recognize (unknown, missing, or non-string `protocolVersion`).
+pub const LATEST_PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+/// Header name a client that negotiated a protocol version in `initialize`
+/// sends on every subsequent request (case-insensitive on the wire; `axum`'s
+/// `HeaderMap` normalizes lookups regardless of the case used here).
+pub const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 // ─── JSON-RPC 2.0 envelope ──────────────────────────────────────────────────
 
@@ -100,6 +107,12 @@ pub mod codes {
     pub const TOOL_BLOCKED: i64 = -32000;
     /// Tool requires user approval (permission stance = ask).
     pub const TOOL_ASK: i64 = -32001;
+    /// Tool's connector needs the user to (re-)authenticate — the credential
+    /// is missing or no longer works (`ConnectorUnusable::AuthRequired`), as
+    /// opposed to `TOOL_BLOCKED`'s "administratively disabled". A pending
+    /// `hitl_requests` row (`kind=auth_required`) is created alongside this
+    /// response — see `protocol::handle_tools_call`.
+    pub const AUTH_REQUIRED: i64 = -32002;
 }
 
 // ─── Backend / auth descriptors ─────────────────────────────────────────────
@@ -144,6 +157,29 @@ impl AuthType {
             _ => None,
         }
     }
+}
+
+/// Why a generic connector's per-user credential is currently unusable —
+/// computed once in `credentials::build_server_config` so later stages (e.g.
+/// a future AuthRequired signal) don't have to re-derive "why", only
+/// "whether". Purely an internal signal for now: nothing outside
+/// `oss/mcp-gateway` branches on this yet, and the JSON-RPC error an agent
+/// sees is unchanged regardless of which variant applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorUnusable {
+    /// The connector's own configuration is incomplete or invalid (no
+    /// `url`, a `url_param` connector missing `url_param_name`, or an
+    /// unrecognized `auth_type`) — not a credential problem at all.
+    NotConfigured,
+    /// No credential has ever been supplied for this user: no stored
+    /// credential/OAuth connection row, or an `oauth2` connector with no
+    /// connection at all yet.
+    MissingCredential,
+    /// A credential was supplied but no longer works — decrypt failure, or
+    /// an OAuth2 refresh that failed because the token was rejected,
+    /// revoked, expired, or the refresh request itself failed. The user
+    /// must re-authenticate.
+    AuthRequired,
 }
 
 /// The two kinds of tool backends the gateway aggregates over.
@@ -230,6 +266,8 @@ pub struct AccessReason {
     pub user_id: Uuid,
     pub username: String,
     pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub role: Option<String>,
     pub via: String,
     pub via_label: Option<String>,
 }
@@ -245,6 +283,18 @@ pub struct OrgGrantConsumer {
     pub name: String,
     pub granted_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A connector that couldn't be built into a live backend this cycle, and
+/// why — computed once in `credentials::build_generic_servers` (from
+/// [`ConnectorUnusable`]) so `tools/call`'s routing-failure path can tell
+/// "needs re-authentication" apart from "genuinely unknown tool"/"disabled",
+/// without a second connector lookup at response time.
+#[derive(Debug, Clone)]
+pub struct UnusableConnector {
+    pub reason: ConnectorUnusable,
+    /// Display/log label only — mirrors [`MCPServerConfig::name`].
+    pub name: String,
 }
 
 /// A resolved backend the gateway will fan out to. The Composio session (when
@@ -264,14 +314,37 @@ pub struct MCPServerConfig {
     pub headers: HashMap<String, String>,
     #[serde(default = "default_transport")]
     pub transport: String,
-    /// True only for `source_kind = UploadedBuild` connectors, whose `url` was
-    /// resolved by `ContainerRuntime::endpoint()` and never typed by a user —
-    /// the SSRF guard (`net.rs`) exists specifically to stop a *user* pointing
-    /// the gateway at an internal address, so it doesn't apply here. Set
-    /// exactly once, in `credentials::build_generic_servers` — never derived or
+    /// True for the two kinds of backend whose `url` was never typed by a
+    /// user — the SSRF guard (`net.rs`) exists specifically to stop a *user*
+    /// pointing the gateway at an internal address, so it doesn't apply to
+    /// either: (1) `source_kind = UploadedBuild` connectors, whose `url` was
+    /// resolved by `ContainerRuntime::endpoint()`, and (2) `provider_type =
+    /// 'system'` connectors (`system` below), which are only ever inserted
+    /// by the platform itself (`register_connector` hardcodes
+    /// `provider_type = 'mcp_server'`; `update`/`share` reject any row that
+    /// isn't `mcp_server` — see their own doc comments) and whose `url` is
+    /// always a loopback address the control plane serves itself. Set
+    /// exactly once, in `credentials::build_server_config` — never derived or
     /// overridden anywhere else, and never accepted from external input.
     #[serde(default)]
     pub trusted: bool,
+    /// Platform-owned backend served by the control plane (provider_type='system'):
+    /// tools are exposed un-prefixed and requests skip the SSRF guard. Computed
+    /// only in `credentials::build_server_config`, like `trusted`.
+    #[serde(default)]
+    pub system: bool,
+    /// Bare tool names this backend owns; populated only for system backends,
+    /// from the synced `mcp_connector_tools` catalog, so bare-name routing is
+    /// exact (`router::route_tool` matches against this, never a naming
+    /// heuristic — a bare name is otherwise ambiguous with a Composio meta-tool
+    /// or toolkit slug, e.g. `GMAIL_SEND_EMAIL`). Empty for every non-system
+    /// backend.
+    #[serde(default)]
+    pub tool_names: Vec<String>,
+    /// The backend's `initialize.instructions`, forwarded by the gateway's own
+    /// `initialize`. `None` for backends that advertise none.
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 fn default_transport() -> String {
@@ -393,6 +466,22 @@ mod tests {
         assert_eq!(
             name.split_once("__"),
             Some(("abcdef0022223333", "SEND_EMAIL"))
+        );
+    }
+
+    #[test]
+    fn connector_unusable_variants_are_distinguishable() {
+        assert_ne!(
+            ConnectorUnusable::NotConfigured,
+            ConnectorUnusable::MissingCredential
+        );
+        assert_ne!(
+            ConnectorUnusable::MissingCredential,
+            ConnectorUnusable::AuthRequired
+        );
+        assert_ne!(
+            ConnectorUnusable::NotConfigured,
+            ConnectorUnusable::AuthRequired
         );
     }
 

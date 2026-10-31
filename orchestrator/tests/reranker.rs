@@ -15,6 +15,8 @@ fn make_agents(names: &[&str]) -> Vec<AgentCard> {
             skills: vec![],
             tags: vec![],
             url: None,
+            embedding: None,
+            embedding_content_hash: None,
         })
         .collect()
 }
@@ -73,6 +75,7 @@ async fn with_history_disabled_store_returns_first_k() {
             role: "user".into(),
             content: "hello".into(),
         }],
+        ..Default::default()
     };
     let result = reranker.rerank(agents, &history, "query", 2).await;
     assert_eq!(result.len(), 2);
@@ -88,6 +91,7 @@ async fn with_history_disabled_store_k_larger_than_list() {
             role: "assistant".into(),
             content: "previous answer".into(),
         }],
+        ..Default::default()
     };
     let result = reranker.rerank(agents, &history, "follow-up", 100).await;
     assert_eq!(result.len(), 2);
@@ -114,6 +118,7 @@ async fn empty_agent_list_with_history_returns_empty() {
             role: "user".into(),
             content: "some message".into(),
         }],
+        ..Default::default()
     };
     let result = reranker.rerank(vec![], &history, "query", 5).await;
     assert!(result.is_empty());
@@ -153,6 +158,8 @@ async fn with_history_and_live_store_returns_scored_results() {
             skills: vec!["rust".into()],
             tags: vec!["engineering".into()],
             url: None,
+            embedding: None,
+            embedding_content_hash: None,
         },
         AgentCard {
             id: Uuid::new_v4(),
@@ -161,18 +168,21 @@ async fn with_history_and_live_store_returns_scored_results() {
             skills: vec!["trading".into()],
             tags: vec!["finance".into()],
             url: None,
+            embedding: None,
+            embedding_content_hash: None,
         },
     ];
 
-    let cache = Default::default();
-    let store =
-        Arc::new(VectorStore::build(agents.clone(), api_key, base_url, model, &cache).await);
+    let db_url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+    let pool = sqlx::PgPool::connect(&db_url).await.unwrap();
+    let store = Arc::new(VectorStore::build(agents.clone(), api_key, base_url, model, &pool).await);
     let reranker = Reranker::new(store);
     let history = SessionHistory {
         messages: vec![ChatMessage {
             role: "user".into(),
             content: "I've been looking at BTC prices".into(),
         }],
+        ..Default::default()
     };
 
     let result = reranker

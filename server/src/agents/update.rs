@@ -451,6 +451,8 @@ pub async fn execute_agent_update(
 ) {
     let db = &state.db;
     let upload_id = build_id.to_string();
+    // Before anything resets the agent's state mode for the new image.
+    let scaling = state.agent_scaling.begin_deploy(agent_id).await;
 
     set_build_status(db, build_id, BuildStatus::Building).await;
     set_upload_status(db, &upload_id, &name, owner_id, "initiated", None, None).await;
@@ -522,17 +524,24 @@ pub async fn execute_agent_update(
         )
         .await;
 
-        let mut env = state.agent_env(agent_id).await;
-        // Inject LLM router wiring (agent JWT + base URL) so the updated agent
-        // keeps routing through the gateway. Best-effort — skipped if not configured.
-        // Uses agent_owner_id (the agent's real owner), NOT owner_id (the caller) —
+        // Read before the deploy env is built: a failed read must not rotate the running
+        // agent's credentials or reset its state mode for a deploy that never happens.
+        let replica_bounds = scaling
+            .bounds()
+            .await
+            .map_err(|e| format!("read replica bounds: {e}"))?;
+        // Built with agent_owner_id (the agent's real owner), NOT owner_id (the caller) -
         // a superuser/ACL-grantee updating someone else's agent must not cause that
         // agent to resolve the caller's secrets/llm_config instead of its own owner's.
-        crate::llm_router::wiring::inject_agent_llm_env(
-            &state.db,
-            &mut env,
+        // Nothing below can fail before `scaling.deploy` (spec building and the pull
+        // credential attach are infallible; the latter logs its errors), so the durable state
+        // mode the build above may have reset needs no restoring on an early exit.
+        let env = crate::agents::deploy_env::build(
+            &state,
             agent_id,
-            Some(agent_owner_id),
+            agent_owner_id,
+            Default::default(),
+            crate::agents::deploy_env::StateModeOnDeploy::Reset,
         )
         .await;
         // Key on the agent UUID (not name) so the update re-targets the existing
@@ -544,7 +553,7 @@ pub async fn execute_agent_update(
             vec![],
             env,
             &state.config.agent_default_memory,
-            state.config.agent_max_replicas,
+            replica_bounds,
             writable,
             writable_path.clone(),
             agent_owner_id,
@@ -560,8 +569,7 @@ pub async fn execute_agent_update(
         // Capture the ports build_agent_spec actually resolved (defaults empty -> 8000)
         // so they can be persisted below (RUN-3b) — restart reads this back.
         let spec_ports: Vec<i32> = spec.ports.iter().map(|&p| p as i32).collect();
-        let deploy_status = state
-            .runtime
+        let deploy_status = scaling
             .deploy(&spec)
             .await
             .map_err(|e| format!("deploy: {e}"))?;
@@ -898,6 +906,8 @@ pub async fn execute_agent_rollback(
     writable_path: Option<String>,
 ) {
     let db = &state.db;
+    // Before anything resets the agent's state mode for the rolled-back image.
+    let scaling = state.agent_scaling.begin_deploy(agent_id).await;
 
     tracing::info!(
         build_id = %rollback_build_id,
@@ -915,17 +925,33 @@ pub async fn execute_agent_rollback(
         .execute(db)
         .await;
 
-    let mut env = state.agent_env(agent_id).await;
-    // Inject LLM router wiring so the rolled-back agent keeps routing through the
-    // gateway. Best-effort — skipped if not configured.
-    // Uses agent_owner_id (the agent's real owner), NOT caller_id — a superuser/
+    // Read before the deploy env is built: a failed read must not rotate the running
+    // agent's credentials or reset its state mode for a deploy that never happens.
+    let replica_bounds = match scaling.bounds().await {
+        Ok(bounds) => bounds,
+        Err(e) => {
+            fail_rollback(
+                db,
+                rollback_build_id,
+                agent_id,
+                &format!("read replica bounds: {e}"),
+            )
+            .await;
+            return;
+        }
+    };
+    // Built with agent_owner_id (the agent's real owner), NOT caller_id - a superuser/
     // ACL-grantee rolling back someone else's agent must not cause that agent to
     // resolve the caller's secrets/llm_config instead of its own owner's.
-    crate::llm_router::wiring::inject_agent_llm_env(
-        &state.db,
-        &mut env,
+    // Nothing below can fail before `scaling.deploy` (spec building and the pull credential
+    // attach are infallible; the latter logs its errors), so the durable state mode the build
+    // may have reset needs no restoring on an early exit.
+    let env = crate::agents::deploy_env::build(
+        &state,
         agent_id,
-        Some(agent_owner_id),
+        agent_owner_id,
+        Default::default(),
+        crate::agents::deploy_env::StateModeOnDeploy::Reset,
     )
     .await;
     // `agent_versions.image_tag` for OCI-push deploys stores the registry-relative
@@ -942,7 +968,7 @@ pub async fn execute_agent_rollback(
         vec![],
         env,
         &state.config.agent_default_memory,
-        state.config.agent_max_replicas,
+        replica_bounds,
         writable,
         writable_path.clone(),
         agent_owner_id,
@@ -958,7 +984,7 @@ pub async fn execute_agent_rollback(
     // Capture the resolved ports so they can be persisted below (RUN-3b).
     let spec_ports: Vec<i32> = spec.ports.iter().map(|&p| p as i32).collect();
 
-    match state.runtime.deploy(&spec).await {
+    match scaling.deploy(&spec).await {
         Ok(deploy_status) => {
             // Deactivate current version, activate rollback target.
             let _ = sqlx::query(
@@ -1022,16 +1048,17 @@ pub async fn execute_agent_rollback(
             set_build_status(db, rollback_build_id, BuildStatus::Success).await;
             tracing::info!(build_id = %rollback_build_id, %agent_id, version = %target.version, "agent rollback succeeded");
         }
-        Err(e) => {
-            let _ = sqlx::query(
-                "UPDATE agents SET status = 'failed', updated_at = now() WHERE id = $1",
-            )
-            .bind(agent_id)
-            .execute(db)
-            .await;
-
-            set_build_status(db, rollback_build_id, BuildStatus::Failed).await;
-            tracing::error!(build_id = %rollback_build_id, %agent_id, %e, "agent rollback failed");
-        }
+        Err(e) => fail_rollback(db, rollback_build_id, agent_id, &e.to_string()).await,
     }
+}
+
+/// Marks a rollback that could not deploy, and its agent, failed.
+async fn fail_rollback(db: &sqlx::PgPool, rollback_build_id: Uuid, agent_id: Uuid, error: &str) {
+    let _ = sqlx::query("UPDATE agents SET status = 'failed', updated_at = now() WHERE id = $1")
+        .bind(agent_id)
+        .execute(db)
+        .await;
+
+    set_build_status(db, rollback_build_id, BuildStatus::Failed).await;
+    tracing::error!(build_id = %rollback_build_id, %agent_id, error, "agent rollback failed");
 }

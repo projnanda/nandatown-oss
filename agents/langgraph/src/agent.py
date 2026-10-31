@@ -7,11 +7,11 @@ from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 # [nasiko:imports]
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
+from nasiko_state import make_checkpointer
 from pydantic import BaseModel
 
-memory = MemorySaver()
+memory = make_checkpointer()
 
 
 @tool
@@ -46,8 +46,10 @@ def get_exchange_rate(currency_from: str = "USD", currency_to: str = "EUR", curr
     """
     try:
         response = httpx.get(
-            f"https://api.frankfurter.app/{currency_date}",
-            params={"from": currency_from, "to": currency_to},
+            f"https://api.frankfurter.dev/v1/{currency_date}",
+            params={"base": currency_from, "symbols": currency_to},
+            timeout=10.0,
+            follow_redirects=True,
         )
         response.raise_for_status()
         return response.json()
@@ -59,6 +61,21 @@ class ResponseFormat(BaseModel):
     """Structured response from the agent."""
     status: Literal["input_required", "completed", "error"] = "input_required"
     message: str
+
+
+class _DeepSeekChatOpenAI(ChatOpenAI):
+    """ChatOpenAI whose structured output uses function-calling, not json_schema.
+
+    LangGraph's `create_react_agent(response_format=...)` binds structured output via
+    `.with_structured_output()`, which defaults to OpenAI's `json_schema` response_format.
+    DeepSeek's OpenAI-compatible endpoint rejects that ("This response_format type is
+    unavailable now"), but it does support function/tool calling — so we force the
+    `function_calling` method, which both DeepSeek and OpenAI accept.
+    """
+
+    def with_structured_output(self, schema, **kwargs):
+        kwargs.setdefault("method", "function_calling")
+        return super().with_structured_output(schema, **kwargs)
 
 
 class DeepAnalystAgent:
@@ -80,11 +97,15 @@ class DeepAnalystAgent:
     SUPPORTED_CONTENT_TYPES = ["text", "text/plain"]
 
     def __init__(self):
-        self.model = ChatOpenAI(
-            model=os.getenv("MODEL", "deepseek-v4-flash"),
+        self.model = _DeepSeekChatOpenAI(
+            # The platform injects OPENAI_MODEL at deploy; MODEL is the legacy override.
+            model=os.getenv("OPENAI_MODEL", os.getenv("MODEL", "deepseek-v4-flash")),
             openai_api_key=os.getenv("DEEPSEEK_API_KEY", os.getenv("OPENAI_API_KEY")),
             openai_api_base=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
             temperature=0,
+            # DeepSeek's v4 "thinking" mode rejects tool_choice, which the ReAct agent
+            # requires for its tools. Force thinking off so tool calling works.
+            extra_body={"thinking": {"type": "disabled"}},
         )
         self.tools = [
             web_search,
@@ -103,7 +124,12 @@ class DeepAnalystAgent:
         inputs = {"messages": [("user", query)]}
         config = {"configurable": {"thread_id": context_id}}
 
-        for item in self.graph.stream(inputs, config, stream_mode="values"):
+        # One checkpoint per turn, not per step: a turn then costs a handful of calls against the
+        # platform's per-agent rate limit, and a crash mid-turn resumes from the previous turn
+        # instead of from a half-finished tool call no new message could follow.
+        final_state: dict[str, Any] = {}
+        async for item in self.graph.astream(inputs, config, stream_mode="values", durability="exit"):
+            final_state = item
             message = item["messages"][-1]
             if isinstance(message, AIMessage) and message.tool_calls:
                 tool_names = [tc["name"] for tc in message.tool_calls]
@@ -119,11 +145,12 @@ class DeepAnalystAgent:
                     "content": "Processing data...",
                 }
 
-        yield self._get_response(config)
+        # The last streamed value is the run's final state; reading it back from the checkpointer
+        # would cost another round of state API calls for the same data.
+        yield self._get_response(final_state)
 
-    def _get_response(self, config) -> dict[str, Any]:
-        current_state = self.graph.get_state(config)
-        structured_response = current_state.values.get("structured_response")
+    def _get_response(self, final_state: dict[str, Any]) -> dict[str, Any]:
+        structured_response = final_state.get("structured_response")
         if structured_response and isinstance(structured_response, ResponseFormat):
             return {
                 "is_task_complete": structured_response.status == "completed",

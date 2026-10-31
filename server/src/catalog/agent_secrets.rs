@@ -268,6 +268,24 @@ pub async fn resolve_agent_env(db: &sqlx::PgPool, agent_id: Uuid) -> HashMap<Str
         .collect()
 }
 
+pub async fn replace_agent_env(
+    db: &sqlx::PgPool,
+    agent_id: Uuid,
+    env: &HashMap<String, String>,
+) -> Result<(), sqlx::Error> {
+    let crypto = SecretsCrypto::for_agent(agent_id);
+    let encrypted: serde_json::Map<String, serde_json::Value> = env
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(crypto.encrypt(v))))
+        .collect();
+    sqlx::query("UPDATE agents SET secrets_env = $2, updated_at = now() WHERE id = $1")
+        .bind(agent_id)
+        .bind(serde_json::Value::Object(encrypted))
+        .execute(db)
+        .await
+        .map(|_| ())
+}
+
 /// Import user secrets into an agent's secrets_env.
 ///
 /// User secrets are encrypted with a user-scoped key; agent secrets use an

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::pricing::CostBreakdown;
 
@@ -23,6 +23,10 @@ pub struct Session {
     pub duration_ms: Option<u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     /// First model observed in the session's spans.
     pub model_used: Option<String>,
     /// Percentiles over chat-span durations within the session.
@@ -37,11 +41,25 @@ pub struct Session {
 pub struct SessionDetails {
     pub session_id: String,
     pub traces: Vec<TraceSummary>,
+    /// Unique trace IDs found by the session search. When `has_more_traces` is
+    /// true this is a lower bound capped by the provider safety limit.
+    pub trace_count: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens served from provider cache, summed over the session.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to provider cache, summed over the session.
+    pub cache_creation_tokens: u64,
     pub model_used: Option<String>,
     pub latency_ms_p50: Option<f64>,
     pub latency_ms_p99: Option<f64>,
+    /// Mean trace duration. The percentiles above answer "how bad does it get";
+    /// the session KPI strip asks for the plain average.
+    pub latency_ms_avg: Option<f64>,
+    /// More matching traces existed than the provider's bounded detail read.
+    pub has_more_traces: bool,
+    /// False when search was truncated or any matching trace failed to load.
+    pub metrics_complete: bool,
     pub cost: CostBreakdown,
 }
 
@@ -53,6 +71,8 @@ pub struct TraceSummary {
     pub root_span: Span,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub model_used: Option<String>,
     pub duration_ms: Option<u64>,
     pub cost: CostBreakdown,
@@ -159,13 +179,19 @@ pub fn extract_cache_token_attrs(attrs: &HashMap<String, serde_json::Value>) -> 
 
     let cache_read = get_u64(&[
         "gen_ai.usage.cached_input_tokens", // semconv (experimental)
+        // Dotted form, emitted by opentelemetry-instrumentation-openai. Missing it is not
+        // cosmetic: cache reads then read as zero and every cached token is priced at the
+        // full input rate.
+        "gen_ai.usage.cache_read.input_tokens",
         "gen_ai.usage.cache_read_input_tokens",
         "gen_ai.usage.cached_tokens",
         "llm.usage.cache_read_input_tokens",
         "cache_read_input_tokens",
     ]);
     let cache_creation = get_u64(&[
+        "gen_ai.usage.cache_creation.input_tokens",
         "gen_ai.usage.cache_creation_input_tokens",
+        "gen_ai.usage.cache_write.input_tokens",
         "gen_ai.usage.cache_write_input_tokens",
         "llm.usage.cache_creation_input_tokens",
         "cache_creation_input_tokens",
@@ -174,25 +200,301 @@ pub fn extract_cache_token_attrs(attrs: &HashMap<String, serde_json::Value>) -> 
     (cache_read, cache_creation)
 }
 
+/// One span's token usage, with the prompt already split into its billable parts.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SpanUsage {
+    /// Prompt tokens billed at the full input rate — cached tokens are **not** included.
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_creation: u64,
+    pub cache_creation_5m: Option<u64>,
+    pub cache_creation_1h: Option<u64>,
+    pub speed: Option<String>,
+    pub service_tier: Option<String>,
+    pub inference_geo: Option<String>,
+    pub conflicting_observations: bool,
+    pub model: Option<String>,
+}
+
+impl SpanUsage {
+    /// Every prompt token, cached or not. What an OpenAI response calls `prompt_tokens`.
+    pub fn total_prompt(&self) -> u64 {
+        self.input + self.cache_read + self.cache_creation
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_creation == 0
+    }
+}
+
+/// Extract a span's usage with the cached portion separated out.
+///
+/// Prefer this over calling [`extract_token_attrs`] and [`extract_cache_token_attrs`]
+/// separately: costing charges `input` at the full rate and `cache_read` at the cache rate
+/// and sums them, so it needs an `input` that excludes the cached tokens. Instrumentations
+/// disagree about whether it already does. Known producers declare a prompt convention;
+/// legacy spans fall back to the shared engine's total-based inference.
+pub fn extract_usage_attrs(attrs: &HashMap<String, serde_json::Value>) -> SpanUsage {
+    let (raw_input, output, model) = extract_token_attrs(attrs);
+    let (cache_read, cache_creation) = extract_cache_token_attrs(attrs);
+    let total = read_u64(
+        attrs,
+        &["gen_ai.usage.total_tokens", "llm.usage.total_tokens"],
+    );
+
+    use nasiko_pricing::{PromptConvention, RawUsage, normalize_usage};
+
+    let convention = match attrs
+        .get("nasiko.usage.prompt_convention")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("exclusive") => PromptConvention::Exclusive,
+        Some("inclusive") => PromptConvention::Inclusive,
+        _ => PromptConvention::Infer,
+    };
+    let usage = normalize_usage(
+        RawUsage {
+            input: raw_input,
+            output,
+            cache_read,
+            cache_creation,
+            total,
+        },
+        convention,
+    );
+    SpanUsage {
+        input: usage.input,
+        output: usage.output,
+        cache_read: usage.cache_read,
+        cache_creation: usage.cache_creation,
+        cache_creation_5m: read_u64(attrs, &["nasiko.usage.cache_creation_5m_tokens"]),
+        cache_creation_1h: read_u64(attrs, &["nasiko.usage.cache_creation_1h_tokens"]),
+        speed: attrs
+            .get("nasiko.usage.speed")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        service_tier: attrs
+            .get("nasiko.usage.service_tier")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        inference_geo: attrs
+            .get("nasiko.usage.inference_geo")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned),
+        conflicting_observations: attrs
+            .get("nasiko.usage.conflicting_observations")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        model,
+    }
+}
+
+fn read_u64(attrs: &HashMap<String, serde_json::Value>, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| attrs.get(*k)).and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
+}
+
+/// Whether this span is the LLM router's own record of a call it served.
+///
+/// `gen_ai.agent.id` is set only there (`oss/llm-router/src/handlers/chat.rs`),
+/// which makes it an unambiguous marker. Such a span carries the **resolved**
+/// provider and model — the ones actually called — where the calling agent's
+/// span carries only what it asked for. The two disagree whenever an agent's
+/// LLM config re-routes it, and the router is the one telling the truth.
+pub fn is_router_llm_span(span: &Span) -> bool {
+    span.attributes.contains_key("gen_ai.agent.id")
+}
+
+/// How each LLM-router span relates to the agent span for the same call.
+pub struct RouterSpanLinks<'a> {
+    /// Router span id → service name of the agent whose call it served.
+    pub attributed: HashMap<&'a str, &'a str>,
+    /// Span ids to leave out of any usage aggregation, because another span in
+    /// the trace already accounts for the same call. Holds the agent's span
+    /// where the router's superseded it, and the router's own span where it
+    /// could not be attributed.
+    pub excluded: HashSet<&'a str>,
+}
+
+/// Pair up each router span with the agent span describing the same LLM call.
+///
+/// One call produces two spans: the agent's, labelled with the model it asked
+/// for, and the router's, labelled with the model that ran. Both carry the same
+/// token counts, so any sum over a trace counts the call twice — and pricing the
+/// agent's label charges a cheap model for an expensive call. Neither is
+/// detectable downstream, which is why this pairing has to happen before any
+/// aggregation rather than being patched afterwards.
+///
+/// The router's span usually sits under the HTTP span for the agent's request,
+/// whose parent is the agent's own LLM span, so the nearest ancestor from a
+/// different service is the calling agent, and that ancestor's usage is the
+/// duplicate.
+///
+/// Some instrumentation doesn't nest that way: an agent's own legacy
+/// instrumentation (pre-GenAI-semconv spans such as `ChatCompletion`) can
+/// record the same call as a **sibling** of the router's span — both rooted
+/// under the agent's own request handling rather than one inside the other.
+/// Ancestry can't see a sibling, so [`find_sibling_duplicate`] is the fallback:
+/// it matches on the one signal that survives both instrumentation styles
+/// unchanged — the output token count — inside the same wall-clock window, so
+/// two unrelated calls of the same length elsewhere in the trace are not
+/// mistaken for one. Found this way, a span is still booked once, against the
+/// agent, exactly as the nested case is: trusting the router's count (it is
+/// cache-aware; legacy spans routinely are not) and dropping the duplicate.
+///
+/// A router span matched neither way depends on what else the trace holds:
+///
+/// * **A span from another service reports token usage** (a self-instrumenting
+///   agent whose span could not be paired, e.g. it propagated the context it
+///   was *called* with rather than its own LLM span's). The agent has already
+///   recorded the call, so the router's copy is dropped: keeping it would
+///   double the tokens. Dropping it costs only the model correction.
+/// * **No span from another service reports usage** (an ACP coding agent such
+///   as OpenCode, which emits no spans of its own). Nothing else accounts for
+///   the call, so it is attributed to the agent id the router stamped on it
+///   (`gen_ai.agent.id`) instead of being lost.
+///
+/// "Another service" means another service than the router span's own, the
+/// same test the ancestor walk uses to recognise an agent. The control plane's
+/// own LLM spans (the orchestrator's routing and ReAct calls) share the
+/// router's service, so they never make a coding agent's call look already
+/// recorded. The check does not try to match a span to one particular agent:
+/// a coding agent's legacy spans do not reliably carry its agent id as their
+/// service name, so matching on it would double-count exactly the agents this
+/// dedupe exists for. When both kinds of agent share a trace, the cost is an
+/// undercount, never a double count.
+pub fn link_router_spans(spans: &[Span]) -> RouterSpanLinks<'_> {
+    let by_id: HashMap<&str, &Span> = spans.iter().map(|s| (s.span_id.as_str(), s)).collect();
+    let mut attributed = HashMap::new();
+    let mut excluded = HashSet::new();
+    // The services (other than the router's) that report token usage in this
+    // trace. Decides what an unpaired router span means (see the doc comment).
+    let usage_services: HashSet<&str> = spans
+        .iter()
+        .filter(|s| !is_router_llm_span(s) && !s.service_name.is_empty())
+        .filter(|s| !extract_usage_attrs(&s.attributes).is_empty())
+        .map(|s| s.service_name.as_str())
+        .collect();
+    for span in spans {
+        if !is_router_llm_span(span) {
+            continue;
+        }
+        let mut parent = span.parent_span_id.as_deref();
+        let mut agent = None;
+        while let Some(id) = parent {
+            let Some(ancestor) = by_id.get(id) else { break };
+            if ancestor.service_name != span.service_name && !ancestor.service_name.is_empty() {
+                agent = Some(*ancestor);
+                break;
+            }
+            parent = ancestor.parent_span_id.as_deref();
+        }
+        if agent.is_none() {
+            agent = find_sibling_duplicate(span, spans);
+        }
+        match agent {
+            Some(agent) => {
+                attributed.insert(span.span_id.as_str(), agent.service_name.as_str());
+                if !extract_usage_attrs(&agent.attributes).is_empty() {
+                    excluded.insert(agent.span_id.as_str());
+                }
+            }
+            None => {
+                // No agent span to pair with. If a span from another service
+                // reports usage, an agent recorded this call itself and the
+                // router's copy would double it: drop it. Otherwise the router's
+                // span is the only record of the call (an ACP coding agent such as
+                // OpenCode emits no spans of its own), so attribute it to the agent
+                // id the router stamped on it; downstream resolves that id.
+                let agent_reports_usage = usage_services
+                    .iter()
+                    .any(|service| *service != span.service_name);
+                let agent_id = span
+                    .attributes
+                    .get("gen_ai.agent.id")
+                    .and_then(|v| v.as_str())
+                    .filter(|id| !id.is_empty());
+                match agent_id {
+                    Some(agent_id) if !agent_reports_usage => {
+                        attributed.insert(span.span_id.as_str(), agent_id);
+                    }
+                    _ => {
+                        excluded.insert(span.span_id.as_str());
+                    }
+                }
+            }
+        }
+    }
+    RouterSpanLinks {
+        attributed,
+        excluded,
+    }
+}
+
+/// The sibling case `link_router_spans` can't reach by walking ancestry: a
+/// same-trace, different-service span reporting the identical output token
+/// count, whose time window overlaps the router span's. Output is the match
+/// key because it is unaffected by prompt caching, so it reads the same from
+/// both an instrumentation that reports cache-aware input and one that
+/// doesn't; input is checked too, but only to confirm an exact (uncached)
+/// match, never to rule one out, since a legacy span's larger, cache-blind
+/// input is exactly the discrepancy this function exists to find.
+fn find_sibling_duplicate<'a>(router_span: &Span, spans: &'a [Span]) -> Option<&'a Span> {
+    let usage = extract_usage_attrs(&router_span.attributes);
+    if usage.is_empty() {
+        return None;
+    }
+    spans.iter().find(|candidate| {
+        candidate.span_id != router_span.span_id
+            && !candidate.service_name.is_empty()
+            && candidate.service_name != router_span.service_name
+            && spans_overlap(router_span, candidate)
+            && extract_usage_attrs(&candidate.attributes).output == usage.output
+    })
+}
+
+/// Whether two spans' wall-clock windows overlap at all. A span with no
+/// recorded end is treated as a point in time at its start.
+fn spans_overlap(a: &Span, b: &Span) -> bool {
+    let a_end = a.ended_at.unwrap_or(a.started_at);
+    let b_end = b.ended_at.unwrap_or(b.started_at);
+    a.started_at <= b_end && b.started_at <= a_end
+}
+
 impl TraceDetails {
     /// Aggregate token counts across all spans:
     /// `(input_tokens, output_tokens, first_model_seen)`.
     ///
+    /// `input_tokens` excludes the cached prompt — [`Self::cache_token_totals`] reports that
+    /// separately, and [`Self::usage_totals`] adds the two. Reading the raw span attribute
+    /// here instead would leave the cached tokens inside `input` as well, so every caller
+    /// that sums the classes would count them twice.
+    ///
     /// Cost is intentionally not computed here — resolve it through a
-    /// [`crate::pricing::PricingSource`] (see [`crate::pricing::compute_cost`]).
+    /// [`nasiko_pricing::PricingEngine`] (see [`crate::pricing::compute_cost`]).
     pub fn token_totals(&self) -> (u64, u64, Option<String>) {
+        let excluded = link_router_spans(&self.spans).excluded;
+        let mut seen = std::collections::HashSet::new();
         let mut input = 0u64;
         let mut output = 0u64;
         let mut model: Option<String> = None;
         for span in &self.spans {
-            let (inp, out, m) = extract_token_attrs(&span.attributes);
-            if inp == 0 && out == 0 {
+            if !seen.insert(&span.span_id) || excluded.contains(span.span_id.as_str()) {
                 continue;
             }
-            input += inp;
-            output += out;
+            let u = extract_usage_attrs(&span.attributes);
+            // Skip on the whole usage, not on input/output alone: a turn served entirely
+            // from cache has no fresh input and no output on that span, but it is not empty.
+            if u.is_empty() {
+                continue;
+            }
+            input += u.input;
+            output += u.output;
             if model.is_none() {
-                model = m;
+                model = u.model;
             }
         }
         (input, output, model)
@@ -201,30 +503,63 @@ impl TraceDetails {
     /// Aggregate cache token counts across all spans:
     /// `(cache_read_tokens, cache_creation_tokens)`.
     pub fn cache_token_totals(&self) -> (u64, u64) {
+        let excluded = link_router_spans(&self.spans).excluded;
+        let mut seen = std::collections::HashSet::new();
         let mut read = 0u64;
         let mut creation = 0u64;
         for span in &self.spans {
-            let (r, c) = extract_cache_token_attrs(&span.attributes);
-            read += r;
-            creation += c;
+            if !seen.insert(&span.span_id) || excluded.contains(span.span_id.as_str()) {
+                continue;
+            }
+            let u = extract_usage_attrs(&span.attributes);
+            read += u.cache_read;
+            creation += u.cache_creation;
         }
         (read, creation)
     }
 
-    /// Per-model token totals, for pricing mixed-model traces correctly.
-    pub fn token_totals_by_model(&self) -> Vec<(Option<String>, u64, u64)> {
-        let mut by_model: Vec<(Option<String>, u64, u64)> = Vec::new();
+    /// All four token-class totals plus the first model observed.
+    pub fn usage_totals(&self) -> (TokenUsage, Option<String>) {
+        let (input_tokens, output_tokens, model) = self.token_totals();
+        let (cache_read_tokens, cache_creation_tokens) = self.cache_token_totals();
+        (
+            TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                total_tokens: input_tokens
+                    + output_tokens
+                    + cache_read_tokens
+                    + cache_creation_tokens,
+            },
+            model,
+        )
+    }
+
+    /// Per-model four-class token totals, for mixed-model trace reporting.
+    pub fn token_totals_by_model(&self) -> Vec<(Option<String>, u64, u64, u64, u64)> {
+        let excluded = link_router_spans(&self.spans).excluded;
+        let mut seen = std::collections::HashSet::new();
+        let mut by_model: Vec<(Option<String>, u64, u64, u64, u64)> = Vec::new();
         for span in &self.spans {
-            let (inp, out, model) = extract_token_attrs(&span.attributes);
-            if inp == 0 && out == 0 {
+            if !seen.insert(&span.span_id) || excluded.contains(span.span_id.as_str()) {
                 continue;
             }
-            match by_model.iter_mut().find(|(m, _, _)| *m == model) {
-                Some((_, i, o)) => {
+            let u = extract_usage_attrs(&span.attributes);
+            let (inp, out, model) = (u.input, u.output, u.model.clone());
+            let (cache_read, cache_creation) = (u.cache_read, u.cache_creation);
+            if u.is_empty() {
+                continue;
+            }
+            match by_model.iter_mut().find(|(m, _, _, _, _)| *m == model) {
+                Some((_, i, o, r, c)) => {
                     *i += inp;
                     *o += out;
+                    *r += cache_read;
+                    *c += cache_creation;
                 }
-                None => by_model.push((model, inp, out)),
+                None => by_model.push((model, inp, out, cache_read, cache_creation)),
             }
         }
         by_model
@@ -239,6 +574,7 @@ pub struct SpanDetails {
     pub input_content: Option<String>,
     /// Completion content, when captured.
     pub output_content: Option<String>,
+    pub token_usage: TokenUsage,
     pub cost: CostBreakdown,
 }
 
@@ -247,6 +583,10 @@ pub struct SpanDetails {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     pub total_tokens: u64,
 }
 
@@ -256,8 +596,14 @@ pub struct AgentStats {
     pub agent_id: String,
     /// Number of user-query traces in the window.
     pub trace_count: usize,
+    /// True when `trace_count` exceeded the token-aggregation trace cap, so
+    /// `input_tokens`/`output_tokens`/`cost` were only summed over the first
+    /// `TOKEN_AGGREGATION_TRACE_CAP` traces and understate the real total.
+    pub is_capped: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
     pub model_used: Option<String>,
     pub latency_ms_p50: Option<f64>,
     pub latency_ms_p99: Option<f64>,
@@ -271,6 +617,10 @@ pub struct AgentFinOps {
     pub agent_id: String,
     /// User-query trace count in the window.
     pub operations: usize,
+    /// True when `operations` exceeded the token-aggregation trace cap, so
+    /// the token/cost fields below were only summed over the first
+    /// `TOKEN_AGGREGATION_TRACE_CAP` traces and understate the real total.
+    pub is_capped: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Prompt tokens served from provider cache (OpenAI cached / Anthropic cache read).
@@ -282,13 +632,340 @@ pub struct AgentFinOps {
     pub cost: CostBreakdown,
 }
 
+/// One row materialized from a Tempo trace for the `trace_usage` table.
+/// Keyed by `(trace_id, agent_name)` — a multi-agent trace produces one row
+/// per participating agent. Produced by [`ObservabilityProvider::extract_trace_usage`].
+#[derive(Debug, Clone)]
+pub struct TraceUsageRow {
+    pub trace_id: String,
+    pub agent_name: String,
+    pub session_id: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub tool_call_count: u32,
+    pub cost_estimated: bool,
+    pub cost_usd: f64,
+    pub prompt_cost_usd: f64,
+    pub completion_cost_usd: f64,
+    pub latency_ms: Option<i64>,
+    pub started_at: DateTime<Utc>,
+    /// Unrecovered error spans this agent contributed to the trace
+    /// ([`unrecovered_error_spans`]). Per agent, never the trace total: the row
+    /// is keyed `(trace_id, agent_name)`, so a trace-wide figure here would be
+    /// multiplied by the agent count by anything that sums it.
+    pub error_count: u32,
+}
+
+/// Gap tolerance when deciding whether one span started after another ended.
+/// Matches the UI's `RETRY_GAP_TOLERANCE_MS` so both sides of the contract
+/// classify the same trace the same way.
+const RETRY_GAP_TOLERANCE_MS: i64 = 1;
+
+/// OTLP status code 2 is `ERROR` (0 unset, 1 ok).
+fn is_error(span: &Span) -> bool {
+    span.status_code == 2
+}
+
+/// Error spans that nothing recovered from: an ERROR span with no same-name
+/// sibling (same parent) that started after it *ended* and succeeded.
+///
+/// This is the SE-3 rule, and it is deliberately identical to the UI's
+/// `unrecoveredErrors` (`ui/shared/features/src/observability/spans.ts`), which
+/// is what `/sessions` has always shown. A retry that eventually worked is not a
+/// failure; an overlapping parallel call with the same name is not a retry, so
+/// the comparison is against the failed span's *end*, not its start.
+pub fn unrecovered_error_spans(spans: &[&Span]) -> Vec<String> {
+    let ended_ms =
+        |s: &Span| -> i64 { s.started_at.timestamp_millis() + s.duration_ms.unwrap_or(0) as i64 };
+    spans
+        .iter()
+        .filter(|s| is_error(s))
+        .filter(|s| {
+            !spans.iter().any(|o| {
+                o.span_id != s.span_id
+                    && o.parent_span_id == s.parent_span_id
+                    && o.name == s.name
+                    && o.started_at.timestamp_millis() >= ended_ms(s) - RETRY_GAP_TOLERANCE_MS
+                    && !is_error(o)
+            })
+        })
+        .map(|s| s.span_id.clone())
+        .collect()
+}
+
 /// Sorted-percentile helper over millisecond durations.
 pub fn latency_percentiles(mut durations: Vec<u64>) -> (Option<f64>, Option<f64>) {
     durations.sort_unstable();
     let len = durations.len();
-    let p50 = durations.get(len / 2).map(|&v| v as f64);
-    let p99 = durations
-        .get((len * 99 / 100).saturating_sub(1))
-        .map(|&v| v as f64);
+    let nearest_rank = |percent: usize| {
+        len.checked_mul(percent)
+            .map(|rank| rank.div_ceil(100).saturating_sub(1))
+            .and_then(|index| durations.get(index))
+            .map(|&v| v as f64)
+    };
+    let p50 = nearest_rank(50);
+    let p99 = nearest_rank(99);
     (p50, p99)
+}
+
+#[cfg(test)]
+mod link_router_spans_tests {
+    use super::*;
+
+    fn span(id: &str, parent: Option<&str>, service: &str, attrs: &[(&str, &str)]) -> Span {
+        Span {
+            span_id: id.to_string(),
+            parent_span_id: parent.map(str::to_string),
+            name: "s".into(),
+            started_at: chrono::Utc::now(),
+            ended_at: None,
+            duration_ms: None,
+            service_name: service.to_string(),
+            kind: 3,
+            status_code: 0,
+            status_message: String::new(),
+            attributes: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+                .collect(),
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unlinkable_router_span_is_attributed_by_gen_ai_agent_id() {
+        // A coding agent (e.g. OpenCode) emits no spans of its own, so the router's
+        // span is the only token-bearing one and has no agent-span ancestor. It must
+        // be attributed off `gen_ai.agent.id`, not dropped — otherwise its tokens
+        // never reach `trace_usage`/FinOps.
+        let spans = vec![span(
+            "r1",
+            None,
+            "nasiko-cp",
+            &[
+                ("gen_ai.agent.id", "agent-uuid"),
+                ("gen_ai.usage.total_tokens", "100"),
+            ],
+        )];
+        let links = link_router_spans(&spans);
+        assert_eq!(links.attributed.get("r1"), Some(&"agent-uuid"));
+        assert!(!links.excluded.contains("r1"), "must not be dropped");
+    }
+
+    #[test]
+    fn unlinkable_router_span_is_dropped_when_an_agent_span_reports_the_usage() {
+        // A self-instrumenting agent recorded the call on its own span, but the
+        // router's span can't be paired with it (no cross-service ancestor, no
+        // overlapping sibling). Attributing the router's copy too would count the
+        // call twice, so it is dropped and the agent's span stands.
+        let spans = vec![
+            span(
+                "a1",
+                None,
+                "devops-agent",
+                &[
+                    ("gen_ai.usage.input_tokens", "300"),
+                    ("gen_ai.usage.output_tokens", "50"),
+                ],
+            ),
+            span(
+                "r1",
+                Some("elsewhere"),
+                "nasiko-cp",
+                &[
+                    ("gen_ai.agent.id", "agent-uuid"),
+                    ("gen_ai.usage.input_tokens", "440"),
+                    ("gen_ai.usage.output_tokens", "67"),
+                ],
+            ),
+        ];
+        let links = link_router_spans(&spans);
+        assert!(!links.attributed.contains_key("r1"));
+        assert!(
+            links.excluded.contains("r1"),
+            "the router's copy is dropped"
+        );
+        assert!(
+            !links.excluded.contains("a1"),
+            "the agent's own span stands"
+        );
+    }
+
+    #[test]
+    fn the_control_planes_own_llm_spans_do_not_hide_a_coding_agents_call() {
+        // The orchestrator's own LLM call (routing, ReAct) reports usage on a span
+        // from the control plane's service -- the same service as the router's
+        // span. That is not an agent recording this call, so the coding agent's
+        // only record of it must still be attributed, not dropped.
+        let spans = vec![
+            span(
+                "o1",
+                None,
+                "nasiko-cp",
+                &[
+                    ("gen_ai.usage.input_tokens", "900"),
+                    ("gen_ai.usage.output_tokens", "40"),
+                ],
+            ),
+            span(
+                "r1",
+                Some("o1"),
+                "nasiko-cp",
+                &[
+                    ("gen_ai.agent.id", "agent-uuid"),
+                    ("gen_ai.usage.input_tokens", "440"),
+                    ("gen_ai.usage.output_tokens", "67"),
+                ],
+            ),
+        ];
+        let links = link_router_spans(&spans);
+        assert_eq!(links.attributed.get("r1"), Some(&"agent-uuid"));
+        assert!(!links.excluded.contains("r1"), "must not be dropped");
+        assert!(
+            !links.excluded.contains("o1"),
+            "the orchestrator's call stands"
+        );
+    }
+
+    #[test]
+    fn router_span_with_agent_ancestor_still_attributes_by_service_name() {
+        // Regression guard: a self-instrumenting agent's own span is the ancestor,
+        // so the router span is still attributed to the agent's service name (the
+        // common path is unchanged).
+        let spans = vec![
+            span("a1", None, "my-agent", &[]),
+            span(
+                "r1",
+                Some("a1"),
+                "nasiko-cp",
+                &[("gen_ai.agent.id", "agent-uuid")],
+            ),
+        ];
+        let links = link_router_spans(&spans);
+        assert_eq!(links.attributed.get("r1"), Some(&"my-agent"));
+    }
+}
+
+#[cfg(test)]
+mod unrecovered_error_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// `started_at` in ms since the epoch, so the cases read as a timeline.
+    fn span(
+        id: &str,
+        parent: Option<&str>,
+        name: &str,
+        start_ms: i64,
+        dur: u64,
+        error: bool,
+    ) -> Span {
+        Span {
+            span_id: id.into(),
+            parent_span_id: parent.map(str::to_owned),
+            name: name.into(),
+            started_at: DateTime::from_timestamp_millis(start_ms).unwrap(),
+            ended_at: None,
+            duration_ms: Some(dur),
+            service_name: "agent".into(),
+            kind: 1,
+            status_code: if error { 2 } else { 1 },
+            status_message: String::new(),
+            attributes: HashMap::new(),
+            events: Vec::new(),
+        }
+    }
+
+    fn count(spans: &[Span]) -> usize {
+        let refs: Vec<&Span> = spans.iter().collect();
+        unrecovered_error_spans(&refs).len()
+    }
+
+    #[test]
+    fn a_lone_error_is_unrecovered() {
+        assert_eq!(count(&[span("a", Some("p"), "call", 0, 10, true)]), 1);
+    }
+
+    #[test]
+    fn a_retry_that_succeeded_recovers_the_error() {
+        // The successful attempt starts after the failed one ended: a retry.
+        assert_eq!(
+            count(&[
+                span("a", Some("p"), "call", 0, 10, true),
+                span("b", Some("p"), "call", 10, 10, false),
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn an_overlapping_success_is_not_a_retry() {
+        // Starts while the failure is still running: parallel fan-out, not a
+        // retry, so the error stands. This is the case a naive "any sibling
+        // succeeded" rule gets wrong.
+        assert_eq!(
+            count(&[
+                span("a", Some("p"), "call", 0, 100, true),
+                span("b", Some("p"), "call", 5, 10, false),
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn a_retry_that_also_failed_is_still_unrecovered() {
+        assert_eq!(
+            count(&[
+                span("a", Some("p"), "call", 0, 10, true),
+                span("b", Some("p"), "call", 10, 10, true),
+            ]),
+            2
+        );
+    }
+
+    #[test]
+    fn a_different_name_does_not_recover() {
+        assert_eq!(
+            count(&[
+                span("a", Some("p"), "call", 0, 10, true),
+                span("b", Some("p"), "other", 10, 10, false),
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn a_different_parent_does_not_recover() {
+        assert_eq!(
+            count(&[
+                span("a", Some("p1"), "call", 0, 10, true),
+                span("b", Some("p2"), "call", 10, 10, false),
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn the_gap_tolerance_allows_an_immediate_retry() {
+        // A retry recorded as starting 1ms before the failure's recorded end is
+        // still a retry: the timestamps come from different clocks.
+        assert_eq!(
+            count(&[
+                span("a", Some("p"), "call", 0, 10, true),
+                span("b", Some("p"), "call", 9, 10, false),
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn unset_status_is_not_an_error() {
+        let mut s = span("a", Some("p"), "call", 0, 10, false);
+        s.status_code = 0;
+        assert_eq!(count(&[s]), 0);
+    }
 }

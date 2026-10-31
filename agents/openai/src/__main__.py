@@ -20,7 +20,6 @@ import click
 import uvicorn
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentInterface, AgentSkill
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
@@ -29,6 +28,7 @@ from agents import set_tracing_disabled
 
 from agent import ResearchAgent
 from agent_executor import ResearchAgentExecutor
+from nasiko_state import install_shutdown_hooks, make_task_store
 
 set_tracing_disabled(True)
 logger = logging.getLogger(__name__)
@@ -68,7 +68,7 @@ def main(host, port):
     )
     request_handler = DefaultRequestHandler(
         agent_executor=ResearchAgentExecutor(),
-        task_store=InMemoryTaskStore(),
+        task_store=make_task_store(),
         agent_card=agent_card,
     )
 
@@ -77,6 +77,7 @@ def main(host, port):
     routes.extend(create_jsonrpc_routes(request_handler, rpc_url="/"))
 
     app = Starlette(routes=routes)
+    install_shutdown_hooks(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,

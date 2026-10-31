@@ -1,0 +1,24 @@
+{
+  "name": "@nasiko/app-core",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Edition slots, environment, session and URL helpers, stale-build recovery, and the shell pieces pages share (top bar, navigation, theme).",
+  "dependencies": {
+    "@nasiko/data-access": "workspace:*",
+    "@nasiko/ui": "workspace:*",
+    "@tanstack/react-query": "^5.103.3",
+    "@tanstack/react-router": "^1.170.39",
+    "lucide-react": "^1.48.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "zod": "^4.6.5",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "msw": "^2.15.0",
+    "vitest": "^4.1.11"
+  }
+}

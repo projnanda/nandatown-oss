@@ -24,9 +24,10 @@ use crate::types::MCPServerConfig;
 /// gateway calls OUT to a backend MCP server. Servers that only speak an
 /// older revision negotiate down in their response.
 ///
-/// Distinct from `types::PROTOCOL_VERSION`, which is what this gateway
-/// advertises INWARD to agents calling it — a separate concern, correctly
-/// pinned independently. Every other outbound call to a backend (probing,
+/// Distinct from `types::SUPPORTED_PROTOCOL_VERSIONS`/`LATEST_PROTOCOL_VERSION`,
+/// which govern what this gateway advertises INWARD to agents calling it —
+/// negotiated per client in `protocol::handle_initialize`, not a single pinned
+/// constant — a separate concern. Every other outbound call to a backend (probing,
 /// OAuth discovery) must reuse *this* constant rather than hardcoding its own
 /// copy of the version string: `connectors::probe_initialize` and
 /// `oauth`'s discovery probe both used to hardcode the older "2024-11-05"

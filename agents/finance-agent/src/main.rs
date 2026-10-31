@@ -3,6 +3,7 @@ use std::sync::Arc;
 use a2a::*;
 use a2a_server::*;
 use futures::stream::BoxStream;
+mod mcp;
 mod telemetry;
 mod tools;
 
@@ -11,16 +12,21 @@ struct FinanceAgent {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
+    /// MCP gateway client -- `None` when the platform didn't inject
+    /// `MCP_GATEWAY_URL`/`MCP_GATEWAY_TOKEN`. Configured ONCE at startup;
+    /// the per-user binding rides the forwarded traceparent (see mcp.rs).
+    mcp: Option<Arc<mcp::McpClient>>,
 }
 
 impl FinanceAgent {
-    fn new() -> Self {
+    fn new(mcp: Option<Arc<mcp::McpClient>>) -> Self {
         Self {
             base_url: std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
             http: reqwest::Client::new(),
+            mcp,
         }
     }
 
@@ -70,10 +76,14 @@ impl FinanceAgent {
             "temperature": 0.1,
         });
 
-        let resp = self
+        let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(&self.api_key);
+        if let Some(tp) = parent_cx.and_then(telemetry::traceparent_for_context) {
+            req = req.header("traceparent", tp);
+        }
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -85,7 +95,8 @@ impl FinanceAgent {
             return Err(format!("LLM API {status}: {body}"));
         }
 
-        let response = resp.json::<serde_json::Value>()
+        let response = resp
+            .json::<serde_json::Value>()
             .await
             .map_err(|e| format!("JSON parse: {e}"))?;
 
@@ -124,7 +135,10 @@ impl FinanceAgent {
 }
 
 impl AgentExecutor for FinanceAgent {
-    fn execute(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         // Join the caller's W3C trace (the platform forwards `traceparent`
         // through the agent proxy/orchestrator). Without adopting it, the OTel
         // SDK mints a fresh root trace id per request and the control plane's
@@ -134,6 +148,16 @@ impl AgentExecutor for FinanceAgent {
             .get("traceparent")
             .and_then(|v| v.first())
             .and_then(|tp| telemetry::remote_context_from_traceparent(tp));
+
+        // The same header, kept verbatim: gateway tool calls forward it so the
+        // platform can resolve the user and authorize this agent as a recorded
+        // participant of that flow (docs/MCP_GATEWAY_AGENT_AUTH.md).
+        let traceparent = ctx
+            .service_params
+            .get("traceparent")
+            .and_then(|v| v.first())
+            .cloned()
+            .unwrap_or_default();
 
         let task_id = ctx.task_id.clone();
         let context_id = ctx.context_id.clone();
@@ -186,25 +210,43 @@ impl AgentExecutor for FinanceAgent {
         let api_key = self.api_key.clone();
         let base_url = self.base_url.clone();
         let http = self.http.clone();
+        let mcp = self.mcp.clone();
         let record_span = span.clone();
 
         let stream = async_stream::stream! {
             yield Ok(status_working(&task_id, &context_id, None));
 
-            let agent = FinanceAgent { model, api_key, base_url, http };
-            let tool_defs = tools::definitions();
+            let agent = FinanceAgent { model, api_key, base_url, http, mcp: mcp.clone() };
+
 
             let system = "\
-You are a Finance Analyst agent with access to real-time market data. You can look up \
-currency exchange rates and cryptocurrency prices/market data.\n\n\
-Guidelines:\n\
-- Use exchange_rates to get current forex rates for any base currency\n\
-- Use crypto_search to find a cryptocurrency's ID if you're unsure of the exact name\n\
-- Use crypto_price to get detailed price/market data for a specific coin\n\
-- Use crypto_market to get an overview of top cryptocurrencies by market cap\n\
-- Be precise with numbers — show appropriate decimal places for the context\n\
-- Always note that prices are point-in-time snapshots and may change rapidly\n\
-- When comparing currencies, show both directions (e.g. 1 USD = X EUR, 1 EUR = Y USD)";
+        You are a Finance Analyst agent with access to real-time market data. You can look up \
+        currency exchange rates and cryptocurrency prices/market data.\n\n\
+        Guidelines:\n\
+        - Use exchange_rates to get current forex rates for any base currency\n\
+        - Use crypto_search to find a cryptocurrency's ID if you're unsure of the exact name\n\
+        - Use crypto_price to get detailed price/market data for a specific coin\n\
+        - Use crypto_market to get an overview of top cryptocurrencies by market cap\n\
+        - Be precise with numbers — show appropriate decimal places for the context\n\
+        - Always note that prices are point-in-time snapshots and may change rapidly\n\
+        - When comparing currencies, show both directions (e.g. 1 USD = X EUR, 1 EUR = Y USD)";
+
+            // One session per request: `tools/list` is query-aware, so the set
+            // depends on this request's traceparent and grows when the model
+            // searches (see mcp.rs).
+            let mut mcp_session = match &mcp {
+                Some(client) => {
+                    Some(mcp::McpSession::open(client.clone(), &traceparent).await)
+                }
+                None => None,
+            };
+
+            // The prompt above lists only the built-ins, so without this the model
+            // keeps answering account questions with web_search (see mcp.rs).
+            let system = match &mcp_session {
+                Some(session) => format!("{system}{}", session.system_prompt_hint()),
+                None => system.to_string(),
+            };
 
             let mut messages = vec![
                 serde_json::json!({"role": "system", "content": system}),
@@ -214,6 +256,12 @@ Guidelines:\n\
             let mut final_text = String::new();
 
             for round in 0..4 {
+                // Rebuilt every round: a `nasiko_search_tools` call adds the
+                // tools it found, and the model can only call what it is shown.
+                let mut tool_defs = tools::definitions();
+                if let Some(session) = &mcp_session {
+                    tool_defs.extend(session.tool_defs().iter().cloned());
+                }
                 // Force the last allowed round to be tool-less so the model must
                 // produce a plain-text answer instead of the loop exhausting with
                 // final_text still empty (silently returning no answer at all).
@@ -245,7 +293,12 @@ Guidelines:\n\
                             Some(&format!("{name}: {preview}")),
                         ));
 
-                        let result = tools::execute(name, args).await;
+                        let result = match &mut mcp_session {
+                            Some(session) if session.handles(name) => {
+                                session.call_tool(name, args).await
+                            }
+                            _ => tools::execute(name, args).await,
+                        };
 
                         messages.push(serde_json::json!({
                             "role": "tool",
@@ -319,14 +372,23 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
 
+    // MCP gateway: configured once from the deploy-injected env. Only a health
+    // check here — the tool set is query-scoped and fetched per request
+    // (docs/MCP_TOOL_SEARCH_DESIGN.md), see McpSession.
+    let mcp = mcp::McpClient::from_env().map(Arc::new);
+    if let Some(client) = &mcp {
+        client.probe().await;
+    }
+
     let handler = Arc::new(DefaultRequestHandler::new(
-        FinanceAgent::new(),
+        FinanceAgent::new(mcp),
         InMemoryTaskStore::new(),
     ));
 
     let agent_card = AgentCard {
         name: "Finance Analyst".to_string(),
-        description: "Real-time exchange rates, cryptocurrency prices, and market data analysis".to_string(),
+        description: "Real-time exchange rates, cryptocurrency prices, and market data analysis"
+            .to_string(),
         version: "1.0.0".to_string(),
         provider: Some(AgentProvider {
             organization: "Nasiko".to_string(),
@@ -345,7 +407,9 @@ async fn main() {
                 description: "Look up current currency exchange rates for any base currency".into(),
                 tags: vec!["finance".into(), "forex".into(), "currency".into()],
                 examples: Some(vec!["What's the USD to EUR exchange rate?".into()]),
-                input_modes: None, output_modes: None, security_requirements: None,
+                input_modes: None,
+                output_modes: None,
+                security_requirements: None,
             },
             AgentSkill {
                 id: "crypto-prices".into(),
@@ -353,7 +417,9 @@ async fn main() {
                 description: "Get real-time cryptocurrency prices and market data".into(),
                 tags: vec!["finance".into(), "crypto".into(), "bitcoin".into()],
                 examples: Some(vec!["What's the current price of Bitcoin?".into()]),
-                input_modes: None, output_modes: None, security_requirements: None,
+                input_modes: None,
+                output_modes: None,
+                security_requirements: None,
             },
             AgentSkill {
                 id: "market-overview".into(),
@@ -361,17 +427,17 @@ async fn main() {
                 description: "Get an overview of top cryptocurrencies by market cap".into(),
                 tags: vec!["finance".into(), "market".into(), "overview".into()],
                 examples: Some(vec!["Show me the top 10 cryptos by market cap".into()]),
-                input_modes: None, output_modes: None, security_requirements: None,
+                input_modes: None,
+                output_modes: None,
+                security_requirements: None,
             },
         ],
         default_input_modes: vec!["text/plain".to_string()],
         default_output_modes: vec!["text/plain".to_string()],
-        supported_interfaces: vec![
-            AgentInterface::new(
-                &format!("http://0.0.0.0:{port}/"),
-                TRANSPORT_PROTOCOL_JSONRPC,
-            ),
-        ],
+        supported_interfaces: vec![AgentInterface::new(
+            &format!("http://0.0.0.0:{port}/"),
+            TRANSPORT_PROTOCOL_JSONRPC,
+        )],
         security_schemes: None,
         security_requirements: None,
         documentation_url: None,
@@ -438,7 +504,11 @@ fn extract_preview(args: &str) -> String {
         .and_then(|v| {
             v.as_object()?.values().find_map(|val| {
                 val.as_str().map(|s| {
-                    if s.len() > 60 { format!("{}...", &s[..60]) } else { s.to_string() }
+                    if s.len() > 60 {
+                        format!("{}...", &s[..60])
+                    } else {
+                        s.to_string()
+                    }
                 })
             })
         })

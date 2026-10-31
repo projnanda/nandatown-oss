@@ -17,14 +17,34 @@ import (
 	"github.com/a2aproject/a2a-go/v2/a2asrv"
 )
 
-type hnExecutor struct{}
+type hnExecutor struct {
+	llm *llmClient
+	// MCP gateway client — nil when the platform didn't inject
+	// MCP_GATEWAY_URL/MCP_GATEWAY_TOKEN. Configured ONCE at startup; the
+	// per-user binding rides the forwarded traceparent, so request handling
+	// needs no credential plumbing at all (see mcp.go).
+	mcp *mcpClient
+}
 
 var _ a2asrv.AgentExecutor = (*hnExecutor)(nil)
 
-func (*hnExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+func (h *hnExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
+	// The inbound W3C trace context, forwarded on the LLM call for attribution.
+	traceparent := firstParam(execCtx, "traceparent")
 	return func(yield func(a2a.Event, error) bool) {
 		userText := extractText(execCtx.Message)
-		result, err := handleQuery(ctx, userText)
+		// One session per request: tools/list is query-aware, so the set depends
+		// on this request's traceparent and grows when the model searches.
+		session := h.mcp.openSession(ctx, traceparent)
+		dispatch := func(ctx context.Context, name, argsJSON string) string {
+			if session.handles(name) {
+				return session.callTool(ctx, name, argsJSON)
+			}
+			return dispatchTool(ctx, name, argsJSON)
+		}
+		// Run the LLM tool-calling loop: the model interprets the query and picks
+		// tools, we execute them, then the model synthesizes the answer.
+		result, err := h.llm.runAgentLoop(ctx, userText, traceparent, session.systemPromptHint(), hnTools, session, dispatch)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -33,20 +53,25 @@ func (*hnExecutor) Execute(ctx context.Context, execCtx *a2asrv.ExecutorContext)
 	}
 }
 
+// firstParam reads a single-valued service param (the a2a-go handler copies the
+// inbound HTTP headers into ExecutorContext.ServiceParams, lowercased).
+func firstParam(execCtx *a2asrv.ExecutorContext, name string) string {
+	if execCtx == nil || execCtx.ServiceParams == nil {
+		return ""
+	}
+	vals, ok := execCtx.ServiceParams.Get(name)
+	if !ok || len(vals) == 0 {
+		return ""
+	}
+	return vals[0]
+}
+
 func (*hnExecutor) Cancel(ctx context.Context, execCtx *a2asrv.ExecutorContext) iter.Seq2[a2a.Event, error] {
 	return func(yield func(a2a.Event, error) bool) {}
 }
 
-func handleQuery(ctx context.Context, query string) (string, error) {
-	lower := strings.ToLower(query)
-	if strings.Contains(lower, "top") || strings.Contains(lower, "front page") || strings.Contains(lower, "trending") {
-		return getTopStories(ctx)
-	}
-	return searchStories(ctx, query)
-}
-
 func getTopStories(ctx context.Context) (string, error) {
-	resp, err := http.Get("https://hacker-news.firebaseio.com/v0/topstories.json")
+	resp, err := httpGet(ctx, "https://hacker-news.firebaseio.com/v0/topstories.json")
 	if err != nil {
 		return "", err
 	}
@@ -83,7 +108,7 @@ func getTopStories(ctx context.Context) (string, error) {
 func searchStories(ctx context.Context, query string) (string, error) {
 	apiURL := fmt.Sprintf("https://hn.algolia.com/api/v1/search?query=%s&tags=story&hitsPerPage=10", url.QueryEscape(query))
 
-	resp, err := http.Get(apiURL)
+	resp, err := httpGet(ctx, apiURL)
 	if err != nil {
 		return "", err
 	}
@@ -133,7 +158,7 @@ type hnItem struct {
 }
 
 func getItem(ctx context.Context, id int) (*hnItem, error) {
-	resp, err := http.Get(fmt.Sprintf("https://hacker-news.firebaseio.com/v0/item/%d.json", id))
+	resp, err := httpGet(ctx, fmt.Sprintf("https://hacker-news.firebaseio.com/v0/item/%d.json", id))
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +168,34 @@ func getItem(ctx context.Context, id int) (*hnItem, error) {
 		return nil, err
 	}
 	return &item, nil
+}
+
+// getItemDetail formats a single item for the LLM's get_item tool.
+func getItemDetail(ctx context.Context, id int) (string, error) {
+	item, err := getItem(ctx, id)
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Item %d: %s\n", id, item.Title))
+	sb.WriteString(fmt.Sprintf("Points: %d | Comments: %d | By: %s\n", item.Score, item.Descendants, item.By))
+	if item.URL != "" {
+		sb.WriteString(fmt.Sprintf("URL: %s\n", item.URL))
+	}
+	sb.WriteString(fmt.Sprintf("Posted: %s\n", time.Unix(item.Time, 0).Format("2006-01-02 15:04")))
+	return sb.String(), nil
+}
+
+// httpGet issues a GET with the request context attached, so the
+// loongsuite-instrumented transport (see Dockerfile) propagates the trace and
+// the call shows up as a span.
+func httpGet(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	return http.DefaultClient.Do(req)
 }
 
 func extractText(msg *a2a.Message) string {
@@ -166,7 +219,7 @@ func main() {
 
 	agentCard := &a2a.AgentCard{
 		Name:        "Hacker News Agent",
-		Description: "Browse and search Hacker News. Get top stories, search by topic, find trending tech discussions.",
+		Description: "Browse and search Hacker News. Get top stories, search by topic, and inspect individual items — an LLM picks the right tool for your question.",
 		SupportedInterfaces: []*a2a.AgentInterface{
 			a2a.NewAgentInterface(fmt.Sprintf("http://0.0.0.0:%d/a2a", *port), a2a.TransportProtocolJSONRPC),
 		},
@@ -177,7 +230,7 @@ func main() {
 			{
 				ID:          "top_stories",
 				Name:        "Top Stories",
-				Description: "Get the current top stories from Hacker News front page",
+				Description: "Get the current top stories from the Hacker News front page",
 				Tags:        []string{"hackernews", "tech", "trending", "news"},
 				Examples:    []string{"Show top HN stories", "What's trending on Hacker News?", "Front page stories"},
 			},
@@ -188,10 +241,23 @@ func main() {
 				Tags:        []string{"hackernews", "search", "tech"},
 				Examples:    []string{"Search HN for Rust programming", "Find stories about AI agents", "Hacker News posts about Go"},
 			},
+			{
+				ID:          "item_details",
+				Name:        "Item Details",
+				Description: "Get details (score, author, comments, URL) for a specific Hacker News item by ID",
+				Tags:        []string{"hackernews", "story", "details"},
+				Examples:    []string{"Tell me about HN item 8863", "What's the score of story 12345678?"},
+			},
 		},
 	}
 
-	handler := a2asrv.NewHandler(&hnExecutor{})
+	// MCP gateway: configured once from the deploy-injected env. Only a health
+	// check here — the tool set is query-scoped and fetched per request
+	// (docs/MCP_TOOL_SEARCH_DESIGN.md), see mcpSession.
+	mcp := newMCPClient()
+	mcp.probe(context.Background())
+
+	handler := a2asrv.NewHandler(&hnExecutor{llm: newLLMClient(), mcp: mcp})
 
 	mux := http.NewServeMux()
 	mux.Handle("/a2a", a2asrv.NewJSONRPCHandler(handler))

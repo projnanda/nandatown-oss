@@ -32,7 +32,6 @@ pub enum StatusKind {
     Thinking,
     ToolCall,
     ToolResult { success: bool },
-    Working,
     Failed,
 }
 
@@ -106,6 +105,9 @@ fn do_stream_request(
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": uuid::Uuid::new_v4().to_string(),
+        // gRPC-style JSON-RPC method/role names — what every example agent's
+        // installed `a2a-sdk` actually registers in its dispatch table
+        // (confirmed against a real deployed `oss/agents/translator` build).
         "method": "SendStreamingMessage",
         "params": {
             "message": {
@@ -132,7 +134,7 @@ fn do_stream_request(
     let mut req = http
         .post(endpoint)
         .header("Content-Type", "application/json")
-        .header("A2A-Version", "1.0")
+        .header("A2A-Version", nasiko_types::a2a::A2A_VERSION_HEADER_VALUE)
         .header("traceparent", &traceparent);
     if let Some(ref t) = token {
         req = req.header("Authorization", &format!("Bearer {t}"));
@@ -248,10 +250,13 @@ fn handle_status_event(event: &serde_json::Value, tx: &mpsc::Sender<AppEvent>) {
                     if let Some(data) = part.get("data") {
                         emit_status_data(data, tx);
                     } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        let _ = tx.send(AppEvent::StreamStatus(StatusEvent {
-                            kind: StatusKind::Working,
-                            text: text.to_string(),
-                        }));
+                        // A text part in a WORKING update is the agent's streamed
+                        // reply content — coding agents (and the a2a agents) stream
+                        // the answer as incremental WORKING message parts, with no
+                        // text on the terminal COMPLETED event. Append it to the
+                        // message, not the transient status line, or the reply is
+                        // never shown in the chat pane.
+                        let _ = tx.send(AppEvent::StreamToken(text.to_string()));
                     }
                 }
             }

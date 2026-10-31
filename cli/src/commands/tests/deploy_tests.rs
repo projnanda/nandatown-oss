@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::dir_references_mcp_gateway;
 
 // ─── resolve_image_deploy_version ────────────────────────────────────────────
 
@@ -234,4 +235,205 @@ fn already_pushed_is_false_for_an_active_version() {
         serde_json::json!({"id": "agent-1", "version": "1.0.0"}),
     );
     assert!(!already_pushed(&client, Some(&existing), "1.0.0").unwrap());
+}
+
+// ─── dir_references_mcp_gateway ──────────────────────────────────────────────
+
+#[test]
+fn dir_references_mcp_gateway_finds_a_reference_in_a_nested_source_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/main.py"),
+        "gateway_url = os.environ['MCP_GATEWAY_URL']\n",
+    )
+    .unwrap();
+    assert!(dir_references_mcp_gateway(dir.path()));
+}
+
+#[test]
+fn dir_references_mcp_gateway_is_false_with_no_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("main.py"), "print('hello')\n").unwrap();
+    assert!(!dir_references_mcp_gateway(dir.path()));
+}
+
+#[test]
+fn dir_references_mcp_gateway_ignores_skipped_directories() {
+    // A reference sitting only inside a vendored/build dir shouldn't count — a
+    // real MCP_GATEWAY_TOKEN in the repo's own .env, say, isn't the agent's own
+    // code calling the gateway.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+    std::fs::write(
+        dir.path().join("node_modules/pkg/index.js"),
+        "const x = 'MCP_GATEWAY_TOKEN';\n",
+    )
+    .unwrap();
+    assert!(!dir_references_mcp_gateway(dir.path()));
+}
+
+// ─── deploy --dry-run plan ───────────────────────────────────────────────────
+
+fn plan_for<'a>(
+    current_version: Option<&'a str>,
+    already_pushed: bool,
+    env: &'a HashMap<String, String>,
+) -> DeployPlan<'a> {
+    DeployPlan {
+        agent_name: "weather",
+        agent_exists: current_version.is_some(),
+        current_version,
+        version: "1.3.0",
+        image_ref: "nasiko/weather:1.3.0",
+        already_pushed,
+        builds_image: true,
+        port: 8000,
+        workload_kind: None,
+        hitl: false,
+        writable: false,
+        writable_path: None,
+        env,
+    }
+}
+
+#[test]
+fn dry_run_plan_never_shows_env_values() {
+    let env = HashMap::from([
+        ("API_KEY".to_string(), "sk-live-secret".to_string()),
+        ("DB_URL".to_string(), "postgres://user:pw@db".to_string()),
+    ]);
+    let text = plan_lines(&plan_for(Some("1.2.0"), false, &env)).join("\n");
+    assert!(text.contains("API_KEY=****"));
+    assert!(text.contains("DB_URL=****"));
+    assert!(!text.contains("sk-live-secret"));
+    assert!(!text.contains("postgres://"));
+}
+
+#[test]
+fn dry_run_plan_describes_update_vs_new_agent_and_reuse_vs_build() {
+    let env = HashMap::new();
+    let update = plan_lines(&plan_for(Some("1.2.0"), false, &env)).join("\n");
+    assert!(update.contains("update 1.2.0 → 1.3.0"));
+    assert!(update.contains("(build + push)"));
+    assert!(update.contains("env       (none)"));
+
+    let new_agent = plan_lines(&plan_for(None, true, &env)).join("\n");
+    assert!(new_agent.contains("register new agent at 1.3.0"));
+    assert!(new_agent.contains("(reuse the already-pushed image)"));
+}
+
+#[test]
+fn dry_run_plan_shows_the_writable_mount() {
+    let env = HashMap::new();
+    let mut plan = plan_for(None, false, &env);
+    plan.writable = true;
+    assert!(
+        plan_lines(&plan)
+            .join("\n")
+            .contains("writable  yes, at /workspace")
+    );
+    plan.writable_path = Some("/data");
+    assert!(
+        plan_lines(&plan)
+            .join("\n")
+            .contains("writable  yes, at /data")
+    );
+}
+
+#[test]
+fn dry_run_plan_shows_a_coding_agent_deploys_port_less() {
+    let env = HashMap::new();
+    let plain = plan_lines(&plan_for(None, false, &env)).join("\n");
+    assert!(plain.contains("port      8000"));
+    assert!(!plain.contains("kind"));
+
+    let mut plan = plan_for(None, false, &env);
+    plan.workload_kind = Some("acp_coding_agent");
+    plan.hitl = true;
+    let coding = plan_lines(&plan).join("\n");
+    assert!(coding.contains("kind      coding agent, HITL on"));
+    assert!(coding.contains("port      none (driven over stdio)"));
+}
+
+#[test]
+fn dry_run_plan_says_what_happens_to_hitl_when_it_is_not_turned_on() {
+    // The deploy only ever sends HITL as on: a new agent is created with it off, and an
+    // existing agent keeps whatever it has.
+    let env = HashMap::new();
+    let mut plan = plan_for(None, false, &env);
+    plan.workload_kind = Some("acp_coding_agent");
+    assert!(
+        plan_lines(&plan)
+            .join("\n")
+            .contains("coding agent, HITL off")
+    );
+    plan.agent_exists = true;
+    assert!(
+        plan_lines(&plan)
+            .join("\n")
+            .contains("coding agent, HITL unchanged")
+    );
+
+    // HITL means nothing for other kinds, so their line doesn't mention it.
+    plan.workload_kind = Some("agent");
+    let other = plan_lines(&plan).join("\n");
+    assert!(
+        other.contains("kind      agent") && !other.contains("HITL"),
+        "{other}"
+    );
+}
+
+#[test]
+fn dry_run_plan_names_an_existing_agent_without_a_live_version_and_a_raw_image_push() {
+    let env = HashMap::new();
+    let mut plan = plan_for(None, false, &env);
+    plan.agent_exists = true;
+    plan.builds_image = false;
+    let text = plan_lines(&plan).join("\n");
+    assert!(
+        text.contains("deploy 1.3.0 to the existing agent"),
+        "{text}"
+    );
+    assert!(text.contains("(push the local image)"), "{text}");
+}
+
+// ─── resolve_workload_kind / deploy_ports ────────────────────────────────────
+
+#[test]
+fn coding_agent_flag_wins_over_the_card() {
+    // The explicit flag marks a coding agent even when the card says otherwise.
+    let card = serde_json::json!({ "workloadKind": "agent" });
+    assert_eq!(
+        resolve_workload_kind(true, &card).as_deref(),
+        Some("acp_coding_agent")
+    );
+}
+
+#[test]
+fn card_workload_kind_is_the_default_without_the_flag() {
+    let card = serde_json::json!({ "workloadKind": "acp_coding_agent" });
+    assert_eq!(
+        resolve_workload_kind(false, &card).as_deref(),
+        Some("acp_coding_agent")
+    );
+}
+
+#[test]
+fn no_flag_and_no_card_field_means_ordinary_agent() {
+    // No flag, no (or empty) card field → None, so the server defaults to `agent`.
+    assert_eq!(resolve_workload_kind(false, &serde_json::json!({})), None);
+    assert_eq!(
+        resolve_workload_kind(false, &serde_json::json!({ "workloadKind": "" })),
+        None
+    );
+}
+
+#[test]
+fn a_coding_agent_deploys_port_less() {
+    // Coding agents are driven over stdio, so they carry no container port;
+    // everything else keeps its service port.
+    assert!(deploy_ports(Some("acp_coding_agent"), 8000).is_empty());
+    assert_eq!(deploy_ports(None, 8000), vec![8000]);
+    assert_eq!(deploy_ports(Some("agent"), 8000), vec![8000]);
 }

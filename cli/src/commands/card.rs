@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use dialoguer::{Confirm, Input};
+use nasiko_utils::term;
 
 use crate::util;
 
@@ -37,8 +38,8 @@ pub fn card(directory: &str, description: Option<&str>) -> Result<()> {
 }
 
 fn try_generate_via_cp(root: &Path, card_path: &Path, description: Option<&str>) -> Result<()> {
-    let client = crate::api::Client::from_active_cluster()
-        .map_err(|e| anyhow::anyhow!("no active cluster ({e}) — run `nasiko connect`"))?;
+    // The error already says what's wrong and what to run; wrapping it would repeat both.
+    let client = crate::api::Client::from_active_cluster()?;
 
     // The server's /capabilities/generate requires source_code unconditionally
     // (there's nothing to generate a card *from* without code) — bailing here
@@ -82,7 +83,7 @@ fn try_generate_via_cp(root: &Path, card_path: &Path, description: Option<&str>)
         .get("tokens_used")
         .and_then(|t| t.as_i64())
         .unwrap_or(0);
-    println!("✓ Wrote AgentCard.json (LLM, {} tokens)", tokens);
+    term::print_success(&format!("Wrote AgentCard.json (LLM, {tokens} tokens)"));
     Ok(())
 }
 
@@ -300,7 +301,8 @@ fn generate_static(root: &Path, card_path: &Path, user_description: Option<&str>
     });
 
     fs::write(card_path, serde_json::to_string_pretty(&card)?)?;
-    println!("\n✓ Wrote AgentCard.json");
+    println!();
+    term::print_success("Wrote AgentCard.json");
     println!("  Connect to a cluster for LLM-powered generation.");
 
     Ok(())

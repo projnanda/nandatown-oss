@@ -1,0 +1,29 @@
+# Prettier covers the app's TypeScript and CSS (plan §2.5); docs and fixtures keep their own style.
+*
+!**/
+!*.ts
+!*.js
+!**/src/**/*.ts
+!**/src/**/*.tsx
+!**/src/**/*.css
+!*/vite.config.ts
+!*/*/vite.config.ts
+!scripts/**/*.ts
+# The design playground (plans/feat-design-playground.md): its code is TypeScript in this repo, so it is
+# formatted like the rest of it. ESLint skips it (its shell is raw elements by design); Prettier does not.
+!design/**/*.ts
+!design/**/*.tsx
+!design/**/*.css
+node_modules/
+.claude/
+**/dist/
+coverage/
+shared/ui/public/
+**/routeTree.gen.ts
+shared/data-access/src/schema.gen.ts
+shared/testing/src/__live__/
+# Stock shadcn output stays close to the registry so `shadcn diff` stays readable (local edits are listed per file).
+shared/ui/src/primitives/
+ee/features/enterprise/src/genui/lang/
+# Written by msw on install (package.json "msw.workerDirectory"); CI's npm ci regenerates it unformatted.
+public/mockServiceWorker.js

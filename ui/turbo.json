@@ -1,0 +1,12 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "//": "`node scripts/app.ts build` (no edition) runs `turbo run build`: each app package builds once, and again only when its inputs change. The shared packages are source-only (vite.shared.ts PACKAGE_ALIASES), so their sources are inputs, not tasks. Strict env mode: a build sees only the variables listed here.",
+  "globalDependencies": ["pnpm-lock.yaml", "vite.shared.ts", "tsconfig.base.json", ".env", ".env.*"],
+  "globalEnv": ["VITE_*", "NASIKO_*", "NODE_ENV"],
+  "tasks": {
+    "build": {
+      "inputs": ["$TURBO_DEFAULT$", "$TURBO_ROOT$/shared/*/src/**", "$TURBO_ROOT$/shared/ui/public/**"],
+      "outputs": ["dist/**"]
+    }
+  }
+}

@@ -11,6 +11,10 @@
 //!
 //! Building IR by constructing OpenAI-shaped JSON and deserializing keeps this in lock-
 //! step with the IR's own serde rules.
+//!
+//! Text is flattened to strings, except where the agent set a `cache_control` marker: that
+//! content stays as text parts, each keeping its marker, so the cached prefix the agent chose
+//! ends where it put it (see [`crate::ir::CACHE_CONTROL`]).
 
 use std::collections::HashMap;
 
@@ -18,7 +22,9 @@ use serde_json::{Value, json};
 
 use super::{ChatStreamRenderer, InboundParser};
 use crate::error::GatewayError;
-use crate::ir::{ChatChunk, ChatRequest, ChatResponse, EmbeddingsRequest, EmbeddingsResponse};
+use crate::ir::{
+    CACHE_CONTROL, ChatChunk, ChatRequest, ChatResponse, EmbeddingsRequest, EmbeddingsResponse,
+};
 
 pub struct AnthropicInbound;
 
@@ -28,9 +34,9 @@ impl InboundParser for AnthropicInbound {
 
         // Anthropic carries the system prompt at the top level (string or block array).
         if let Some(system) = body.get("system") {
-            let text = anthropic_text(system);
-            if !text.is_empty() {
-                oa_messages.push(json!({ "role": "system", "content": text }));
+            let content = text_content_from_anthropic(system);
+            if !is_blank(&content) {
+                oa_messages.push(json!({ "role": "system", "content": content }));
             }
         }
 
@@ -110,10 +116,7 @@ impl InboundParser for AnthropicInbound {
             "stop_sequence": Value::Null,
         });
         if let Some(u) = usage {
-            out["usage"] = json!({
-                "input_tokens": u.prompt_tokens.unwrap_or(0),
-                "output_tokens": u.completion_tokens.unwrap_or(0),
-            });
+            out["usage"] = anthropic_usage(u);
         }
         out
     }
@@ -150,47 +153,88 @@ fn anthropic_text(v: &Value) -> String {
     }
 }
 
+/// Anthropic text content → IR content: the joined text, unless a text block carries a cache
+/// marker; then one text part per block, each keeping its marker.
+fn text_content_from_anthropic(v: &Value) -> Value {
+    let Value::Array(blocks) = v else {
+        return json!(anthropic_text(v));
+    };
+    let text_blocks: Vec<&Value> = blocks.iter().filter(|b| is_text_block(b)).collect();
+    if !text_blocks.iter().any(|b| b.get(CACHE_CONTROL).is_some()) {
+        return json!(anthropic_text(v));
+    }
+    let parts: Vec<Value> = text_blocks
+        .into_iter()
+        .map(|b| with_cache_marker_of(b, json!({ "type": "text", "text": b["text"] })))
+        .collect();
+    json!(parts)
+}
+
+/// The blocks [`anthropic_text`] reads.
+fn is_text_block(b: &Value) -> bool {
+    b.get("text").and_then(Value::as_str).is_some()
+}
+
+fn is_blank(content: &Value) -> bool {
+    match content {
+        Value::String(s) => s.is_empty(),
+        Value::Array(parts) => parts.is_empty(),
+        _ => true,
+    }
+}
+
+/// `target` with `source`'s cache marker copied onto it, if it has one.
+fn with_cache_marker_of(source: &Value, mut target: Value) -> Value {
+    if let Some(marker) = source.get(CACHE_CONTROL) {
+        target[CACHE_CONTROL] = marker.clone();
+    }
+    target
+}
+
+/// A `tool_result` keeps one marker, on its whole result: the block's own, else the last one on
+/// a block inside it. Both end the cached prefix at the end of the result.
+fn tool_result_marker(b: &Value) -> Option<&Value> {
+    b.get(CACHE_CONTROL).or_else(|| {
+        b.get("content")
+            .and_then(Value::as_array)?
+            .iter()
+            .rev()
+            .find_map(|inner| inner.get(CACHE_CONTROL))
+    })
+}
+
 /// An Anthropic assistant turn → an OpenAI assistant message. `text` blocks join into
 /// `content`; `tool_use` blocks become `tool_calls[]` (arguments as a JSON string).
 fn assistant_from_anthropic(content: &Value) -> Value {
     match content {
         Value::String(s) => json!({ "role": "assistant", "content": s }),
         Value::Array(blocks) => {
-            let mut text = String::new();
             let mut tool_calls: Vec<Value> = Vec::new();
             for b in blocks {
-                match b.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        text.push_str(b.get("text").and_then(Value::as_str).unwrap_or_default())
-                    }
-                    Some("tool_use") => {
-                        let arguments = b
-                            .get("input")
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "{}".to_string());
-                        tool_calls.push(json!({
-                            "id": b.get("id").and_then(Value::as_str).unwrap_or_default(),
-                            "type": "function",
-                            "function": {
-                                "name": b.get("name").and_then(Value::as_str).unwrap_or_default(),
-                                "arguments": arguments,
-                            }
-                        }));
-                    }
-                    _ => {}
+                if b.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let arguments = b
+                        .get("input")
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "{}".to_string());
+                    let call = json!({
+                        "id": b.get("id").and_then(Value::as_str).unwrap_or_default(),
+                        "type": "function",
+                        "function": {
+                            "name": b.get("name").and_then(Value::as_str).unwrap_or_default(),
+                            "arguments": arguments,
+                        }
+                    });
+                    tool_calls.push(with_cache_marker_of(b, call));
                 }
             }
+            let text = text_content_from_anthropic(content);
             let mut msg = json!({ "role": "assistant" });
             if tool_calls.is_empty() {
-                msg["content"] = json!(text);
+                msg["content"] = text;
             } else {
                 msg["tool_calls"] = json!(tool_calls);
                 // OpenAI: content is null on a pure tool-call turn.
-                msg["content"] = if text.is_empty() {
-                    Value::Null
-                } else {
-                    json!(text)
-                };
+                msg["content"] = if is_blank(&text) { Value::Null } else { text };
             }
             msg
         }
@@ -204,24 +248,24 @@ fn append_user_from_anthropic(content: &Value, out: &mut Vec<Value>) {
     match content {
         Value::String(s) => out.push(json!({ "role": "user", "content": s })),
         Value::Array(blocks) => {
-            let mut text = String::new();
             for b in blocks {
-                match b.get("type").and_then(Value::as_str) {
-                    Some("text") => {
-                        text.push_str(b.get("text").and_then(Value::as_str).unwrap_or_default())
-                    }
-                    Some("tool_result") => {
-                        let result = b.get("content").map(anthropic_text).unwrap_or_default();
-                        out.push(json!({
-                            "role": "tool",
-                            "tool_call_id": b.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
-                            "content": result,
-                        }));
-                    }
-                    _ => {}
+                if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    let result = b.get("content").map(anthropic_text).unwrap_or_default();
+                    let content = match tool_result_marker(b) {
+                        Some(marker) => {
+                            json!([{ "type": "text", "text": result, CACHE_CONTROL: marker }])
+                        }
+                        None => json!(result),
+                    };
+                    out.push(json!({
+                        "role": "tool",
+                        "tool_call_id": b.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
+                        "content": content,
+                    }));
                 }
             }
-            if !text.is_empty() {
+            let text = text_content_from_anthropic(content);
+            if !is_blank(&text) {
                 out.push(json!({ "role": "user", "content": text }));
             }
         }
@@ -238,7 +282,7 @@ fn tool_from_anthropic(t: &Value) -> Value {
     if let Some(s) = t.get("input_schema") {
         function["parameters"] = s.clone();
     }
-    json!({ "type": "function", "function": function })
+    with_cache_marker_of(t, json!({ "type": "function", "function": function }))
 }
 
 /// Anthropic `tool_choice` → OpenAI `tool_choice` (inverse of the outbound mapping).
@@ -286,21 +330,41 @@ enum OpenBlock {
     Tool(i64),
 }
 
+fn anthropic_usage(mut usage: crate::ir::Usage) -> Value {
+    usage.normalize_openai_details();
+    let mut value = json!({});
+    for (key, count) in [
+        ("input_tokens", usage.prompt_tokens),
+        ("output_tokens", usage.completion_tokens),
+        ("cache_read_input_tokens", usage.cache_read_input_tokens),
+        (
+            "cache_creation_input_tokens",
+            usage.cache_creation_input_tokens,
+        ),
+    ] {
+        if let Some(count) = count {
+            value[key] = json!(count);
+        }
+    }
+    if let Some(cache) = usage.cache_creation {
+        value["cache_creation"] = json!(cache);
+    }
+    value
+}
+
 /// Reconstructs Anthropic's stateful event sequence from flat OpenAI-shaped IR chunks.
 ///
 /// Anthropic indexes content blocks sequentially across both text and tool blocks; the
 /// IR carries tool deltas with their own (tool-only) index. We assign Anthropic block
-/// indices as blocks open and map the IR tool index onto them. `input_tokens` is only
-/// known at the end of the IR stream (terminal usage chunk), so `message_start` reports
-/// what we have so far (usually 0) — a known minor fidelity gap; `output_tokens` is
-/// reported faithfully in `message_delta`.
+/// indices as blocks open and map the IR tool index onto them. Usage arriving after
+/// message_start is sent in message_delta so clients can update their final message
+/// without delaying incremental text or tool delivery.
 #[derive(Default)]
 struct AnthropicStreamRenderer {
     started: bool,
     id: String,
     model: String,
-    input_tokens: i64,
-    output_tokens: i64,
+    usage: crate::ir::Usage,
     stop_reason: Option<String>,
     open_block: Option<OpenBlock>,
     next_index: i64,
@@ -320,7 +384,12 @@ impl AnthropicStreamRenderer {
                     "content": [],
                     "stop_reason": Value::Null,
                     "stop_sequence": Value::Null,
-                    "usage": { "input_tokens": self.input_tokens, "output_tokens": 0 },
+                    // Required start counts are provisional; terminal usage replaces them.
+                    "usage": anthropic_usage(crate::ir::Usage {
+                        prompt_tokens: Some(self.usage.prompt_tokens.unwrap_or(0)),
+                        completion_tokens: Some(0),
+                        ..self.usage.clone()
+                    }),
                 }
             }),
         )
@@ -354,12 +423,24 @@ impl ChatStreamRenderer for AnthropicStreamRenderer {
     fn render(&mut self, chunk: ChatChunk) -> Vec<String> {
         let mut out = Vec::new();
 
-        if let Some(u) = &chunk.usage {
-            if let Some(i) = u.prompt_tokens {
-                self.input_tokens = i;
-            }
-            if let Some(o) = u.completion_tokens {
-                self.output_tokens = o;
+        if let Some(mut usage) = chunk.usage {
+            usage.normalize_openai_details();
+            self.usage.prompt_tokens = usage.prompt_tokens.or(self.usage.prompt_tokens);
+            self.usage.completion_tokens = usage.completion_tokens.or(self.usage.completion_tokens);
+            self.usage.cache_read_input_tokens = usage
+                .cache_read_input_tokens
+                .or(self.usage.cache_read_input_tokens);
+            self.usage.cache_creation_input_tokens = usage
+                .cache_creation_input_tokens
+                .or(self.usage.cache_creation_input_tokens);
+            if let Some(cache) = usage.cache_creation {
+                let current = self.usage.cache_creation.get_or_insert_default();
+                current.ephemeral_5m_input_tokens = cache
+                    .ephemeral_5m_input_tokens
+                    .or(current.ephemeral_5m_input_tokens);
+                current.ephemeral_1h_input_tokens = cache
+                    .ephemeral_1h_input_tokens
+                    .or(current.ephemeral_1h_input_tokens);
             }
         }
 
@@ -447,7 +528,7 @@ impl ChatStreamRenderer for AnthropicStreamRenderer {
             "message_delta",
             json!({
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                "usage": { "output_tokens": self.output_tokens },
+                "usage": anthropic_usage(self.usage.clone()),
             }),
         ));
         out.push(event("message_stop", json!({})));
@@ -556,6 +637,75 @@ mod tests {
         assert_eq!(req.tools.as_ref().unwrap()[0].function.name, "f");
     }
 
+    #[test]
+    fn parse_keeps_cache_markers_on_content_parts_where_openrouter_reads_them() {
+        let ephemeral = json!({ "type": "ephemeral" });
+        let req = AnthropicInbound
+            .parse_chat(json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "system": [
+                    { "type": "text", "text": "You are a coding agent." },
+                    { "type": "text", "text": "Repository map.", "cache_control": ephemeral }
+                ],
+                "tools": [{ "name": "read", "input_schema": { "type": "object" }, "cache_control": ephemeral }],
+                "messages": [
+                    { "role": "user", "content": "Fix the test." },
+                    { "role": "assistant", "content": [
+                        { "type": "tool_use", "id": "toolu_1", "name": "read", "input": {}, "cache_control": ephemeral }
+                    ]},
+                    { "role": "user", "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_1", "content": "fn main() {}", "cache_control": ephemeral }
+                    ]}
+                ]
+            }))
+            .unwrap();
+
+        let ir = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            ir["messages"][0]["content"],
+            json!([
+                { "type": "text", "text": "You are a coding agent." },
+                { "type": "text", "text": "Repository map.", "cache_control": ephemeral }
+            ])
+        );
+        assert_eq!(ir["tools"][0]["cache_control"], ephemeral);
+        assert_eq!(
+            ir["messages"][2]["tool_calls"][0]["cache_control"],
+            ephemeral
+        );
+        assert_eq!(
+            ir["messages"][3]["content"],
+            json!([{ "type": "text", "text": "fn main() {}", "cache_control": ephemeral }])
+        );
+    }
+
+    #[test]
+    fn parse_without_cache_markers_still_flattens_content_to_strings() {
+        // Unmarked requests must reach every provider byte-identical to before markers were kept.
+        let req = AnthropicInbound
+            .parse_chat(json!({
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "system": [
+                    { "type": "text", "text": "You are a coding agent. " },
+                    { "type": "text", "text": "Repository map." }
+                ],
+                "messages": [{ "role": "user", "content": [
+                    { "type": "text", "text": "Fix the test. " },
+                    { "type": "text", "text": "Then stop." }
+                ]}]
+            }))
+            .unwrap();
+
+        let ir = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            ir["messages"][0]["content"],
+            "You are a coding agent. Repository map."
+        );
+        assert_eq!(ir["messages"][1]["content"], "Fix the test. Then stop.");
+    }
+
     // ── render_chat_response (IR → Anthropic response) ────────────────────────
 
     #[test]
@@ -616,6 +766,63 @@ mod tests {
             usage: None,
             extra: Map::new(),
         }
+    }
+
+    #[test]
+    fn terminal_usage_preserves_input_cache_and_ttl_without_buffering_text() {
+        let mut renderer = AnthropicInbound.chat_stream_renderer();
+        assert!(
+            renderer
+                .render(text_chunk("hello"))
+                .join("")
+                .contains("text_delta")
+        );
+        let usage: crate::ir::Usage = serde_json::from_value(json!({
+            "prompt_tokens":2,"completion_tokens":10,"cache_read_input_tokens":1000,
+            "cache_creation_input_tokens":300,
+            "cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200}
+        }))
+        .unwrap();
+        let mut chunk = text_chunk("");
+        chunk.usage = Some(usage.clone());
+        renderer.render(chunk.clone());
+        renderer.render(chunk);
+        let mut partial = text_chunk("");
+        partial.usage = Some(crate::ir::Usage {
+            completion_tokens: Some(0),
+            ..Default::default()
+        });
+        renderer.render(partial);
+        let frames = renderer.finish();
+        let delta: Value = serde_json::from_str(
+            frames
+                .iter()
+                .find(|f| f.contains("event: message_delta"))
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .unwrap(),
+        )
+        .unwrap();
+        let mut expected = anthropic_usage(usage);
+        expected["output_tokens"] = json!(0);
+        assert_eq!(delta["usage"], expected);
+        assert!(
+            !delta["usage"]
+                .as_object()
+                .unwrap()
+                .contains_key("total_tokens")
+        );
+    }
+
+    #[test]
+    fn buffered_usage_normalizes_nested_cache_and_retains_missing_fields() {
+        let usage = serde_json::from_value(json!({"prompt_tokens":110,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":100}})).unwrap();
+        let result = anthropic_usage(usage);
+        assert_eq!(result["input_tokens"], 10);
+        assert_eq!(result["cache_read_input_tokens"], 100);
+        assert!(result.get("cache_creation_input_tokens").is_none());
+        assert_eq!(anthropic_usage(crate::ir::Usage::default()), json!({}));
     }
 
     #[test]

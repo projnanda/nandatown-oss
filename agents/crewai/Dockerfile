@@ -7,6 +7,7 @@ COPY src/ /app
 RUN pip install --no-cache-dir \
     "crewai[tools]>=0.95.0" \
     "a2a-sdk[http-server]==0.3.26" \
+    "httpx>=0.28.1" \
     google-genai \
     pillow \
     pydantic \

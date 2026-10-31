@@ -18,6 +18,8 @@ pub struct ChatSession {
     pub agent_id: Option<Uuid>,
     pub agent_url: Option<String>,
     pub title: String,
+    /// `orchestrator` | `direct_chat` | `maf_execution` — see migration 0034.
+    pub session_type: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -29,9 +31,12 @@ pub struct ChatSessionView {
     pub agent_id: Option<Uuid>,
     pub agent_url: Option<String>,
     pub title: String,
+    /// `orchestrator` | `direct_chat` | `maf_execution` — see migration 0034.
+    pub session_type: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub agent_name: Option<String>,
+    pub is_coding_agent: bool,
     pub last_message: Option<String>,
     // Per-session rollups computed in the list query itself, so the sessions
     // page renders its stats columns without a trace-store round-trip.
@@ -48,6 +53,7 @@ pub struct ChatSessionView {
 pub struct ChatMessage {
     pub id: Uuid,
     pub session_id: String,
+    pub external_turn_id: Option<String>,
     pub role: String,
     pub content: String,
     pub file_parts: Option<sqlx::types::Json<serde_json::Value>>,
@@ -58,11 +64,17 @@ pub struct ChatMessage {
     // carry at most duration/trace.
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    /// Prompt tokens served from the provider cache. Separate from `input_tokens`, which
+    /// carries only the fresh portion — a chip that sums input+output alone under-reports
+    /// the prompt by whatever the cache served (migration 041).
+    pub cache_read_tokens: Option<i32>,
+    pub cache_creation_tokens: Option<i32>,
     pub model: Option<String>,
     pub duration_ms: Option<i32>,
     pub cost_usd: Option<rust_decimal::Decimal>,
     pub usage_estimated: Option<bool>,
     pub trace_id: Option<String>,
+    pub metadata: Option<sqlx::types::Json<serde_json::Value>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +110,19 @@ pub struct ChatMessageFile {
     pub created_at: DateTime<Utc>,
 }
 
+/// The only two `chat_messages.role` values a client may ever write via `POST
+/// /api/chat/sessions/{id}/messages` (`send_message`, which validates `SendMessage::role` against
+/// these). `"system"` is deliberately excluded even though it's a real, legitimate value in this
+/// column — it's written exclusively by internal server code
+/// (`router/a2a_dispatch.rs::INTERNAL_TRANSCRIPT_ROLE`, a HITL resume's own continuation note) and
+/// must never be attacker-controlled: `list_messages` hides `role = 'system'` rows from the
+/// transcript/audit UI on the assumption that nothing a human or API caller wrote can carry that
+/// role, but `SessionHistory::fetch` (`oss/orchestrator`) applies no such filter when building the
+/// next turn's LLM prompt — a client-forged `role: "system"` row would reach the model as a system
+/// instruction while staying invisible everywhere a human would look for it (found in review).
+pub const CHAT_MESSAGE_ROLE_USER: &str = "user";
+pub const CHAT_MESSAGE_ROLE_ASSISTANT: &str = "assistant";
+
 #[derive(Debug, Deserialize)]
 pub struct SendMessage {
     pub role: String,
@@ -107,6 +132,31 @@ pub struct SendMessage {
     /// Optional per-message usage captured client-side from the stream's
     /// `usage_meta` event (direct-agent chats persist through this route).
     pub usage: Option<MessageUsage>,
+    /// The agent ended this turn as failed: saved so a reload shows the failure
+    /// rather than "no reply".
+    pub error: Option<TurnError>,
+}
+
+/// A failed turn's error, exactly as the agent sent it -- JSON, text or an SDK
+/// dump alike. Stored as text and never parsed here; the UI reads it.
+#[derive(Debug, Deserialize)]
+pub struct TurnError {
+    pub message: String,
+}
+
+/// How much of a failed turn's error is kept.
+pub const TURN_ERROR_MAX_CHARS: usize = 4_000;
+
+/// `metadata` for a failed turn: `{"turn_error": {"message", "source"}}`, under
+/// the key the history readers filter on, so it never reaches a model prompt.
+pub fn turn_error_metadata(message: &str, source: &str) -> serde_json::Value {
+    let message: String = message.chars().take(TURN_ERROR_MAX_CHARS).collect();
+    let mut m = serde_json::Map::new();
+    m.insert(
+        nasiko_orchestrator::session_history::TURN_ERROR_METADATA_KEY.to_string(),
+        serde_json::json!({ "message": message, "source": source }),
+    );
+    serde_json::Value::Object(m)
 }
 
 /// The usage subset a client may attach when persisting an assistant message.
@@ -114,9 +164,61 @@ pub struct SendMessage {
 pub struct MessageUsage {
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_creation_tokens: Option<i32>,
     pub model: Option<String>,
     pub duration_ms: Option<i32>,
     pub cost_usd: Option<rust_decimal::Decimal>,
     pub estimated: Option<bool>,
     pub trace_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExternalTurn {
+    pub turn_id: String,
+    pub user_content: String,
+    pub assistant_content: String,
+    pub assistant_usage: Option<MessageUsage>,
+    #[serde(default, deserialize_with = "deserialize_optional_object")]
+    pub assistant_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+fn deserialize_optional_object<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(serde_json::Value::Object(object)) => Ok(Some(object)),
+        Some(_) => Err(D::Error::custom(
+            "assistant_metadata must be null or a JSON object",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_turn_is_kept_as_text_under_the_key_history_skips() {
+        let raw = "Error code: 503 - {'code': 'upstream_down', 'error': 'try later'}";
+        let m = turn_error_metadata(raw, "agent");
+        let e = &m[nasiko_orchestrator::session_history::TURN_ERROR_METADATA_KEY];
+        assert_eq!(e["message"], raw, "stored as sent, never parsed");
+        assert_eq!(e["source"], "agent");
+    }
+
+    #[test]
+    fn a_long_error_is_cut_to_the_cap() {
+        let m = turn_error_metadata(&"é".repeat(TURN_ERROR_MAX_CHARS + 50), "orchestrator");
+        let kept = m["turn_error"]["message"].as_str().unwrap();
+        assert_eq!(kept.chars().count(), TURN_ERROR_MAX_CHARS);
+    }
 }

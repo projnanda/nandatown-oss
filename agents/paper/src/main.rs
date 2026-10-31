@@ -4,6 +4,7 @@ use a2a::*;
 use a2a_server::*;
 use futures::stream::BoxStream;
 
+mod mcp;
 mod telemetry;
 mod tools;
 
@@ -12,16 +13,21 @@ struct PaperAgent {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
+    /// MCP gateway client -- `None` when the platform didn't inject
+    /// `MCP_GATEWAY_URL`/`MCP_GATEWAY_TOKEN`. Configured ONCE at startup;
+    /// the per-user binding rides the forwarded traceparent (see mcp.rs).
+    mcp: Option<Arc<mcp::McpClient>>,
 }
 
 impl PaperAgent {
-    fn new() -> Self {
+    fn new(mcp: Option<Arc<mcp::McpClient>>) -> Self {
         Self {
             base_url: std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com/v1".into()),
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into()),
             http: reqwest::Client::new(),
+            mcp,
         }
     }
 
@@ -52,7 +58,9 @@ impl PaperAgent {
         if capture {
             tracing::Span::current().record(
                 "gen_ai.input.messages",
-                telemetry::genai_input_messages(messages).to_string().as_str(),
+                telemetry::genai_input_messages(messages)
+                    .to_string()
+                    .as_str(),
             );
         }
         let mut body = serde_json::json!({
@@ -66,10 +74,14 @@ impl PaperAgent {
             body.as_object_mut().unwrap().remove("tools");
         }
 
-        let resp = self
+        let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(&self.api_key);
+        if let Some(tp) = parent_cx.and_then(telemetry::traceparent_for_context) {
+            req = req.header("traceparent", tp);
+        }
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -81,7 +93,8 @@ impl PaperAgent {
             return Err(format!("LLM API {status}: {body}"));
         }
 
-        let response = resp.json::<serde_json::Value>()
+        let response = resp
+            .json::<serde_json::Value>()
             .await
             .map_err(|e| format!("JSON parse: {e}"))?;
 
@@ -99,7 +112,11 @@ impl PaperAgent {
             let msg = &response["choices"][0]["message"];
             let text = msg["content"].as_str().unwrap_or("");
             let tool_calls = msg["tool_calls"].as_array().cloned().unwrap_or_default();
-            let finish_reason = if tool_calls.is_empty() { "stop" } else { "tool_call" };
+            let finish_reason = if tool_calls.is_empty() {
+                "stop"
+            } else {
+                "tool_call"
+            };
             tracing::Span::current().record(
                 "gen_ai.output.messages",
                 telemetry::genai_output_message(text, &tool_calls, finish_reason)
@@ -113,7 +130,10 @@ impl PaperAgent {
 }
 
 impl AgentExecutor for PaperAgent {
-    fn execute(&self, ctx: ExecutorContext) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
+    fn execute(
+        &self,
+        ctx: ExecutorContext,
+    ) -> BoxStream<'static, Result<StreamResponse, A2AError>> {
         // Join the caller's W3C trace (the platform forwards `traceparent`
         // through the agent proxy/orchestrator). Without adopting it, the OTel
         // SDK mints a fresh root trace id per request and the control plane's
@@ -123,6 +143,16 @@ impl AgentExecutor for PaperAgent {
             .get("traceparent")
             .and_then(|v| v.first())
             .and_then(|tp| telemetry::remote_context_from_traceparent(tp));
+
+        // The same header, kept verbatim: gateway tool calls forward it so the
+        // platform can resolve the user and authorize this agent as a recorded
+        // participant of that flow (docs/MCP_GATEWAY_AGENT_AUTH.md).
+        let traceparent = ctx
+            .service_params
+            .get("traceparent")
+            .and_then(|v| v.first())
+            .cloned()
+            .unwrap_or_default();
 
         let task_id = ctx.task_id.clone();
         let context_id = ctx.context_id.clone();
@@ -146,8 +176,8 @@ impl AgentExecutor for PaperAgent {
         // invocation, so record it as invoke_agent with the exchanged messages
         // (content gated by the platform capture flag). `session.id` lets the
         // control plane find this trace by A2A contextId directly in Tempo.
-        let agent_name = std::env::var("OTEL_SERVICE_NAME")
-            .unwrap_or_else(|_| env!("CARGO_PKG_NAME").into());
+        let agent_name =
+            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| env!("CARGO_PKG_NAME").into());
         let span = tracing::info_span!(
             "a2a.execute",
             otel.kind = "server",
@@ -175,29 +205,47 @@ impl AgentExecutor for PaperAgent {
         let api_key = self.api_key.clone();
         let base_url = self.base_url.clone();
         let http = self.http.clone();
+        let mcp = self.mcp.clone();
         let record_span = span.clone();
 
         let stream = async_stream::stream! {
             yield Ok(status_working(&task_id, &context_id, None));
 
-            let agent = PaperAgent { model, api_key, base_url, http };
-            let tool_defs = tools::definitions();
+            let agent = PaperAgent { model, api_key, base_url, http, mcp: mcp.clone() };
+
 
             let system = "\
-You are a research assistant. You MUST use your tools for every answer — never respond from \
-memory alone. Every claim must be backed by tool output.\n\n\
-Tools:\n\
-- arxiv_search — find papers (use sort_by=submittedDate for 'latest' queries)\n\
-- semantic_scholar — search with citation counts and influential citation data\n\
-- semantic_scholar_paper — detailed info on a specific paper (abstract, references, TL;DR)\n\
-- wikipedia_summary — background context on concepts\n\n\
-Rules:\n\
-- ALWAYS call at least one tool before answering\n\
-- For recent/latest work: use arxiv_search with sort_by=submittedDate\n\
-- For influential/seminal work: use semantic_scholar (has citation counts)\n\
-- Always cite: title, authors, year, and link\n\
-- Include citation counts when available — they indicate paper impact\n\
-- Synthesize findings concisely; don't just list raw results";
+        You are a research assistant. You MUST use your tools for every answer — never respond from \
+        memory alone. Every claim must be backed by tool output.\n\n\
+        Tools:\n\
+        - arxiv_search — find papers (use sort_by=submittedDate for 'latest' queries)\n\
+        - semantic_scholar — search with citation counts and influential citation data\n\
+        - semantic_scholar_paper — detailed info on a specific paper (abstract, references, TL;DR)\n\
+        - wikipedia_summary — background context on concepts\n\n\
+        Rules:\n\
+        - ALWAYS call at least one tool before answering\n\
+        - For recent/latest work: use arxiv_search with sort_by=submittedDate\n\
+        - For influential/seminal work: use semantic_scholar (has citation counts)\n\
+        - Always cite: title, authors, year, and link\n\
+        - Include citation counts when available — they indicate paper impact\n\
+        - Synthesize findings concisely; don't just list raw results";
+
+            // One session per request: `tools/list` is query-aware, so the set
+            // depends on this request's traceparent and grows when the model
+            // searches (see mcp.rs).
+            let mut mcp_session = match &mcp {
+                Some(client) => {
+                    Some(mcp::McpSession::open(client.clone(), &traceparent).await)
+                }
+                None => None,
+            };
+
+            // The prompt above lists only the built-ins, so without this the model
+            // keeps answering account questions with web_search (see mcp.rs).
+            let system = match &mcp_session {
+                Some(session) => format!("{system}{}", session.system_prompt_hint()),
+                None => system.to_string(),
+            };
 
             let mut messages = vec![
                 serde_json::json!({"role": "system", "content": system}),
@@ -207,6 +255,12 @@ Rules:\n\
             let mut final_text = String::new();
 
             for _ in 0..6 {
+                // Rebuilt every round: a `nasiko_search_tools` call adds the
+                // tools it found, and the model can only call what it is shown.
+                let mut tool_defs = tools::definitions();
+                if let Some(session) = &mcp_session {
+                    tool_defs.extend(session.tool_defs().iter().cloned());
+                }
                 let resp = match agent.chat(&messages, &tool_defs, remote_cx.as_ref()).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -230,7 +284,12 @@ Rules:\n\
                             Some(&format!("{name}: {preview}")),
                         ));
 
-                        let result = tools::execute(name, args).await;
+                        let result = match &mut mcp_session {
+                            Some(session) if session.handles(name) => {
+                                session.call_tool(name, args).await
+                            }
+                            _ => tools::execute(name, args).await,
+                        };
 
                         messages.push(serde_json::json!({
                             "role": "tool",
@@ -323,14 +382,23 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8000);
 
+    // MCP gateway: configured once from the deploy-injected env. Only a health
+    // check here — the tool set is query-scoped and fetched per request
+    // (docs/MCP_TOOL_SEARCH_DESIGN.md), see McpSession.
+    let mcp = mcp::McpClient::from_env().map(Arc::new);
+    if let Some(client) = &mcp {
+        client.probe().await;
+    }
+
     let handler = Arc::new(DefaultRequestHandler::new(
-        PaperAgent::new(),
+        PaperAgent::new(mcp),
         InMemoryTaskStore::new(),
     ));
 
     let agent_card = AgentCard {
         name: "Paper Research Assistant".to_string(),
-        description: "Search and analyze academic papers from arXiv and Semantic Scholar".to_string(),
+        description: "Search and analyze academic papers from arXiv and Semantic Scholar"
+            .to_string(),
         version: "1.0.0".to_string(),
         provider: Some(AgentProvider {
             organization: "Nasiko".to_string(),
@@ -346,17 +414,23 @@ async fn main() {
             id: "paper-search".into(),
             name: "Paper Search".into(),
             description: "Find and analyze academic papers on any topic".into(),
-            tags: vec!["research".into(), "papers".into(), "arxiv".into(), "science".into()],
-            examples: None, input_modes: None, output_modes: None, security_requirements: None,
+            tags: vec![
+                "research".into(),
+                "papers".into(),
+                "arxiv".into(),
+                "science".into(),
+            ],
+            examples: None,
+            input_modes: None,
+            output_modes: None,
+            security_requirements: None,
         }],
         default_input_modes: vec!["text/plain".to_string()],
         default_output_modes: vec!["text/plain".to_string()],
-        supported_interfaces: vec![
-            AgentInterface::new(
-                &format!("http://0.0.0.0:{port}/"),
-                TRANSPORT_PROTOCOL_JSONRPC,
-            ),
-        ],
+        supported_interfaces: vec![AgentInterface::new(
+            &format!("http://0.0.0.0:{port}/"),
+            TRANSPORT_PROTOCOL_JSONRPC,
+        )],
         security_schemes: None,
         security_requirements: None,
         documentation_url: None,
@@ -422,7 +496,11 @@ fn extract_preview(args: &str) -> String {
         .and_then(|v| {
             v.as_object()?.values().find_map(|val| {
                 val.as_str().map(|s| {
-                    if s.len() > 60 { format!("{}...", &s[..60]) } else { s.to_string() }
+                    if s.len() > 60 {
+                        format!("{}...", &s[..60])
+                    } else {
+                        s.to_string()
+                    }
                 })
             })
         })

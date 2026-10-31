@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{StatusCode, header},
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,14 @@ pub fn non_login_public_router(login_limiter: crate::rate_limit::RateLimiter) ->
 pub fn public_router(login_limiter: crate::rate_limit::RateLimiter) -> Router<AppState> {
     Router::new()
         .route("/api/auth/login", post(login))
+        // Central-dashboard delegation: a BFF-signed assertion is exchanged
+        // for a delegated token (ui/docs/adr/0001a §2.2). Unauthenticated
+        // by nature (the assertion IS the credential) and therefore under the
+        // same global limiter as login.
+        .route(
+            "/api/auth/delegate/assertion",
+            post(super::assertion::exchange_assertion),
+        )
         .layer(axum::middleware::from_fn_with_state(
             login_limiter,
             crate::rate_limit::limit_globally,
@@ -47,8 +55,27 @@ pub fn public_router(login_limiter: crate::rate_limit::RateLimiter) -> Router<Ap
 }
 
 /// Protected auth routes — require X-User-* headers from the gateway.
-pub fn protected_router() -> Router<AppState> {
+///
+/// `change_password_limiter` bounds the two bcrypt cost-12 operations
+/// `change_password` performs. It is keyed per caller (`limit_by_user`) rather
+/// than globally: the route is authenticated, so an identity is available, and
+/// a shared bucket would let one caller block every other user's password
+/// change.
+pub fn protected_router(
+    change_password_limiter: crate::rate_limit::RateLimiter,
+) -> Router<AppState> {
+    let credential_routes = Router::new()
+        .route("/auth/change-password", post(change_password))
+        .layer(axum::middleware::from_fn_with_state(
+            change_password_limiter,
+            crate::rate_limit::limit_by_user,
+        ));
+
     Router::new()
+        .merge(credential_routes)
+        // Short-lived, scoped, audience-bound token for a server-side renderer
+        // (ui/docs/adr/0001a). Session callers only; see auth/delegate.rs.
+        .route("/auth/delegate", post(super::delegate::delegate))
         .route("/auth/logout", post(logout))
         .route("/auth/system/users-for-search", get(users_for_search))
         .route("/auth/users/{id}", get(get_user_profile))
@@ -142,6 +169,15 @@ async fn login(
             Json(serde_json::json!({"error": "account disabled"})),
         )
             .into_response(),
+        Err(nasiko_auth::AuthError::AccountLocked { retry_after_secs }) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "account temporarily locked due to too many failed login attempts",
+                "code": "account_locked",
+                "retry_after_secs": retry_after_secs,
+            })),
+        )
+            .into_response(),
         // A backend failure must surface as 500 — never as an auth rejection (AUTH-10).
         // The raw error is logged, not returned in the body.
         Err(nasiko_auth::AuthError::Database(e)) => {
@@ -151,6 +187,13 @@ async fn login(
                 Json(serde_json::json!({"error": "internal error"})),
             )
                 .into_response()
+        }
+        Err(nasiko_auth::AuthError::InvalidCredentials { remaining_attempts }) => {
+            let mut body = serde_json::json!({"error": "invalid credentials"});
+            if let Some(remaining) = remaining_attempts {
+                body["remaining_attempts"] = serde_json::json!(remaining);
+            }
+            (StatusCode::UNAUTHORIZED, Json(body)).into_response()
         }
         Err(_) => (
             StatusCode::UNAUTHORIZED,
@@ -169,12 +212,11 @@ struct SsoSessionQuery {
 /// web UI actually authenticates with, then lands the browser on the app root.
 ///
 /// Exists for SSO flows that authenticate a user out-of-band and then hand their
-/// *browser* to this control plane — marketplace SSO (`ee/tenant-do`) is the
+/// *browser* to this control plane — marketplace SSO is the
 /// first: it logs the user in over the API, holds a real session token, and has
 /// nowhere to put it, because a cookie can only be set by a response from this
-/// origin. Before this endpoint it redirected to `/app/?token=…`, which only the
-/// Flutter client could read; the vanilla UI has no URL-token path at all and
-/// simply showed the login page.
+/// origin. The UI has no URL-token path of its own, so without this endpoint
+/// such a hand-off simply lands on the login page.
 ///
 /// Grants nothing the token doesn't already carry — anyone holding it can call
 /// the API directly with `Authorization: Bearer` — and it is validated exactly
@@ -186,21 +228,47 @@ struct SsoSessionQuery {
 ///
 /// An SSO arrival is the tail of a cross-site redirect chain (the marketplace,
 /// then the management plane, then here). Browsers withhold `Strict` cookies for
-/// every hop of such a chain, so a server redirect to `/` would arrive without
-/// the cookie just set, hit the page gate, and bounce to the login screen — the
-/// very failure this endpoint exists to fix. A navigation started by *this* page
-/// is same-site with no cross-site chain, so the cookie rides it.
+/// every hop of such a chain — and keep withholding it even once the chain lands
+/// back on this origin, because modern browsers taint the *whole* redirect chain
+/// as cross-site once any hop in it was, specifically to close the open-redirect
+/// bypass of `SameSite=Strict`/`Lax`. So a server redirect to `/` would arrive
+/// without the cookie just set, hit the page gate, and bounce to the login
+/// screen — the very failure this endpoint exists to fix. A navigation started
+/// by *this* page's own script, by contrast, is a fresh top-level navigation
+/// whose initiator is a document already on this origin, so the cookie rides it.
 ///
-/// (EE's OIDC callback redirects directly and is fine: there the control plane
-/// and dashboard share one registrable domain, so the chain is same-site. A
-/// tenant control plane on its own hostname has no such luxury.)
-const SSO_HANDOFF_HTML: &str = r#"<!doctype html>
-<meta charset="utf-8">
-<title>Signing in…</title>
-<meta http-equiv="refresh" content="0;url=/">
-<script>location.replace('/')</script>
-<p>Signing you in… <a href="/">continue</a></p>
-"#;
+/// (EE's OIDC callback hit exactly this: its single-tenant, same-origin
+/// `redirect_to` branch used a raw `Location` redirect — see
+/// `ee/server/src/oidc.rs`'s `success_redirect`, fixed to call
+/// [`same_origin_handoff_html`] instead. Its multi-tenant branch is unaffected:
+/// there the cookie is picked up later by the dashboard's own credentialed
+/// same-site *fetch*, not by this redirect, so no chain-tainted hop ever needs
+/// to carry it.)
+pub fn same_origin_handoff_html(target: &str) -> String {
+    // HTML-context escaping for the `<meta>` and `<a href>` attributes.
+    let html_target = target
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    // JS-string-context escaping for the `location.replace('...')` argument.
+    // `<` becomes a unicode escape (not just HTML-escaped) so a target
+    // containing a literal "</script>" can't close the script element early —
+    // the HTML parser runs before the JS one, so HTML-escaping alone wouldn't
+    // stop that.
+    let js_target = target
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('<', "\\u003C");
+    format!(
+        "<!doctype html>\n\
+         <meta charset=\"utf-8\">\n\
+         <title>Signing in…</title>\n\
+         <meta http-equiv=\"refresh\" content=\"0;url={html_target}\">\n\
+         <script>location.replace('{js_target}')</script>\n\
+         <p>Signing you in… <a href=\"{html_target}\">continue</a></p>\n"
+    )
+}
 
 async fn sso_session(
     State(state): State<AppState>,
@@ -210,7 +278,11 @@ async fn sso_session(
     match crate::auth::middleware::validate_session_token(&state, &query.token).await {
         Ok(_) => {
             let cookie = set_token_cookie(&query.token, request_is_https(&headers));
-            ([(header::SET_COOKIE, cookie)], Html(SSO_HANDOFF_HTML)).into_response()
+            (
+                [(header::SET_COOKIE, cookie)],
+                Html(same_origin_handoff_html("/")),
+            )
+                .into_response()
         }
         // Logged, because a silent bounce to the login page is indistinguishable
         // from the SSO bug this endpoint fixes — the reason is the whole
@@ -248,6 +320,203 @@ async fn logout(
     )
 }
 
+/// Body for `POST /api/auth/change-password`.
+///
+/// No `Debug` derive, for the same reason `LoginRequest` omits it: this struct
+/// holds two cleartext passwords and must never be formattable into a log line.
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Serialize)]
+struct ChangePasswordData {
+    token: String,
+    expires_in: u64,
+}
+
+/// `API_CONVENTIONS.md` §2: every error is JSON carrying a stable `code` slug
+/// clients switch on. Never plain text, and 5xx bodies never carry the internal
+/// detail — that goes to `tracing`, joined to the response by the trace id.
+fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "error": message, "code": code })),
+    )
+        .into_response()
+}
+
+/// The password write committed but the replacement session could not be
+/// issued. Reporting 5xx would say the change failed when it succeeded, so
+/// clear the cookie and report success — the caller signs in again with the new
+/// password. 204 is the one bodyless response §2 allows.
+fn password_changed_but_signed_out(secure: bool) -> Response {
+    (
+        [(header::SET_COOKIE, clear_token_cookie(secure))],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response()
+}
+
+/// Self-service password change — any authenticated user rotating their own
+/// credential, including the admin.
+///
+/// Distinct from `PUT /api/users/{id}`, which is superuser-only and sets
+/// *someone else's* password. This route requires the caller's current
+/// password, so a stolen session alone cannot lock the owner out of their own
+/// account.
+///
+/// Mounted under `auth` rather than `/users/me/*` deliberately: the whole
+/// `/users/*` router sits behind `require_superuser` (see
+/// `build_app_with_user_router`), which is precisely the gate this endpoint
+/// must not have. EE inherits this router unchanged, so one registration
+/// serves both editions.
+async fn change_password(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    claims: Claims,
+    Json(body): Json<ChangePasswordRequest>,
+) -> Response {
+    let user_id = match claims.user_uuid() {
+        Ok(id) => id,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+
+    // Length and composition, from the one policy both password-setting paths
+    // share. Each failure carries its own slug so a client can tell the user
+    // which rule they missed rather than restating the whole policy.
+    if let Err(policy) = nasiko_auth::validate_password(&body.new_password) {
+        return error_response(StatusCode::BAD_REQUEST, policy.code(), &policy.message());
+    }
+    if body.new_password == body.current_password {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "password_unchanged",
+            "new password must differ from the current one",
+        );
+    }
+
+    let existing: Option<(String,)> =
+        match sqlx::query_as("SELECT access_secret_hash FROM user_credentials WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(%e, %user_id, "change_password: credential lookup failed");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "internal error",
+                );
+            }
+        };
+
+    // SSO-provisioned users have no credential row at all (directory sync
+    // inserts the user without one), so there is nothing to verify against and
+    // nothing to update. That is a 409, not a 500 — and it is reachable the
+    // moment SSO is enabled, so it must not look like a server fault.
+    let Some((current_hash,)) = existing else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "no_local_password",
+            "this account signs in through your identity provider and has no local password",
+        );
+    };
+
+    // 403, deliberately not 401. The caller IS authenticated — they just failed a
+    // confirmation factor (API_CONVENTIONS §3). A 401 would also be actively
+    // harmful: `common/services/api.js` treats every 401 as a dead session and
+    // navigates to /login.html, so a single typo would throw the user out of the
+    // app with their session still perfectly valid and no error ever shown.
+    if !nasiko_auth::verify_password_async(&body.current_password, &current_hash).await {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "current_password_incorrect",
+            "current password is incorrect",
+        );
+    }
+
+    let new_hash = match nasiko_auth::hash_password_async(&body.new_password).await {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(%e, %user_id, "change_password: password hash failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "internal error",
+            );
+        }
+    };
+
+    // A matched-nothing write means the credential row vanished between the
+    // SELECT above and here (a concurrent delete cascades from `users`). Falling
+    // through would report a successful password change, and hand back a fresh
+    // session, for a credential that no longer exists. `update_user` already
+    // guards the identical write this way.
+    match sqlx::query(
+        "UPDATE user_credentials SET access_secret_hash = $2, updated_at = now() WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .bind(&new_hash)
+    .execute(&state.db)
+    .await
+    {
+        Ok(r) if r.rows_affected() == 0 => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "no_local_password",
+                "this account signs in through your identity provider and has no local password",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(%e, %user_id, "change_password: credential update failed");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "internal error",
+            );
+        }
+    }
+
+    // The old password is gone, so every session established with it goes too.
+    // Enforced in both editions: `auth::middleware::validate_session_token` does
+    // its own fail-closed `auth_tokens` lookup on every authenticated request,
+    // independently of whichever `AuthService` impl is wired in.
+    crate::users::routes::revoke_sessions(&state, user_id).await;
+
+    // Re-read the caller rather than re-signing the presented token's claims, so
+    // a role change since that token was minted is reflected in the replacement
+    // instead of being replayed for another full expiry window.
+    let identity = match state.auth.lookup_user(&user_id.to_string()).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(%e, %user_id, "change_password: caller lookup failed after rotation");
+            return password_changed_but_signed_out(request_is_https(&headers));
+        }
+    };
+    let secure = request_is_https(&headers);
+    match state.auth.issue_token(&identity).await {
+        Ok(token) => (
+            [(header::SET_COOKIE, set_token_cookie(&token, secure))],
+            Json(serde_json::json!({
+                "data": ChangePasswordData {
+                    token,
+                    expires_in: nasiko_auth::TOKEN_EXPIRY_SECS,
+                }
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(%e, %user_id, "change_password: re-issuing the session token failed");
+            password_changed_but_signed_out(secure)
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct InitAdminRequest {
     username: String,
@@ -273,21 +542,55 @@ async fn initialize_admin(
     }
 }
 
+/// Serializes concurrent `initialize-admin` calls, so two requests racing on an
+/// empty database cannot both pass the "no admin yet" check.
+const BOOTSTRAP_LOCK_KEY: i64 = 0x6e61_7369_6b6f_0001;
+
+fn init_admin_internal_error() -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "internal error"})),
+    )
+        .into_response()
+}
+
+/// Bootstrap the first administrator. Unauthenticated by design, so the gate
+/// must only ever open on a database that has never had one.
+///
+/// Any `role = 'admin'` or superuser row closes it, deleted or not, active or
+/// not: counting only `role = 'admin'` reopened it on a database whose
+/// administrators are superusers with another role. A failed check fails
+/// closed. The check and both inserts run in one transaction under an advisory
+/// lock, so concurrent callers cannot both create an admin.
+#[allow(clippy::result_large_err)]
 async fn initialize_admin_inner(
     state: &AppState,
     username: &str,
     email: &str,
     https: bool,
 ) -> Result<axum::response::Response, axum::response::Response> {
-    // Check if admin exists
-    let admin_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL",
-    )
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
+    let internal = |stage: &'static str| {
+        move |e: sqlx::Error| {
+            tracing::error!(%e, stage, "initialize_admin failed");
+            init_admin_internal_error()
+        }
+    };
 
-    if admin_count > 0 {
+    let mut tx = state.db.begin().await.map_err(internal("begin"))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(BOOTSTRAP_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal("lock"))?;
+
+    let admin_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE role = 'admin' OR is_superuser)",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(internal("admin check"))?;
+
+    if admin_exists {
         // 409: initializing an admin when one already exists is a conflict, not an
         // authorization failure.
         return Err((
@@ -303,11 +606,7 @@ async fn initialize_admin_inner(
         .await
         .map_err(|e| {
             tracing::error!(%e, "initialize_admin: password hash failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "internal error"})),
-            )
-                .into_response()
+            init_admin_internal_error()
         })?;
 
     let result: Result<(uuid::Uuid,), _> = sqlx::query_as(
@@ -317,7 +616,7 @@ async fn initialize_admin_inner(
     )
     .bind(username)
     .bind(email)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await;
 
     let user_id = match result {
@@ -346,16 +645,11 @@ async fn initialize_admin_inner(
     .bind(user_id)
     .bind(&access_key)
     .bind(&access_secret_hash)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!(%e, %user_id, "initialize_admin: insert credentials failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal error"})),
-        )
-            .into_response()
-    })?;
+    .map_err(internal("insert credentials"))?;
+
+    tx.commit().await.map_err(internal("commit"))?;
 
     // `issue_token` records the JWT's JTI in auth_tokens, so the admin token minted
     // here is revocable (previously init-admin tokens were unrevocable).
@@ -367,11 +661,7 @@ async fn initialize_admin_inner(
 
     let token = state.auth.issue_token(&identity).await.map_err(|e| {
         tracing::error!(%e, %user_id, "initialize_admin: issue token failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "internal error"})),
-        )
-            .into_response()
+        init_admin_internal_error()
     })?;
 
     // Belt-and-suspenders record (ON CONFLICT DO NOTHING) so counting/revocation work.
@@ -484,8 +774,8 @@ async fn token_validate(
         }
     }
 
-    // Fetch the user's actual role from the DB so the Flutter sidebar can
-    // gate admin-only tabs (access control) correctly. Fall back to
+    // Fetch the user's actual role from the DB so a client can gate
+    // admin-only navigation correctly. Fall back to
     // is_superuser-derived role on any error (user deleted, DB unavailable).
     let role: String =
         sqlx::query_scalar("SELECT role::text FROM users WHERE id = $1 AND deleted_at IS NULL")
@@ -504,7 +794,7 @@ async fn token_validate(
 
     Json(serde_json::json!({
         "valid": true,
-        // subject_id / subject_type are the fields the Flutter client reads.
+        // subject_id / subject_type identify the authenticated principal.
         "subject_id": identity.user_id,
         "subject_type": "user",
         "role": role,
@@ -624,5 +914,35 @@ async fn get_user_profile(
             tracing::error!(%e, %id, "get_user_profile: db error");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_origin_handoff_html;
+
+    /// A `redirect_to` crafted to close the `<script>` element early must not
+    /// succeed: the HTML parser runs before the JS one, so HTML-escaping `<`
+    /// in the `<meta>`/`<a>` attributes isn't enough — the `<script>` body
+    /// itself must never contain a raw `<` either.
+    #[test]
+    fn handoff_html_cannot_be_used_to_break_out_of_its_own_script_tag() {
+        let evil = "/x\"></script><script>alert(1)</script>";
+        let html = same_origin_handoff_html(evil);
+        let start = html.find("<script>").unwrap() + "<script>".len();
+        let end = html[start..].find("</script>").unwrap();
+        let script_body = &html[start..start + end];
+        assert!(
+            !script_body.contains('<'),
+            "script body still contains a raw '<': {script_body}"
+        );
+    }
+
+    #[test]
+    fn handoff_html_targets_the_given_path() {
+        let html = same_origin_handoff_html("/budgets");
+        assert!(html.contains("location.replace('/budgets')"));
+        assert!(html.contains("content=\"0;url=/budgets\""));
+        assert!(html.contains("href=\"/budgets\""));
     }
 }

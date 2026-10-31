@@ -26,6 +26,7 @@ pub fn upload(
     env_args: &[String],
     writable: bool,
     writable_path: Option<&str>,
+    coding_agent: bool,
 ) -> Result<()> {
     let source_path = Path::new(source);
 
@@ -35,8 +36,22 @@ pub fn upload(
 
     let env = parse_env(env_file, env_args)?;
 
+    // Flag wins; a directory source's AgentCard.json `workloadKind` is the
+    // default (a `.zip` source has no card readable here, so only the flag
+    // applies). `None` → the server defaults to `agent`.
+    let workload_kind = resolve_upload_workload_kind(coding_agent, source_path);
+
     // ── Resolve name and version ─────────────────────────────────────────────
     let (resolved_name, resolved_version) = resolve_name_version(source_path, name, version)?;
+
+    // Checked on the source directory directly, before it's zipped below — cheaper than
+    // re-scanning the freshly built archive, and reuses `deploy.rs`'s own directory-walk
+    // implementation instead of duplicating it. Only meaningful for a directory source: a source
+    // that's already a `.zip` has nothing to walk, so it falls back to the zip-entry scan below
+    // instead (`source_references_mcp_gateway`).
+    let dir_hint = source_path
+        .is_dir()
+        .then(|| crate::util::dir_references_mcp_gateway(source_path));
 
     // ── Zip directory if needed ──────────────────────────────────────────────
     let (zip_path, is_temp) = if source_path.is_dir() {
@@ -75,6 +90,13 @@ pub fn upload(
         resolved_version
     );
 
+    // Checked before the temp zip is cleaned up below — every agent gets an
+    // `MCP_GATEWAY_TOKEN` injected unconditionally at deploy time (`oss/server/
+    // src/mcp/wiring.rs`), so its mere presence can't tell us whether THIS
+    // agent's own code actually calls the gateway. Only the source itself can.
+    let references_mcp_gateway =
+        dir_hint.unwrap_or_else(|| source_references_mcp_gateway(&zip_path));
+
     let result = client.upload_agent(
         &zip_path,
         &resolved_name,
@@ -84,6 +106,7 @@ pub fn upload(
         // A path implies the mount (mirrors the server-side rule).
         writable || writable_path.is_some(),
         writable_path,
+        workload_kind.as_deref(),
     );
 
     if is_temp {
@@ -98,7 +121,51 @@ pub fn upload(
         client.poll_build_status(build_id)?;
     }
     println!("\nDeployed: {}", queued.data.agent_name);
+
+    if references_mcp_gateway {
+        println!(
+            "\nThis agent's source references the MCP gateway — to give it tool access:\n\
+             \x20 nasiko mcp catalog                                      # find a connector\n\
+             \x20 nasiko mcp connect --connector-id <id>                  # connect your account (if not already)\n\
+             \x20 nasiko mcp agent-tools enable {} <id>                   # grant this agent access",
+            queued.data.agent_name
+        );
+    }
     Ok(())
+}
+
+/// Best-effort scan of the uploaded archive's text entries for a reference to
+/// the MCP gateway env vars (`MCP_GATEWAY_URL`/`MCP_GATEWAY_TOKEN`) — the
+/// signal that this agent's own code is coded to call `/api/mcp`, as opposed
+/// to an agent that never touches it (every agent gets the credential
+/// injected regardless, per `oss/server/src/mcp/wiring.rs`, so its presence
+/// alone proves nothing). Any read/parse failure is treated as "no reference
+/// found" — this is a hint, not a correctness check, so it must never fail
+/// the upload itself.
+fn source_references_mcp_gateway(zip_path: &Path) -> bool {
+    let Ok(file) = fs::File::open(zip_path) else {
+        return false;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return false;
+    };
+    for i in 0..archive.len() {
+        let Ok(mut entry) = archive.by_index(i) else {
+            continue;
+        };
+        if entry.is_dir() || entry.size() > 1_000_000 {
+            continue;
+        }
+        let mut contents = String::new();
+        use std::io::Read;
+        if entry.read_to_string(&mut contents).is_err() {
+            continue;
+        }
+        if contents.contains("MCP_GATEWAY_URL") || contents.contains("MCP_GATEWAY_TOKEN") {
+            return true;
+        }
+    }
+    false
 }
 
 fn resolve_name_version(
@@ -145,6 +212,27 @@ fn resolve_name_version(
     Ok((name, version))
 }
 
+/// Resolve the workload kind for an upload: an explicit `--coding-agent` flag
+/// wins; otherwise a directory source's `AgentCard.json` `workloadKind` is the
+/// default. A `.zip` source has no card readable here, so only the flag applies.
+/// `None` → the server defaults the column to `agent`.
+fn resolve_upload_workload_kind(coding_agent: bool, source: &Path) -> Option<String> {
+    if coding_agent {
+        return Some("acp_coding_agent".to_owned());
+    }
+    if source.is_dir() {
+        let card_path = source.join("AgentCard.json");
+        if card_path.exists() {
+            return fs::read_to_string(&card_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|c| c.get("workloadKind")?.as_str().map(String::from))
+                .filter(|s| !s.is_empty());
+        }
+    }
+    None
+}
+
 fn parse_env(env_file: Option<&str>, env_args: &[String]) -> Result<HashMap<String, String>> {
     let mut env = HashMap::new();
 
@@ -174,4 +262,47 @@ fn parse_env(env_file: Option<&str>, env_args: &[String]) -> Result<HashMap<Stri
     }
 
     Ok(env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coding_agent_flag_marks_the_upload_without_touching_disk() {
+        // The flag wins regardless of the source (no card read needed).
+        assert_eq!(
+            resolve_upload_workload_kind(true, Path::new("/no/such/path")).as_deref(),
+            Some("acp_coding_agent")
+        );
+    }
+
+    #[test]
+    fn no_flag_and_no_readable_card_means_ordinary_agent() {
+        // A non-directory source (e.g. a .zip) or a dir without AgentCard.json
+        // yields None, so the server defaults the column to `agent`.
+        assert_eq!(
+            resolve_upload_workload_kind(false, Path::new("/no/such/path")),
+            None
+        );
+    }
+
+    #[test]
+    fn directory_card_workload_kind_is_the_default() {
+        // A directory source whose AgentCard.json declares a coding agent is
+        // registered as one even without the flag.
+        let dir =
+            std::env::temp_dir().join(format!("nasiko-upload-wk-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            dir.join("AgentCard.json"),
+            r#"{"name":"c","workloadKind":"acp_coding_agent"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_upload_workload_kind(false, &dir).as_deref(),
+            Some("acp_coding_agent")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -15,9 +15,17 @@ path = "src/bin/llm-router.rs"
 [dependencies]
 # Internal — AES-GCM (per-user HKDF) decrypt of user_secrets via try_for_user
 nasiko-secrets.workspace = true
+nasiko-session-token.workspace = true
+nasiko-pricing.workspace = true
+nasiko-savings.workspace = true
+# Internal — structural payload compression at the egress seam (src/compress.rs)
+nasiko-compress.workspace = true
+# Internal — opt-in compact tool schemas at the egress seam (src/compact_tools.rs)
+nasiko-tool-compact.workspace = true
 
 # Web / async
 axum = { workspace = true }
+tower-http = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 
@@ -35,6 +43,7 @@ sqlx = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 futures = { workspace = true }
 async-stream = { workspace = true }
+bytes = { workspace = true }
 
 # Auth (agent-identity JWT verify)
 jsonwebtoken = { workspace = true }
@@ -59,3 +68,8 @@ serde_json = { workspace = true }
 serial_test = { workspace = true }
 base64 = { workspace = true }
 mockito = { workspace = true }
+tower = { workspace = true }
+zstd.workspace = true
+# examples/compact_tools_eval.rs: o200k_base token counts (measurement only; never a
+# dependency of the library or the router).
+tiktoken-rs = "=0.12.1"

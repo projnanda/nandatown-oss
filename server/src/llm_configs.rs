@@ -23,11 +23,78 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::Claims;
+use crate::embedding_change::{self, EmbeddingTarget};
 use crate::mcp::ApiResponse;
 use crate::state::AppState;
 
-/// Outbound providers the LLM router can translate to — used to validate config writes.
-const SUPPORTED_PROVIDERS: [&str; 3] = ["openai", "anthropic", "gemini"];
+/// Built-in providers the LLM router routes through a dedicated client. A config may
+/// also name any admin-registered custom provider — see [`provider_is_supported`].
+const SUPPORTED_PROVIDERS: [&str; 4] = ["openai", "anthropic", "gemini", "openrouter"];
+
+/// Resolve a provider identifier to the internal label stored in `llm_configs.provider`.
+/// Built-in names pass through; a UUID is resolved to the custom provider's label;
+/// an existing label passes through (backward compat).
+async fn resolve_provider_label(db: &sqlx::PgPool, provider: &str) -> Result<String, String> {
+    if SUPPORTED_PROVIDERS.contains(&provider) {
+        return Ok(provider.to_string());
+    }
+    // Try as UUID first.
+    if let Ok(uuid) = uuid::Uuid::parse_str(provider) {
+        return match sqlx::query_scalar::<_, String>(
+            "SELECT label FROM custom_providers WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(uuid)
+        .fetch_optional(db)
+        .await
+        {
+            Ok(Some(label)) => Ok(label),
+            Ok(None) => Err(unsupported_provider_msg(provider)),
+            Err(_) => Err("failed to resolve provider".to_string()),
+        };
+    }
+    // Legacy: pass through as-is (label-based).
+    Ok(provider.to_string())
+}
+
+/// Like [`resolve_provider_label`], but a label that matches no registered custom provider
+/// is an error instead of passing through.
+///
+/// [`resolve_provider_label`]'s pass-through exists for `llm_configs.provider` rows written
+/// before custom providers were a table; those labels must keep resolving. The
+/// organization-wide embedding provider has no such history — it ships with this feature —
+/// so it can afford to be strict, and it should be: it is one row for the whole
+/// deployment, and a typo accepted here would sit unnoticed until some unrelated agent's
+/// next embedding call failed.
+pub(crate) async fn require_known_provider(
+    db: &sqlx::PgPool,
+    provider: &str,
+) -> Result<String, String> {
+    let label = resolve_provider_label(db, provider).await?;
+    if SUPPORTED_PROVIDERS.contains(&label.as_str()) {
+        return Ok(label);
+    }
+    let registered = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM custom_providers WHERE label = $1 AND deleted_at IS NULL)",
+    )
+    .bind(&label)
+    .fetch_one(db)
+    .await
+    .map_err(|_| "failed to resolve provider".to_string())?;
+    if registered {
+        Ok(label)
+    } else {
+        Err(unsupported_provider_msg(provider))
+    }
+}
+
+/// Client-facing message for a provider name that is neither a built-in nor a
+/// registered custom provider.
+fn unsupported_provider_msg(provider: &str) -> String {
+    format!(
+        "unsupported provider '{provider}' (expected a built-in [{}] or a registered custom provider)",
+        SUPPORTED_PROVIDERS.join(", ")
+    )
+}
 
 /// The `llm_configs` columns returned to clients, assembled by Postgres into one JSON object.
 const CONFIG_JSON: &str = "json_build_object(\
@@ -36,6 +103,9 @@ const CONFIG_JSON: &str = "json_build_object(\
      'max_tokens', max_tokens, 'api_key_secret_name', api_key_secret_name, \
      'pinned', pinned, 'pinned_model', pinned_model, \
      'tier1_model', tier1_model, 'tier2_model', tier2_model, 'tier3_model', tier3_model, \
+     'embedding_provider', embedding_provider, 'embedding_model', embedding_model, \
+     'embedding_api_key_secret_name', embedding_api_key_secret_name, \
+     'embedding_model_override', embedding_model_override, \
      'is_default', is_default, \
      'created_at', created_at, 'updated_at', updated_at)";
 
@@ -84,9 +154,30 @@ pub struct CreateLlmConfigRequest {
     pub tier2_model: Option<String>,
     #[serde(default)]
     pub tier3_model: Option<String>,
+    /// Embedding destination — independent of the chat provider/model above. Set the
+    /// provider and model together or not at all; the secret name is optional and means
+    /// "use the platform key for this provider" when absent.
+    #[serde(default)]
+    pub embedding_provider: Option<String>,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    #[serde(default)]
+    pub embedding_api_key_secret_name: Option<String>,
+    /// Plaintext key to store under `embedding_api_key_secret_name` when no such secret
+    /// exists yet — the embedding-side twin of `secret_value`.
+    #[serde(default)]
+    pub embedding_secret_value: Option<String>,
+    /// When true, this config's `embedding_model` outranks the model an agent names on
+    /// its own `POST /v1/embeddings` request.
+    #[serde(default)]
+    pub embedding_model_override: bool,
     /// Mark this as the caller's default (clears any prior default).
     #[serde(default)]
     pub is_default: bool,
+    /// Accepted for client uniformity and ignored: a create has no previous embedding
+    /// model, so there is never anything to confirm.
+    #[serde(default)]
+    pub confirm_embedding_change: bool,
 }
 
 /// Partial update — every field is optional. Absent fields keep their current value.
@@ -119,6 +210,25 @@ pub struct UpdateLlmConfigRequest {
     pub tier2_model: Option<String>,
     #[serde(default)]
     pub tier3_model: Option<String>,
+    #[serde(default)]
+    pub embedding_provider: Option<String>,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    #[serde(default)]
+    pub embedding_api_key_secret_name: Option<String>,
+    #[serde(default)]
+    pub embedding_secret_value: Option<String>,
+    #[serde(default)]
+    pub embedding_model_override: Option<bool>,
+    /// Clear the embedding destination. Needed because this PATCH is `COALESCE`-partial —
+    /// an absent field means "keep", so there is otherwise no way to express "unset".
+    /// Clearing is itself a confirmable transition (see [`crate::embedding_change`]).
+    #[serde(default)]
+    pub clear_embedding_model: bool,
+    /// Acknowledge that changing an already-set embedding provider/model invalidates
+    /// vectors indexed with the old one. Without it such a change is rejected with 428.
+    #[serde(default)]
+    pub confirm_embedding_change: bool,
 }
 
 /// Validate the fields that don't need the DB. Shared by create/update.
@@ -127,15 +237,13 @@ pub struct UpdateLlmConfigRequest {
 /// only when no tier model is set (otherwise the router has no fallback).
 fn validate(
     provider: &str,
+    provider_supported: bool,
     model: Option<&str>,
     pinned_model: &Option<String>,
     has_any_tier: bool,
 ) -> Result<(), String> {
-    if !SUPPORTED_PROVIDERS.contains(&provider) {
-        return Err(format!(
-            "unsupported provider '{provider}' (expected one of: {})",
-            SUPPORTED_PROVIDERS.join(", ")
-        ));
+    if !provider_supported {
+        return Err(unsupported_provider_msg(provider));
     }
     match model {
         Some(m) if m.trim().is_empty() => {
@@ -155,6 +263,42 @@ fn validate(
         return Err("pinned_model must not be empty".to_string());
     }
     Ok(())
+}
+
+/// `""` is not a value. Cleared form fields and shell flags arrive as empty strings, and
+/// storing one would put a routable-looking destination in the row: the resolver would
+/// read `Some("")` and try to call a provider with no name. Every write of an embedding
+/// column goes through this.
+fn blank_to_none(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// Validate the embedding pair. The DB enforces all-or-nothing too (a CHECK constraint),
+/// but a constraint violation surfaces as a 500 — this turns it into an actionable 400.
+///
+/// The provider must be resolvable the same way the chat provider is, so built-ins and
+/// registered custom providers both work and a typo is caught at write time rather than
+/// as an opaque failure on the agent's first embedding call.
+async fn validate_embedding(
+    db: &sqlx::PgPool,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<Option<String>, String> {
+    let provider = provider.map(str::trim).filter(|p| !p.is_empty());
+    let model = model.map(str::trim).filter(|m| !m.is_empty());
+    match (provider, model) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(
+            "embedding_provider and embedding_model must be set together (an embedding model \
+             with no provider cannot be routed)"
+                .to_string(),
+        ),
+        (Some(p), Some(_)) => resolve_provider_label(db, p).await.map(Some),
+    }
 }
 
 /// Ensure the caller's secret named `name` exists, storing `value` under it when supplied.
@@ -206,6 +350,13 @@ async fn ensure_secret(
     }
 }
 
+/// The embedding destination currently stored on a config row, read from the JSON that
+/// [`fetch_config`] already returns rather than from a second query.
+fn stored_embedding(config: &Value) -> EmbeddingTarget {
+    let field = |k: &str| config.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    EmbeddingTarget::new(field("embedding_provider"), field("embedding_model"))
+}
+
 /// One config as JSON, scoped to the caller. `None` ⇒ unknown or not owned (→ 404).
 async fn fetch_config(db: &sqlx::PgPool, id: Uuid, user_id: Uuid) -> Option<Value> {
     sqlx::query_scalar::<_, Value>(&format!(
@@ -231,7 +382,8 @@ async fn fetch_config(db: &sqlx::PgPool, id: Uuid, user_id: Uuid) -> Option<Valu
         (status = 200, description = "`data` is an array of config objects, each with: \
             id, name, provider, model, fallback_models, temperature, max_tokens, \
             api_key_secret_name, pinned, pinned_model, tier1_model, tier2_model, tier3_model, \
-            is_default, created_at, updated_at", body = crate::mcp::openapi::McpEnvelope),
+            embedding_provider, embedding_model, embedding_api_key_secret_name, \
+            embedding_model_override, is_default, created_at, updated_at", body = crate::mcp::openapi::McpEnvelope),
         (status = 401, description = "Missing or invalid session"),
     ),
 )]
@@ -263,9 +415,11 @@ pub(crate) async fn list(State(state): State<AppState>, claims: Claims) -> impl 
     responses(
         (status = 201, description = "`data` is the created config object (id, name, provider, \
             model, fallback_models, temperature, max_tokens, api_key_secret_name, pinned, \
-            pinned_model, tier1_model, tier2_model, tier3_model, is_default, created_at, \
-            updated_at)", body = crate::mcp::openapi::McpEnvelope),
-        (status = 400, description = "Validation failed (name/provider/model/pinned_model/secret)"),
+            pinned_model, tier1_model, tier2_model, tier3_model, embedding_provider, \
+            embedding_model, embedding_api_key_secret_name, embedding_model_override, \
+            is_default, created_at, updated_at)", body = crate::mcp::openapi::McpEnvelope),
+        (status = 400, description = "Validation failed (name/provider/model/pinned_model/secret, \
+            or embedding_provider/embedding_model not set together)"),
         (status = 401, description = "Missing or invalid session"),
         (status = 409, description = "A config with this name already exists"),
     ),
@@ -282,16 +436,32 @@ pub(crate) async fn create(
     if req.name.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "name must not be empty").into_response();
     }
+    // Resolve provider identifier (built-in name or custom provider UUID → internal label).
+    let provider_label = match resolve_provider_label(&state.db, &req.provider).await {
+        Ok(label) => label,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
     let has_any_tier =
         req.tier1_model.is_some() || req.tier2_model.is_some() || req.tier3_model.is_some();
     if let Err(msg) = validate(
-        &req.provider,
+        &provider_label,
+        true, // already validated by resolve_provider_label
         req.model.as_deref(),
         &req.pinned_model,
         has_any_tier,
     ) {
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
+    let embedding_provider = match validate_embedding(
+        &state.db,
+        req.embedding_provider.as_deref(),
+        req.embedding_model.as_deref(),
+    )
+    .await
+    {
+        Ok(label) => label,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
     if config_name_taken(&state.db, user_id, &req.name).await {
         return (
             StatusCode::CONFLICT,
@@ -304,6 +474,16 @@ pub(crate) async fn create(
         user_id,
         req.api_key_secret_name.as_deref(),
         req.secret_value.as_deref(),
+    )
+    .await
+    {
+        return (code, msg).into_response();
+    }
+    if let Err((code, msg)) = ensure_secret(
+        &state.db,
+        user_id,
+        req.embedding_api_key_secret_name.as_deref(),
+        req.embedding_secret_value.as_deref(),
     )
     .await
     {
@@ -331,12 +511,14 @@ pub(crate) async fn create(
         "INSERT INTO llm_configs \
          (created_by, name, provider, model, fallback_models, temperature, max_tokens, \
           api_key_secret_name, pinned, pinned_model, tier1_model, tier2_model, tier3_model, \
-          is_default) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
+          is_default, embedding_provider, embedding_model, embedding_api_key_secret_name, \
+          embedding_model_override) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18) \
+         RETURNING id",
     )
     .bind(user_id)
     .bind(&req.name)
-    .bind(&req.provider)
+    .bind(&provider_label)
     .bind(&req.model)
     .bind(sqlx::types::Json(&req.fallback_models))
     .bind(req.temperature)
@@ -348,6 +530,10 @@ pub(crate) async fn create(
     .bind(&req.tier2_model)
     .bind(&req.tier3_model)
     .bind(req.is_default)
+    .bind(&embedding_provider)
+    .bind(blank_to_none(&req.embedding_model))
+    .bind(blank_to_none(&req.embedding_api_key_secret_name))
+    .bind(req.embedding_model_override)
     .fetch_one(&mut *tx)
     .await;
 
@@ -382,7 +568,9 @@ pub(crate) async fn create(
     responses(
         (status = 200, description = "`data` is the config object (id, name, provider, model, \
             fallback_models, temperature, max_tokens, api_key_secret_name, pinned, pinned_model, \
-            tier1_model, tier2_model, tier3_model, is_default, created_at, updated_at)",
+            tier1_model, tier2_model, tier3_model, embedding_provider, embedding_model, \
+            embedding_api_key_secret_name, embedding_model_override, is_default, created_at, \
+            updated_at)",
             body = crate::mcp::openapi::McpEnvelope),
         (status = 401, description = "Missing or invalid session"),
         (status = 404, description = "Unknown id, or not owned by the caller"),
@@ -418,12 +606,18 @@ pub(crate) async fn get_one(
     responses(
         (status = 200, description = "`data` is the updated config object (id, name, provider, \
             model, fallback_models, temperature, max_tokens, api_key_secret_name, pinned, \
-            pinned_model, tier1_model, tier2_model, tier3_model, is_default, created_at, \
-            updated_at)", body = crate::mcp::openapi::McpEnvelope),
-        (status = 400, description = "Validation failed (name/provider/model/pinned_model/secret)"),
+            pinned_model, tier1_model, tier2_model, tier3_model, embedding_provider, \
+            embedding_model, embedding_api_key_secret_name, embedding_model_override, \
+            is_default, created_at, updated_at)", body = crate::mcp::openapi::McpEnvelope),
+        (status = 400, description = "Validation failed (name/provider/model/pinned_model/secret, \
+            or embedding_provider/embedding_model not set together)"),
         (status = 401, description = "Missing or invalid session"),
         (status = 404, description = "Unknown id, or not owned by the caller"),
         (status = 409, description = "Another config with this name already exists"),
+        (status = 428, description = "The embedding provider/model was already set and is being \
+            changed or cleared. Vectors indexed with the previous model cannot be compared with \
+            the new one. Body carries `code = embedding_change_requires_confirmation` and \
+            `details.from`/`details.to`; re-send with `confirm_embedding_change: true`."),
     ),
 )]
 pub(crate) async fn update(
@@ -436,22 +630,20 @@ pub(crate) async fn update(
         Ok(id) => id,
         Err(e) => return e.into_response(),
     };
-    if fetch_config(&state.db, id, user_id).await.is_none() {
+    // The 404 check already reads the whole row, so the current embedding values for the
+    // §2.6 comparison come from it rather than a second query.
+    let Some(current) = fetch_config(&state.db, id, user_id).await else {
         return (StatusCode::NOT_FOUND, "llm config not found").into_response();
-    }
-    // Validate only the fields that are present.
-    if let Some(provider) = &req.provider
-        && !SUPPORTED_PROVIDERS.contains(&provider.as_str())
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "unsupported provider '{provider}' (expected one of: {})",
-                SUPPORTED_PROVIDERS.join(", ")
-            ),
-        )
-            .into_response();
-    }
+    };
+    // Validate only the fields that are present; resolve UUID → internal label.
+    let resolved_provider = if let Some(ref provider) = req.provider {
+        match resolve_provider_label(&state.db, provider).await {
+            Ok(label) => Some(label),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        }
+    } else {
+        None
+    };
     if let Some(model) = &req.model
         && model.trim().is_empty()
     {
@@ -465,6 +657,68 @@ pub(crate) async fn update(
         && pm.trim().is_empty()
     {
         return (StatusCode::BAD_REQUEST, "pinned_model must not be empty").into_response();
+    }
+    if req.clear_embedding_model
+        && (req.embedding_provider.is_some() || req.embedding_model.is_some())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "clear_embedding_model cannot be combined with embedding_provider/embedding_model",
+        )
+            .into_response();
+    }
+    // A supplied provider may be a custom provider's UUID; resolve it to the stored label
+    // before it is compared with, or merged into, what the row already holds.
+    let embedding_model = blank_to_none(&req.embedding_model);
+    let embedding_secret_name = blank_to_none(&req.embedding_api_key_secret_name);
+    let embedding_provider = match blank_to_none(&req.embedding_provider) {
+        Some(p) => match resolve_provider_label(&state.db, &p).await {
+            Ok(label) => Some(label),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+        None => None,
+    };
+
+    // This PATCH is partial, so an absent field means "keep". Validation therefore has to
+    // run on the row as it *will be*, not on the request alone — otherwise changing only
+    // the model reads as an embedding model with no provider and is rejected, even though
+    // the provider is right there in the row and is not changing.
+    let current_embedding = stored_embedding(&current);
+    let incoming_embedding = if req.clear_embedding_model {
+        EmbeddingTarget::new(None, None)
+    } else {
+        EmbeddingTarget::new(
+            embedding_provider
+                .clone()
+                .or_else(|| current_embedding.provider.clone()),
+            embedding_model
+                .clone()
+                .or_else(|| current_embedding.model.clone()),
+        )
+    };
+    if incoming_embedding.provider.is_some() != incoming_embedding.model.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "embedding_provider and embedding_model must be set together (an embedding model \
+             with no provider cannot be routed)",
+        )
+            .into_response();
+    }
+
+    // §2.6: a change to an already-set embedding provider/model is rejected unless the
+    // caller confirms it. Checked *before* ensure_secret and before the UPDATE, so a
+    // rejected request writes nothing at all — no secret, no touched `updated_at`.
+    match embedding_change::needs_confirmation(&current_embedding, &incoming_embedding) {
+        Some(change) if !req.confirm_embedding_change => {
+            return embedding_change::confirmation_required(&change);
+        }
+        Some(change) => embedding_change::log_confirmed(
+            "llm_config",
+            &id.to_string(),
+            &user_id.to_string(),
+            &change,
+        ),
+        None => {}
     }
     if let Some(name) = req.name.as_deref() {
         if name.trim().is_empty() {
@@ -488,6 +742,16 @@ pub(crate) async fn update(
     {
         return (code, msg).into_response();
     }
+    if let Err((code, msg)) = ensure_secret(
+        &state.db,
+        user_id,
+        req.embedding_api_key_secret_name.as_deref(),
+        req.embedding_secret_value.as_deref(),
+    )
+    .await
+    {
+        return (code, msg).into_response();
+    }
 
     let result = sqlx::query(
         "UPDATE llm_configs SET \
@@ -503,13 +767,21 @@ pub(crate) async fn update(
          tier1_model = COALESCE($12, tier1_model), \
          tier2_model = COALESCE($13, tier2_model), \
          tier3_model = COALESCE($14, tier3_model), \
+         embedding_provider = CASE WHEN $15 THEN NULL \
+                                   ELSE COALESCE($16, embedding_provider) END, \
+         embedding_model = CASE WHEN $15 THEN NULL \
+                                ELSE COALESCE($17, embedding_model) END, \
+         embedding_api_key_secret_name = CASE WHEN $15 THEN NULL \
+                                              ELSE COALESCE($18, embedding_api_key_secret_name) \
+                                         END, \
+         embedding_model_override = COALESCE($19, embedding_model_override), \
          updated_at = now() \
          WHERE id = $1 AND created_by = $2 AND deleted_at IS NULL",
     )
     .bind(id)
     .bind(user_id)
     .bind(&req.name)
-    .bind(&req.provider)
+    .bind(&resolved_provider)
     .bind(&req.model)
     .bind(req.fallback_models.as_ref().map(sqlx::types::Json))
     .bind(req.temperature)
@@ -520,6 +792,11 @@ pub(crate) async fn update(
     .bind(&req.tier1_model)
     .bind(&req.tier2_model)
     .bind(&req.tier3_model)
+    .bind(req.clear_embedding_model)
+    .bind(&embedding_provider)
+    .bind(&embedding_model)
+    .bind(&embedding_secret_name)
+    .bind(req.embedding_model_override)
     .execute(&state.db)
     .await;
 
@@ -606,7 +883,8 @@ pub(crate) async fn delete_config(
         (status = 200, description = "`data` is the config object now marked as default (id, \
             name, provider, model, fallback_models, temperature, max_tokens, \
             api_key_secret_name, pinned, pinned_model, tier1_model, tier2_model, tier3_model, \
-            is_default, created_at, updated_at)", body = crate::mcp::openapi::McpEnvelope),
+            embedding_provider, embedding_model, embedding_api_key_secret_name, \
+            embedding_model_override, is_default, created_at, updated_at)", body = crate::mcp::openapi::McpEnvelope),
         (status = 401, description = "Missing or invalid session"),
         (status = 404, description = "Unknown id, or not owned by the caller"),
     ),
@@ -764,41 +1042,57 @@ mod tests {
         assert!(
             validate(
                 "anthropic",
+                true,
                 Some("claude-3-5-sonnet-20241022"),
                 &None,
                 false
             )
             .is_ok()
         );
-        assert!(validate("openai", Some("gpt-4o-mini"), &None, false).is_ok());
+        assert!(validate("openai", true, Some("gpt-4o-mini"), &None, false).is_ok());
+    }
+
+    #[test]
+    fn accepts_custom_provider() {
+        // A registered custom provider (membership resolved by the caller via the DB)
+        // validates just like a built-in.
+        assert!(validate("deepseek", true, Some("deepseek-chat"), &None, false).is_ok());
     }
 
     #[test]
     fn accepts_no_model_when_tiers_set() {
-        assert!(validate("anthropic", None, &None, true).is_ok());
+        assert!(validate("anthropic", true, None, &None, true).is_ok());
     }
 
     #[test]
     fn rejects_no_model_and_no_tiers() {
-        let err = validate("openai", None, &None, false).unwrap_err();
+        let err = validate("openai", true, None, &None, false).unwrap_err();
         assert!(err.contains("either model or at least one tier model"));
     }
 
     #[test]
     fn rejects_unsupported_provider() {
-        let err = validate("cohere", Some("command-r"), &None, false).unwrap_err();
+        // Not a built-in and not registered (caller resolved membership to false).
+        let err = validate("cohere", false, Some("command-r"), &None, false).unwrap_err();
         assert!(err.contains("unsupported provider"));
     }
 
     #[test]
     fn rejects_empty_model() {
-        let err = validate("openai", Some("   "), &None, false).unwrap_err();
+        let err = validate("openai", true, Some("   "), &None, false).unwrap_err();
         assert!(err.contains("model must not be empty"));
     }
 
     #[test]
     fn rejects_empty_pinned_model() {
-        let err = validate("openai", Some("gpt-4o"), &Some("  ".to_string()), false).unwrap_err();
+        let err = validate(
+            "openai",
+            true,
+            Some("gpt-4o"),
+            &Some("  ".to_string()),
+            false,
+        )
+        .unwrap_err();
         assert!(err.contains("pinned_model must not be empty"));
     }
 }

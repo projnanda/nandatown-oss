@@ -1,13 +1,15 @@
 pub mod api;
 pub mod commands;
 pub mod config;
+pub mod hitl;
 pub mod oci;
+pub mod session_store;
 pub mod skill;
 pub mod util;
 pub mod version_prompt;
 
 use anyhow::Result;
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 
 #[derive(Subcommand)]
 #[command(next_help_heading = "Create")]
@@ -73,6 +75,18 @@ pub enum AgentDevCommands {
 #[derive(Subcommand)]
 #[command(next_help_heading = "Operate")]
 pub enum AgentOpsCommands {
+    /// Run Claude Code through the Nasiko LLM router
+    Claude {
+        /// Registered agent name or UUID used for routing identity
+        #[arg(long)]
+        agent: String,
+        /// LLM config name or UUID to attach before launching
+        #[arg(long)]
+        config: Option<String>,
+        /// Arguments passed through to Claude Code
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Build + push + deploy to active cluster
     #[command(
         after_help = "Reads: AgentCard.json, Dockerfile\nWrites: .nasiko/agent.json (agent ID binding)"
@@ -108,6 +122,25 @@ pub enum AgentOpsCommands {
         /// Non-interactive: auto-accept the suggested version instead of prompting
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Register as an ACP coding agent (e.g. OpenCode): driven over a stdio
+        /// turn instead of HTTP, and deployed port-less with a workspace volume.
+        /// Overrides any `workloadKind` in AgentCard.json.
+        #[arg(long)]
+        coding_agent: bool,
+        /// Deprecated / redundant: HITL is ON by default for coding agents, so
+        /// each tool call pauses for a decision via the HITL API. Accepted for
+        /// back-compat; pass --no-hitl to run the agent unattended instead.
+        #[arg(long)]
+        hitl: bool,
+        /// Opt out of human-approval gating: the coding agent's tool use runs
+        /// unattended (autonomous/batch), auto-approving every request. Only
+        /// meaningful with --coding-agent; HITL is on by default otherwise.
+        #[arg(long, conflicts_with = "hitl")]
+        no_hitl: bool,
+        /// Show what would be deployed (version, image, env keys) without building, pushing,
+        /// or deploying anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Push image to cluster OCI registry (without deploying)
     Push {
@@ -122,6 +155,21 @@ pub enum AgentOpsCommands {
         /// Non-interactive: auto-accept the suggested version instead of prompting
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Mark the registered agent as an ACP coding agent (e.g. OpenCode).
+        /// Overrides any `workloadKind` in AgentCard.json. `push` only registers
+        /// the image; `nasiko deploy` then brings it up port-less.
+        #[arg(long)]
+        coding_agent: bool,
+        /// Deprecated / redundant: HITL is ON by default for coding agents.
+        /// Accepted for back-compat; pass --no-hitl to register the agent for
+        /// unattended (auto-approving) use instead.
+        #[arg(long)]
+        hitl: bool,
+        /// Opt out of human-approval gating: register the coding agent for
+        /// unattended use. Only meaningful with --coding-agent; HITL is on by
+        /// default otherwise.
+        #[arg(long, conflicts_with = "hitl")]
+        no_hitl: bool,
     },
     /// Upload source directory or .zip and let the server build + deploy (no local Docker needed)
     #[command(
@@ -156,12 +204,31 @@ pub enum AgentOpsCommands {
         /// the mount hides whatever the image ships at that path
         #[arg(long, value_name = "PATH")]
         writable_path: Option<String>,
+        /// Register as an ACP coding agent (e.g. OpenCode): built, then deployed
+        /// port-less with a workspace volume and driven over a stdio turn.
+        /// Overrides any `workloadKind` in AgentCard.json.
+        #[arg(long)]
+        coding_agent: bool,
+    },
+    /// Deploy an agent from an OCI/artifact-registry reference
+    ///
+    /// The registry counterpart of `push` (local image) and `upload` (local
+    /// source): the control plane pulls the image itself, so no local Docker
+    /// is needed. The reference must include the registry host, which must be
+    /// listed in the server's REGISTRY_IMPORT_ALLOWED_HOSTS.
+    Import {
+        /// `owner/name[:tag]` (resolved against the connected registry, like
+        /// `nasiko new`) or a full `registry.host/owner/name[:tag]`
+        reference: String,
     },
     /// List running agents
     Ps {
         /// Output as JSON
-        #[arg(short = 'j', long)]
+        #[arg(short = 'j', long, conflicts_with = "watch")]
         json: bool,
+        /// Refresh the list every 2s until Ctrl-C
+        #[arg(short = 'w', long)]
+        watch: bool,
     },
     /// Stream agent container logs
     Logs {
@@ -171,6 +238,20 @@ pub enum AgentOpsCommands {
         /// Live-tail: stream new log lines as they arrive (SSE)
         #[arg(short = 'f', long)]
         follow: bool,
+        /// Only lines at exactly this level (WARN does not include WARNING)
+        #[arg(
+            long,
+            ignore_case = true,
+            value_parser = ["DEBUG", "TRACE", "INFO", "WARN", "WARNING", "ERROR", "CRITICAL", "FATAL"]
+        )]
+        level: Option<String>,
+        /// Only lines whose message contains this text (case-insensitive)
+        #[arg(long)]
+        search: Option<String>,
+        /// Only lines from this far back: 30m, 2h, 1d, or an ISO-8601 time. Raw container
+        /// output carries no timestamps, so its latest lines are always shown
+        #[arg(long, conflicts_with = "follow")]
+        since: Option<String>,
     },
     /// Stop agent container
     Stop { agent: String },
@@ -232,11 +313,11 @@ pub enum AgentOpsCommands {
     },
     /// Terminate + deregister agent
     Rm {
-        /// Agent UUID (preferred; use --name to look up by name instead)
-        #[arg(conflicts_with = "name")]
-        id: Option<String>,
-        /// Delete by agent name (resolved to UUID via the CP registry)
-        #[arg(long, short = 'n', conflicts_with = "id")]
+        /// Agent name or UUID
+        #[arg(required_unless_present = "name", conflicts_with = "name")]
+        agent: Option<String>,
+        /// Older spelling of the positional argument, kept so existing scripts keep working
+        #[arg(long, short = 'n', hide = true)]
         name: Option<String>,
         #[arg(short, long)]
         force: bool,
@@ -256,9 +337,19 @@ pub enum AgentOpsCommands {
         /// Resume a previous session by ID (TUI mode)
         #[arg(long)]
         resume: Option<String>,
-        /// Route message to an existing session (one-shot mode)
+        /// Switch to a specific existing conversation by ID. Omit to continue the
+        /// current conversation for this agent (the default); it also becomes the
+        /// new current one.
         #[arg(long)]
         session_id: Option<String>,
+        /// Start a fresh conversation instead of continuing the current one, and
+        /// make it the new current conversation.
+        #[arg(long)]
+        new: bool,
+        /// Assert the target is an ACP coding agent — fail loudly if it isn't.
+        /// A guardrail only; the server still drives the turn by the agent's kind.
+        #[arg(long)]
+        coding_agent: bool,
     },
     /// List chat sessions
     Sessions {
@@ -319,7 +410,7 @@ pub enum AgentOpsCommands {
     #[command(name = "llm-config")]
     LlmConfig {
         #[command(subcommand)]
-        command: LlmConfigCommands,
+        command: Box<LlmConfigCommands>,
     },
     /// View or set the platform tier→model registry the smart router resolves against
     #[command(name = "model-registry")]
@@ -332,6 +423,29 @@ pub enum AgentOpsCommands {
         #[command(subcommand)]
         command: MafCommands,
     },
+}
+
+/// Embedding-routing flags, shared by `llm-config create` and `llm-config update`.
+///
+/// Grouped rather than spelled out twice: both commands already carry a long parameter
+/// list, and these five only ever move together.
+#[derive(Args, Clone, Debug, Default)]
+pub struct EmbeddingArgs {
+    /// Provider for this config's embedding calls (set together with --embedding-model)
+    #[arg(long = "embedding-provider")]
+    pub embedding_provider: Option<String>,
+    /// Embedding model this config routes to (set together with --embedding-provider)
+    #[arg(long = "embedding-model")]
+    pub embedding_model: Option<String>,
+    /// Name of your user-secret holding the embedding provider's API key
+    #[arg(long = "embedding-secret-name")]
+    pub embedding_secret_name: Option<String>,
+    /// Plaintext embedding API key to store under --embedding-secret-name
+    #[arg(long = "embedding-secret-value")]
+    pub embedding_secret_value: Option<String>,
+    /// Let this config's embedding model outrank the model an agent asks for
+    #[arg(long = "embedding-model-override")]
+    pub embedding_model_override: bool,
 }
 
 #[derive(Subcommand)]
@@ -363,9 +477,20 @@ pub enum LlmConfigCommands {
         /// Model to pin to (defaults to --model when --pin is set)
         #[arg(long = "pinned-model")]
         pinned_model: Option<String>,
+        /// Model for the HIGH tier, complex queries (tier1_model); used when not pinned
+        #[arg(long, value_name = "MODEL")]
+        high: Option<String>,
+        /// Model for the MID tier (tier2_model); used when not pinned
+        #[arg(long, value_name = "MODEL")]
+        mid: Option<String>,
+        /// Model for the LOW tier, simple queries (tier3_model); used when not pinned
+        #[arg(long, value_name = "MODEL")]
+        low: Option<String>,
         /// Mark this as your default config
         #[arg(long)]
         default: bool,
+        #[command(flatten)]
+        embedding: EmbeddingArgs,
     },
     /// Update an existing config in your library (only the flags you pass change)
     Update {
@@ -406,6 +531,24 @@ pub enum LlmConfigCommands {
         /// Reset the pinned model to null (pin falls back to the config's model)
         #[arg(long = "clear-pinned-model")]
         clear_pinned_model: bool,
+        /// Model for the HIGH tier, complex queries (tier1_model); used when not pinned
+        #[arg(long, value_name = "MODEL")]
+        high: Option<String>,
+        /// Model for the MID tier (tier2_model); used when not pinned
+        #[arg(long, value_name = "MODEL")]
+        mid: Option<String>,
+        /// Model for the LOW tier, simple queries (tier3_model); used when not pinned
+        #[arg(long, value_name = "MODEL")]
+        low: Option<String>,
+        #[command(flatten)]
+        embedding: EmbeddingArgs,
+        /// Unset the embedding provider and model (embedding calls fall through to the
+        /// organization default, which is a different vector space — needs --yes)
+        #[arg(long = "clear-embedding-model")]
+        clear_embedding_model: bool,
+        /// Confirm an embedding provider/model change up front, for non-interactive use
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
     },
     /// Delete a config from your library (must be detached from all agents first)
     #[command(alias = "rm")]
@@ -488,6 +631,27 @@ pub enum MafCommands {
         #[command(subcommand)]
         command: MafExecutionCommands,
     },
+    /// Run one instruction end to end and report every stage
+    #[command(
+        after_help = "Does in one command what `workflow create --instruction`, \
+`workflow run --wait` and `execution get` do in three: sends the sentence to the decomposer, \
+shows how it was split and which agent each step was routed to, runs it while reporting each \
+step as it finishes, then prints the result with its token breakdown.\n\n\
+The workflow is kept by default so it can be re-run or inspected; pass --cleanup to delete it \
+once the run finishes."
+    )]
+    Trace {
+        /// The compound instruction to decompose into a workflow and run
+        instruction: String,
+        /// Run-time data folded into step 0's task before planning
+        #[arg(long)]
+        content: Option<String>,
+        /// Delete the workflow once the run finishes
+        #[arg(long)]
+        cleanup: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -498,11 +662,14 @@ pub enum MafWorkflowCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Create a workflow from one or more steps
+    /// Create a workflow from one or more steps, or from one compound instruction
     #[command(
         after_help = "Steps run in the order given. Pass --agent once per --step to pin \
 an agent (name or UUID) to that step, or \"-\" to auto-assign it; omit --agent entirely to \
-auto-assign every step via the routing engine."
+auto-assign every step via the routing engine.\n\n\
+--instruction is mutually exclusive with --step/--agent: it sends the whole sentence to the \
+decomposer service (MODEL_API_URL), which splits it into atomic steps; each is then \
+auto-assigned an agent exactly like an auto-assigned --step."
     )]
     Create {
         #[arg(long)]
@@ -510,11 +677,14 @@ auto-assign every step via the routing engine."
         #[arg(long)]
         description: Option<String>,
         /// A workflow step's task description. Repeat in order: --step "..." --step "..."
-        #[arg(long = "step")]
+        #[arg(long = "step", conflicts_with = "instruction")]
         steps: Vec<String>,
         /// Agent (name or UUID) for the step at the same position, or "-" to auto-assign
-        #[arg(long = "agent")]
+        #[arg(long = "agent", conflicts_with = "instruction")]
         agents: Vec<String>,
+        /// One compound instruction to split into atomic steps via the decomposer service
+        #[arg(long, conflicts_with_all = ["steps", "agents"])]
+        instruction: Option<String>,
     },
     /// Show a workflow's steps and metadata
     Get {
@@ -577,6 +747,11 @@ server-side patch API, so behind the scenes this still sends the full step list.
         /// Poll until the execution finishes and print its result
         #[arg(long)]
         wait: bool,
+        /// Run-time data for this execution only — folded into step 0's task
+        /// description before planning, so the same saved workflow can be
+        /// re-run against different content each time
+        #[arg(long)]
+        content: Option<String>,
     },
     /// List executions of one workflow
     Executions {
@@ -611,6 +786,55 @@ pub enum MafExecutionCommands {
 
 #[derive(Subcommand)]
 pub enum AgentsCommands {
+    /// Discover coding agents installed on this machine (now: `status`)
+    #[command(hide = true)]
+    Discover,
+    /// Install session reporting for a local coding agent (now: `connect <agent> --reporting`)
+    #[command(hide = true)]
+    Install {
+        /// Agent to install (e.g. claude or opencode)
+        agent: String,
+        /// Report tokens, latency and cost, but omit conversation content
+        #[arg(long)]
+        no_content: bool,
+    },
+    /// Remove session reporting for a local coding agent (now: `disconnect <agent> --reporting`)
+    #[command(hide = true)]
+    Uninstall {
+        /// Agent to uninstall (e.g. claude or opencode)
+        agent: String,
+    },
+    /// Validate and deliver queued coding-agent events
+    Sync {
+        /// Queue the turns that were set aside again, then deliver them
+        #[arg(long)]
+        retry_rejected: bool,
+    },
+    /// Connect every coding agent on this computer and import its past sessions, newest first
+    Setup {
+        /// No longer needed (setup doesn't ask); accepted for older scripts
+        #[arg(long, short = 'y', hide = true)]
+        yes: bool,
+        /// Connect the agents but don't import their past sessions
+        #[arg(long)]
+        no_import: bool,
+        /// Import in this terminal and return when done, instead of in the background
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Import the past sessions of the coding agents already connected
+    Import,
+    /// Show how the coding-agent import is going and what is still waiting to send
+    Status,
+    /// Run the import `agents setup` starts in the background.
+    #[command(hide = true)]
+    ImportWorker,
+    /// Export one session's new turns. Invoked by installed hooks.
+    #[command(hide = true)]
+    Report {
+        #[arg(long)]
+        agent: String,
+    },
     /// List all deployed agents
     #[command(alias = "list")]
     Ls,
@@ -714,6 +938,14 @@ pub enum ObserveCommands {
     /// Show full detail for a session (traces, tokens, cost)
     Session {
         /// Session ID (trace ID)
+        session_id: String,
+        /// Output the raw API response as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show per-turn tokens + cost for a session (from the billing ledger)
+    Turns {
+        /// Session ID (ses_...)
         session_id: String,
         /// Output the raw API response as JSON
         #[arg(long)]
@@ -919,6 +1151,11 @@ pub fn dispatch_agent_dev(cmd: AgentDevCommands) -> Result<()> {
 
 pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
     match cmd {
+        AgentOpsCommands::Claude {
+            agent,
+            config,
+            args,
+        } => commands::claude::run(&agent, config.as_deref(), &args),
         AgentOpsCommands::Deploy {
             image,
             name,
@@ -929,6 +1166,10 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             writable_path,
             version,
             yes,
+            coding_agent,
+            hitl: _,
+            no_hitl,
+            dry_run,
         } => commands::deploy::deploy_with_version_flags(
             &image,
             name.as_deref(),
@@ -941,12 +1182,19 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             },
             writable,
             writable_path.as_deref(),
+            coding_agent,
+            // HITL is on by default for coding agents; --no-hitl opts out.
+            coding_agent && !no_hitl,
+            dry_run,
         ),
         AgentOpsCommands::Push {
             image,
             name,
             version,
             yes,
+            coding_agent,
+            hitl: _,
+            no_hitl,
         } => commands::push::push_with_version_flags(
             &image,
             name.as_deref(),
@@ -954,6 +1202,9 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 version: version.as_deref(),
                 yes,
             },
+            coding_agent,
+            // HITL is on by default for coding agents; --no-hitl opts out.
+            coding_agent && !no_hitl,
         ),
         AgentOpsCommands::Upload {
             source,
@@ -964,6 +1215,7 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             env,
             writable,
             writable_path,
+            coding_agent,
         } => commands::upload::upload(
             &source,
             name.as_deref(),
@@ -973,13 +1225,27 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             &env,
             writable,
             writable_path.as_deref(),
+            coding_agent,
         ),
-        AgentOpsCommands::Ps { json } => commands::agents::ps(json),
+        AgentOpsCommands::Import { reference } => commands::import::from_registry(&reference),
+        AgentOpsCommands::Ps { json, watch } => commands::agents::ps(json, watch),
         AgentOpsCommands::Logs {
             agent,
             tail,
             follow,
-        } => commands::agents::logs(&agent, tail, follow),
+            level,
+            search,
+            since,
+        } => commands::agents::logs(
+            &agent,
+            tail,
+            follow,
+            &commands::agents::LogFilters {
+                level,
+                search,
+                since,
+            },
+        ),
         AgentOpsCommands::Stop { agent } => commands::agents::stop(&agent),
         AgentOpsCommands::Start { agent } => commands::agents::start(&agent),
         AgentOpsCommands::Restart { agent } => commands::agents::restart(&agent),
@@ -1018,8 +1284,10 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             version.as_deref(),
             reason.as_deref(),
         ),
-        AgentOpsCommands::Rm { id, name, force } => {
-            commands::agents::rm(id.as_deref(), name.as_deref(), force)
+        AgentOpsCommands::Rm { agent, name, force } => {
+            // Parsing guarantees exactly one of the two is set.
+            let agent = agent.or(name).unwrap_or_default();
+            commands::agents::rm(&agent, force)
         }
         AgentOpsCommands::Chat {
             url,
@@ -1028,6 +1296,8 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             tui,
             resume,
             session_id,
+            new,
+            coding_agent,
         } => {
             // `nasiko chat "some message"` — a lone positional *containing
             // whitespace* is a natural-language message for the orchestrator,
@@ -1061,25 +1331,31 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 .or(url.as_deref())
                 .unwrap_or("")
                 .to_string();
-            let resolved = match (url, agent) {
-                // `url` is documented to accept a full URL, an agent
-                // UUID/name, or "orchestrator" — `resolve_chat_target`
-                // is what actually implements that (URL passthrough,
-                // orchestrator special-case, agent lookup by id/name);
-                // using `u` as-is here skipped that resolution entirely,
-                // so `nasiko chat <agent-name>` sent the literal name as
-                // the HTTP endpoint instead of resolving it first.
-                (Some(u), _) => commands::agents::resolve_chat_target(&u)?,
-                (None, Some(a)) => {
-                    let base = config::active_url()?;
-                    let id = commands::agents::resolve_agent_id(&a)?;
-                    format!("{}/api/agents/{}", base.trim_end_matches('/'), id)
-                }
+            // Resolve to (endpoint, workload_kind). `resolve_chat_target_with_kind`
+            // accepts a full URL, an agent UUID/name, or "orchestrator"; the kind
+            // is `None` for a URL / the orchestrator (neither is one catalog agent).
+            let (resolved, kind) = match (url, agent) {
+                (Some(u), _) => commands::agents::resolve_chat_target_with_kind(&u)?,
+                (None, Some(a)) => commands::agents::resolve_chat_target_with_kind(&a)?,
                 (None, None) => {
                     let base = config::active_url()?;
-                    format!("{}/api/orchestrator/a2a", base.trim_end_matches('/'))
+                    (
+                        format!("{}/api/orchestrator/a2a", base.trim_end_matches('/')),
+                        None,
+                    )
                 }
             };
+            // `--coding-agent` guardrail: assert the resolved target really is an
+            // ACP coding agent, so a wrong name/id fails loudly instead of silently
+            // chatting the wrong (or a normal) agent. It changes nothing on the wire
+            // — the server drives the turn by the agent's stored `workload_kind`.
+            if coding_agent && kind.as_deref() != Some("acp_coding_agent") {
+                let got = kind.as_deref().unwrap_or("unknown (URL/orchestrator)");
+                anyhow::bail!(
+                    "--coding-agent was given but '{target_label}' resolves to a '{got}' target, \
+                     not an ACP coding agent. Drop the flag, or check the name with `nasiko ps`."
+                );
+            }
             if tui || resume.is_some() {
                 commands::tui::run_tui(&resolved, resume.as_deref(), &target_label)
             } else {
@@ -1087,7 +1363,9 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                     &resolved,
                     message.as_deref(),
                     session_id.as_deref(),
+                    new,
                     &target_label,
+                    kind.as_deref(),
                 )
             }
         }
@@ -1113,6 +1391,28 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             }
         },
         AgentOpsCommands::Agents { command } => match command {
+            AgentsCommands::Discover => {
+                commands::local_agents::note_renamed("agents discover", "status");
+                commands::local_agents::print_overview()
+            }
+            AgentsCommands::Install { agent, no_content } => {
+                install_reporting_renamed("agents", &agent, no_content)
+            }
+            AgentsCommands::Uninstall { agent } => uninstall_reporting_renamed("agents", &agent),
+            AgentsCommands::Sync { retry_rejected } => commands::integration::sync(retry_rejected),
+            AgentsCommands::Setup {
+                yes,
+                no_import,
+                wait,
+            } => commands::integration::setup(commands::integration::SetupOptions {
+                yes,
+                no_import,
+                wait,
+            }),
+            AgentsCommands::Import => commands::integration::import(),
+            AgentsCommands::Status => commands::integration::import_status(),
+            AgentsCommands::ImportWorker => commands::integration::import_worker(),
+            AgentsCommands::Report { agent } => commands::integration::report(&agent),
             AgentsCommands::Ls => commands::agents::cmd_ls(),
             AgentsCommands::Get {
                 agent_id,
@@ -1157,6 +1457,9 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             ObserveCommands::Session { session_id, json } => {
                 commands::observe::session_detail(&session_id, json)
             }
+            ObserveCommands::Turns { session_id, json } => {
+                commands::observe::turns(&session_id, json)
+            }
             ObserveCommands::TraceDetail { trace_id, json } => {
                 commands::observe::trace_detail(&trace_id, json)
             }
@@ -1185,7 +1488,7 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
             SecretsCommands::Ls { agent } => commands::secrets::ls(agent.as_deref()),
             SecretsCommands::Rm { key, agent } => commands::secrets::rm(&key, agent.as_deref()),
         },
-        AgentOpsCommands::LlmConfig { command } => match command {
+        AgentOpsCommands::LlmConfig { command } => match *command {
             LlmConfigCommands::Create {
                 name,
                 provider,
@@ -1197,7 +1500,11 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 secret_value,
                 pin,
                 pinned_model,
+                high,
+                mid,
+                low,
                 default,
+                embedding,
             } => commands::llm_config::create(
                 &name,
                 &provider,
@@ -1209,7 +1516,9 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 secret_value,
                 pin,
                 pinned_model,
+                commands::llm_config::TierModels { high, mid, low },
                 default,
+                embedding,
             ),
             LlmConfigCommands::Update {
                 config,
@@ -1226,6 +1535,12 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 no_pin,
                 pinned_model,
                 clear_pinned_model,
+                high,
+                mid,
+                low,
+                embedding,
+                clear_embedding_model,
+                yes,
             } => commands::llm_config::update(
                 &config,
                 name,
@@ -1241,6 +1556,12 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 no_pin,
                 pinned_model,
                 clear_pinned_model,
+                commands::llm_config::TierModels { high, mid, low },
+                commands::llm_config::EmbeddingUpdate {
+                    args: embedding,
+                    clear: clear_embedding_model,
+                    confirmed: yes,
+                },
             ),
             LlmConfigCommands::Delete { config, force } => {
                 commands::llm_config::delete(&config, force)
@@ -1272,11 +1593,13 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                     description,
                     steps,
                     agents,
+                    instruction,
                 } => commands::maf::workflow_create(
                     name.as_deref(),
                     description.as_deref(),
                     &steps,
                     &agents,
+                    instruction.as_deref(),
                 ),
                 MafWorkflowCommands::Get { workflow, json } => {
                     commands::maf::workflow_get(&workflow, json)
@@ -1309,9 +1632,11 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                 MafWorkflowCommands::Delete { workflow, force } => {
                     commands::maf::workflow_delete(&workflow, force)
                 }
-                MafWorkflowCommands::Run { workflow, wait } => {
-                    commands::maf::workflow_run(&workflow, wait)
-                }
+                MafWorkflowCommands::Run {
+                    workflow,
+                    wait,
+                    content,
+                } => commands::maf::workflow_run(&workflow, wait, content.as_deref()),
                 MafWorkflowCommands::Executions { workflow, json } => {
                     commands::maf::workflow_executions(&workflow, json)
                 }
@@ -1325,6 +1650,12 @@ pub fn dispatch_agent_ops(cmd: AgentOpsCommands) -> Result<()> {
                     commands::maf::execution_result(&execution_id, json)
                 }
             },
+            MafCommands::Trace {
+                instruction,
+                content,
+                cleanup,
+                json,
+            } => commands::maf::trace(&instruction, content.as_deref(), cleanup, json),
         },
     }
 }
@@ -1353,6 +1684,89 @@ pub fn dispatch_registry(cmd: RegistrySubCommands) -> Result<()> {
             artifact_type,
             json,
         } => commands::registry::list(artifact_type.as_deref(), json),
+    }
+}
+
+// ─── Coding-agent integrations ──────────────────────────────────────────────
+
+/// `agents install` / `integration install`, now `connect <agent> --no-routing --reporting`:
+/// runs exactly the command the note names. The old command reported prompt and response text
+/// unless `--no-content`, so the new one says which explicitly.
+/// `old` is the group the caller used (`agents` or `integration`), for the note.
+pub fn install_reporting_renamed(old: &str, agent: &str, no_content: bool) -> Result<()> {
+    let content = if no_content {
+        " --no-content"
+    } else {
+        " --content"
+    };
+    commands::local_agents::note_renamed(
+        &format!("{old} install"),
+        &format!("connect {agent} --no-routing --reporting{content} -y"),
+    );
+    // Exactly the command the note names, so the two never behave differently.
+    commands::local_agents::connect(
+        Some(agent),
+        &commands::local_agents::ConnectOptions {
+            no_routing: true,
+            reporting: true,
+            content: !no_content,
+            no_content,
+            yes: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// `agents uninstall` / `integration uninstall`, now `disconnect <agent> --reporting`.
+pub fn uninstall_reporting_renamed(old: &str, agent: &str) -> Result<()> {
+    commands::local_agents::note_renamed(
+        &format!("{old} uninstall"),
+        &format!("disconnect {agent} --reporting"),
+    );
+    commands::integration::uninstall(agent)
+}
+
+#[derive(Subcommand)]
+pub enum IntegrationSubCommands {
+    /// Show which coding agents are on this machine and their reporting status
+    Status,
+    /// Register a coding agent and start reporting its sessions to Nasiko
+    Install {
+        /// Agent to install (e.g. claude or opencode)
+        agent: String,
+        /// Report tokens, latency and cost, but omit conversation text from spans
+        #[arg(long)]
+        no_content: bool,
+    },
+    /// Stop reporting a coding agent's sessions and remove its hook
+    Uninstall {
+        /// Agent to uninstall (e.g. claude or opencode)
+        agent: String,
+    },
+    /// Export one session's new turns. Invoked by the installed hook, not by hand.
+    #[command(hide = true)]
+    Report {
+        #[arg(long)]
+        agent: String,
+    },
+    /// Validate and deliver queued coding-agent events
+    Sync,
+}
+
+pub fn dispatch_integration(cmd: IntegrationSubCommands) -> Result<()> {
+    match cmd {
+        IntegrationSubCommands::Status => {
+            commands::local_agents::note_renamed("integration status", "status");
+            commands::local_agents::print_overview()
+        }
+        IntegrationSubCommands::Install { agent, no_content } => {
+            install_reporting_renamed("integration", &agent, no_content)
+        }
+        IntegrationSubCommands::Uninstall { agent } => {
+            uninstall_reporting_renamed("integration", &agent)
+        }
+        IntegrationSubCommands::Report { agent } => commands::integration::report(&agent),
+        IntegrationSubCommands::Sync => commands::integration::sync(false),
     }
 }
 
@@ -1398,7 +1812,7 @@ pub enum McpSubCommands {
     /// Manage custom MCP server connectors
     Connector {
         #[command(subcommand)]
-        command: McpConnectorCommands,
+        command: Box<McpConnectorCommands>,
     },
     /// Manage a per-connector stored credential
     Credential {
@@ -1510,6 +1924,12 @@ pub enum McpConnectorCommands {
         /// OAuth client secret
         #[arg(long)]
         oauth_client_secret: Option<String>,
+        /// OAuth scope to request, space separated (overrides automatic selection, offline_access is still added when the server offers it; empty string on update clears it)
+        #[arg(long)]
+        oauth_scopes: Option<String>,
+        /// Send the RFC 8707 resource parameter on authorize: true, false, or auto to let discovery decide (set false for Entra ID behind a proxy)
+        #[arg(long, value_enum)]
+        oauth_send_resource: Option<commands::mcp::SendResourceArg>,
     },
     /// Edit a connector's fields (owner/admin only)
     Update {
@@ -1536,6 +1956,12 @@ pub enum McpConnectorCommands {
         logo_url: Option<String>,
         #[arg(long)]
         active: Option<bool>,
+        /// OAuth scope to request, space separated (overrides automatic selection, offline_access is still added when the server offers it; empty string on update clears it)
+        #[arg(long)]
+        oauth_scopes: Option<String>,
+        /// Send the RFC 8707 resource parameter on authorize: true, false, or auto to let discovery decide (set false for Entra ID behind a proxy)
+        #[arg(long, value_enum)]
+        oauth_send_resource: Option<commands::mcp::SendResourceArg>,
     },
     /// Delete a connector (owner/admin only)
     Delete {
@@ -1807,7 +2233,7 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 commands::mcp::toolkit_delete(&connector_id, yes)
             }
         },
-        McpSubCommands::Connector { command } => match command {
+        McpSubCommands::Connector { command } => match *command {
             McpConnectorCommands::List { json } => commands::mcp::connector_list(json),
             McpConnectorCommands::Probe { url, json } => commands::mcp::connector_probe(&url, json),
             McpConnectorCommands::Register {
@@ -1825,6 +2251,8 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 logo_url,
                 oauth_client_id,
                 oauth_client_secret,
+                oauth_scopes,
+                oauth_send_resource,
             } => commands::mcp::connector_register(
                 &name,
                 &url,
@@ -1840,6 +2268,8 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 logo_url.as_deref(),
                 oauth_client_id.as_deref(),
                 oauth_client_secret.as_deref(),
+                oauth_scopes.as_deref(),
+                oauth_send_resource,
             ),
             McpConnectorCommands::Update {
                 connector_id,
@@ -1854,6 +2284,8 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 display_name,
                 logo_url,
                 active,
+                oauth_scopes,
+                oauth_send_resource,
             } => commands::mcp::connector_update(
                 &connector_id,
                 name.as_deref(),
@@ -1867,6 +2299,8 @@ pub fn dispatch_mcp(cmd: McpSubCommands) -> Result<()> {
                 display_name.as_deref(),
                 logo_url.as_deref(),
                 active,
+                oauth_scopes.as_deref(),
+                oauth_send_resource,
             ),
             McpConnectorCommands::Delete { connector_id, yes } => {
                 commands::mcp::connector_delete(&connector_id, yes)

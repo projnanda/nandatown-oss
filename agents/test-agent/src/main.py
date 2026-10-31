@@ -21,7 +21,6 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -34,6 +33,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from agent import run
+from nasiko_state import install_shutdown_hooks, make_task_store
 
 _CARD_PATH = Path(__file__).parent.parent / "AgentCard.json"
 
@@ -43,8 +43,12 @@ class EchoExecutor(AgentExecutor):
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         query = context.get_user_input()
-        task = context.current_task or new_task_from_user_message(context.message)
-        await event_queue.enqueue_event(task)
+        task = context.current_task
+        if task is None:
+            # Enqueue only a new task. Re-enqueueing a stored input-required task on resume makes
+            # the SDK replay the stale pause as the first event and drop the human's answer.
+            task = new_task_from_user_message(context.message)
+            await event_queue.enqueue_event(task)
 
         result = run(query)
 
@@ -105,13 +109,15 @@ def main() -> None:
 
     handler = DefaultRequestHandler(
         agent_executor=EchoExecutor(),
-        task_store=InMemoryTaskStore(),
+        task_store=make_task_store(),
         agent_card=agent_card,
     )
     routes = [Route("/health", health)]
     routes += create_agent_card_routes(agent_card)
     routes += create_jsonrpc_routes(handler, rpc_url="/")
-    uvicorn.run(Starlette(routes=routes), host=host, port=port)
+    app = Starlette(routes=routes)
+    install_shutdown_hooks(app)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":

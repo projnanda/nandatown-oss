@@ -1,0 +1,17 @@
+{
+  "name": "@nasiko/testing",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The test kit: setup, render helpers, fixtures and the live-contract harness.",
+  "devDependencies": {
+    "@tanstack/react-query": "^5.103.3",
+    "@tanstack/react-router": "^1.170.39",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "motion": "^13.4.4",
+    "msw": "^2.15.0",
+    "vitest": "^4.1.11",
+    "zod": "^4.6.5"
+  }
+}

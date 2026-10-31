@@ -88,8 +88,12 @@ class DocReaderExecutor(AgentExecutor):
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         query = context.get_user_input() or ""
-        task = context.current_task or new_task_from_user_message(context.message)
-        await event_queue.enqueue_event(task)
+        task = context.current_task
+        if task is None:
+            # Enqueue only a new task. Re-enqueueing a stored input-required task on resume makes
+            # the SDK replay the stale pause as the first event and drop the human's answer.
+            task = new_task_from_user_message(context.message)
+            await event_queue.enqueue_event(task)
 
         tracer = trace.get_tracer("doc-reader-agent")
         parent_ctx = request_otel_context.get() or otel_context.Context()
@@ -225,6 +229,9 @@ def main(host, port):
 
     handler = DefaultRequestHandler(
         agent_executor=DocReaderExecutor(llm, model),
+        # Deliberately in memory: uploaded documents travel inside the task's message history, so a
+        # task body routinely exceeds the platform state API's per-value limit (1 MiB by default).
+        # Move to nasiko_state.make_task_store() once the state API supports large bodies.
         task_store=InMemoryTaskStore(),
         agent_card=agent_card,
     )

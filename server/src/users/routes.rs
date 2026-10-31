@@ -50,7 +50,7 @@ async fn check_last_admin(state: &AppState, target_id: Uuid) -> Option<axum::res
             return Some(
                 (
                     StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error": "cannot deactivate the last admin"})),
+                    Json(serde_json::json!({"error": "cannot remove the last admin"})),
                 )
                     .into_response(),
             );
@@ -59,8 +59,85 @@ async fn check_last_admin(state: &AppState, target_id: Uuid) -> Option<axum::res
     None
 }
 
+/// The superuser ceiling: a caller who is not a superuser may not grant
+/// superuser, and may not act on an account that already is one.
+///
+/// User management is open to `role = 'admin'` callers (and in OSS, whose
+/// `can_manage_users` is allow-all, to every authenticated caller). Without
+/// this check such a caller could create a superuser, or reset a superuser's
+/// credentials and sign in as them.
+///
+/// Returns `None` when the request may go ahead. A target that does not exist
+/// passes, so the handler still answers 404 itself. A database error fails
+/// closed (500).
+async fn superuser_ceiling(
+    state: &AppState,
+    claims: &Claims,
+    grants_superuser: bool,
+    target_id: Option<Uuid>,
+) -> Option<axum::response::Response> {
+    if claims.is_superuser {
+        return None;
+    }
+    let forbidden = || {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(
+                    serde_json::json!({"error": "only a superuser can manage superuser accounts"}),
+                ),
+            )
+                .into_response(),
+        )
+    };
+    if grants_superuser {
+        return forbidden();
+    }
+    let target_id = target_id?;
+    let target_is_superuser: Result<Option<bool>, sqlx::Error> =
+        sqlx::query_scalar("SELECT is_superuser FROM users WHERE id = $1")
+            .bind(target_id)
+            .fetch_optional(&state.db)
+            .await;
+    match target_is_superuser {
+        Ok(Some(true)) => forbidden(),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::error!(%e, %target_id, "superuser_ceiling: target lookup failed");
+            Some(
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "internal error"})),
+                )
+                    .into_response(),
+            )
+        }
+    }
+}
+
+/// Revoke every live session for `user_id`.
+///
+/// Called wherever a credential is replaced: a password that no longer exists
+/// must not leave behind sessions that were established with it. Best-effort by
+/// design — the credential change has already committed by the time this runs,
+/// so a revocation failure is logged rather than turned into a failed request
+/// that would wrongly suggest the change did not happen.
+///
+/// Enforced in both editions: `auth::middleware::validate_session_token` runs its
+/// own fail-closed `auth_tokens` lookup on every authenticated request,
+/// independently of whichever `AuthService` impl is wired in.
+pub(crate) async fn revoke_sessions(state: &AppState, user_id: Uuid) {
+    if let Err(e) = state
+        .auth
+        .revoke_tokens_for_user(&user_id.to_string())
+        .await
+    {
+        tracing::warn!(%e, %user_id, "failed to revoke sessions after a credential change");
+    }
+}
+
 /// Full user orchestrator — list, get, and all management routes including role changes.
-/// Used by the OSS server. EE provides its own orchestrator (ee/server/src/users.rs)
+/// Used by the OSS server. EE provides its own orchestrator
 /// that merges management_router() and supplies EE-aware handlers + the cascade
 /// role-change endpoint.
 pub fn router() -> Router<AppState> {
@@ -87,7 +164,7 @@ pub fn router() -> Router<AppState> {
 /// so each can be overridden without causing a duplicate-route panic: EE wraps
 /// `change_role` with its leadership cascade, and wraps `update_user` to also
 /// accept `department_id`/`team_id` (EE-only columns `oss/server`'s `users`
-/// table doesn't have — see `ee/server/src/users.rs::ee_update_user`).
+/// table doesn't have — see the EE `ee_update_user` override).
 pub fn management_router() -> Router<AppState> {
     Router::new()
         .route("/users/admins", get(list_admins))
@@ -142,7 +219,7 @@ pub(crate) struct UserListResponse {
 }
 
 /// List users (superuser-only; EE additionally exposes a role/org-scoped
-/// listing at `/api/org/users` — see `ee/server/src/org_users.rs`).
+/// listing at `/api/org/users` — see the EE org-users routes).
 #[utoipa::path(
     get,
     path = "/api/users",
@@ -266,6 +343,14 @@ pub(crate) struct CreateUser {
     email: String,
     display_name: Option<String>,
     role: Option<String>,
+    /// Separate from `role` — `role` is a `user_role` enum value
+    /// (admin/department_manager/team_lead/team_member/member), never
+    /// "superuser". This is the one flag that actually grants unrestricted
+    /// access (bypasses org-visibility scoping, gates superuser-only routes
+    /// like MCP toolkit registration) — see CLAUDE.md's `role` vs
+    /// `is_superuser` note.
+    #[serde(default)]
+    is_superuser: bool,
 }
 
 /// One-time credential material — the only time `access_secret` is ever
@@ -289,13 +374,18 @@ pub(crate) struct CreateUserResponse {
     request_body = CreateUser,
     responses(
         (status = 201, description = "User created", body = CreateUserResponse),
+        (status = 403, description = "Only a superuser can create a superuser"),
         (status = 409, description = "Username or email already exists"),
     ),
 )]
 pub(crate) async fn create_user(
     State(state): State<AppState>,
+    claims: Claims,
     Json(body): Json<CreateUser>,
 ) -> impl IntoResponse {
+    if let Some(err) = superuser_ceiling(&state, &claims, body.is_superuser, None).await {
+        return err;
+    }
     let access_key = nasiko_auth::generate_access_key();
     let access_secret = nasiko_auth::generate_access_secret();
     let access_secret_hash = match nasiko_auth::hash_password_async(&access_secret).await {
@@ -310,12 +400,13 @@ pub(crate) async fn create_user(
     let id = Uuid::new_v4();
     let result = sqlx::query(
         r#"INSERT INTO users (id, username, email, display_name, is_superuser, is_active, role)
-           VALUES ($1, $2, $3, $4, false, true, $5::user_role)"#,
+           VALUES ($1, $2, $3, $4, $5, true, $6::user_role)"#,
     )
     .bind(id)
     .bind(&body.username)
     .bind(&body.email)
     .bind(&body.display_name)
+    .bind(body.is_superuser)
     .bind(role)
     .execute(&state.db)
     .await;
@@ -379,7 +470,7 @@ pub struct ChangeRoleRequest {
 
 /// Update a user's own-editable fields (superuser-only; EE overrides this
 /// route to additionally accept `department_id`/`team_id` — see
-/// `ee/server/src/users.rs::ee_update_user`). An `is_active: false`
+/// the EE `ee_update_user` override). An `is_active: false`
 /// transition here runs the same self-deactivate/last-admin guards as the
 /// dedicated `/deactivate` route.
 #[utoipa::path(
@@ -393,7 +484,7 @@ pub struct ChangeRoleRequest {
     responses(
         (status = 200, description = "Updated user", body = UserRow),
         (status = 400, description = "Empty username/email or password too short"),
-        (status = 403, description = "Cannot deactivate your own account"),
+        (status = 403, description = "Cannot deactivate your own account, or the target is a superuser and the caller is not"),
         (status = 404, description = "No such user"),
         (status = 409, description = "Username/email already taken, cannot deactivate the last admin, or user has no local credentials to set a password for"),
     ),
@@ -411,14 +502,17 @@ pub async fn update_user(
     if body.email.as_deref() == Some("") {
         return (StatusCode::BAD_REQUEST, "email cannot be empty").into_response();
     }
+    // Same policy as the self-service route: an administrator setting someone
+    // else's password must not be able to set one that user could not have
+    // chosen themselves.
     if let Some(ref p) = body.password
-        && p.len() < 8
+        && let Err(policy) = nasiko_auth::validate_password(p)
     {
-        return (
-            StatusCode::BAD_REQUEST,
-            "password must be at least 8 characters",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, policy.message()).into_response();
+    }
+
+    if let Some(err) = superuser_ceiling(&state, &claims, false, Some(id)).await {
+        return err;
     }
 
     // AUTH-2: an `is_active: false` transition through this generic PUT must go
@@ -473,10 +567,10 @@ pub async fn update_user(
     }
 
     // Shared (edition-agnostic) columns only. department_id/team_id are
-    // EE-only columns (created by ee/migrations/1002) — naming them here made
+    // EE-only columns (created by an EE migration) — naming them here made
     // this statement fail on every pure-OSS database, 500ing all user
     // updates. Org placement is layered on by `ee_update_user`
-    // (ee/server/src/users.rs), which delegates the shared fields here first.
+    // (the EE users module), which delegates the shared fields here first.
     // UserRow's #[sqlx(default)] covers the columns RETURNING no longer names.
     let result = sqlx::query_as::<_, UserRow>(
         r#"UPDATE users SET
@@ -503,6 +597,7 @@ pub async fn update_user(
     match result {
         Ok(None) => (StatusCode::NOT_FOUND, "user not found").into_response(),
         Ok(Some(updated)) => {
+            let password_changed = access_secret_hash.is_some();
             if let Some(hash) = access_secret_hash {
                 match sqlx::query(
                     "UPDATE user_credentials SET access_secret_hash = $2, updated_at = now() WHERE user_id = $1",
@@ -525,8 +620,12 @@ pub async fn update_user(
                     }
                 }
             }
-            if body.is_active == Some(false) {
-                let _ = state.auth.revoke_tokens_for_user(&id.to_string()).await;
+            // A replaced password and a deactivated account both invalidate every
+            // session the old credential established. Previously only the
+            // deactivation branch revoked, so an admin resetting a compromised
+            // user's password left the attacker's existing session alive.
+            if password_changed || body.is_active == Some(false) {
+                revoke_sessions(&state, id).await;
             }
             Json(updated).into_response()
         }
@@ -541,8 +640,8 @@ pub async fn update_user(
     }
 }
 
-/// Delete a user. Rejects self-deletion, deleting a superuser, or a user who
-/// still owns agents (reassign or delete those first).
+/// Delete a user. Rejects self-deletion, deleting the last admin, or a user
+/// who still owns agents (reassign or delete those first).
 #[utoipa::path(
     delete,
     path = "/api/users/{id}",
@@ -552,7 +651,8 @@ pub async fn update_user(
     ),
     responses(
         (status = 204, description = "Deleted"),
-        (status = 403, description = "Cannot delete your own account or a superuser"),
+        (status = 403, description = "Cannot delete your own account, or the target is a superuser and the caller is not"),
+        (status = 409, description = "Cannot delete the last admin"),
         (status = 404, description = "No such user"),
         (status = 409, description = "User still owns agents"),
     ),
@@ -571,19 +671,13 @@ pub(crate) async fn delete_user(
             .into_response();
     }
 
-    let is_super: Option<bool> = sqlx::query_scalar("SELECT is_superuser FROM users WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
+    if let Some(err) = superuser_ceiling(&state, &claims, false, Some(id)).await {
+        return err;
+    }
 
-    if is_super == Some(true) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "cannot delete superuser"})),
-        )
-            .into_response();
+    // Prevent deleting the last admin (covers both role='admin' and is_superuser).
+    if let Some(err) = check_last_admin(&state, id).await {
+        return err;
     }
 
     // Prevent deletion if the user owns any non-deleted agents.
@@ -641,7 +735,7 @@ pub(crate) async fn delete_user(
     ),
     responses(
         (status = 204, description = "Deactivated"),
-        (status = 403, description = "Cannot deactivate your own account"),
+        (status = 403, description = "Cannot deactivate your own account, or the target is a superuser and the caller is not"),
         (status = 404, description = "No such user"),
         (status = 409, description = "Cannot deactivate the last admin"),
     ),
@@ -660,6 +754,10 @@ pub(crate) async fn deactivate(
             .into_response();
     }
 
+    if let Some(err) = superuser_ceiling(&state, &claims, false, Some(id)).await {
+        return err;
+    }
+
     // Prevent deactivating the last admin.
     if let Some(err) = check_last_admin(&state, id).await {
         return err;
@@ -672,7 +770,7 @@ pub(crate) async fn deactivate(
     {
         Ok(r) if r.rows_affected() > 0 => {
             // Revoke all live tokens immediately so the gateway stops accepting them.
-            let _ = state.auth.revoke_tokens_for_user(&id.to_string()).await;
+            revoke_sessions(&state, id).await;
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(_) => StatusCode::NOT_FOUND.into_response(),
@@ -699,13 +797,18 @@ pub(crate) async fn deactivate(
     ),
     responses(
         (status = 204, description = "Reinstated"),
+        (status = 403, description = "The target is a superuser and the caller is not"),
         (status = 404, description = "No such user"),
     ),
 )]
 pub(crate) async fn reinstate(
     State(state): State<AppState>,
+    claims: Claims,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Some(err) = superuser_ceiling(&state, &claims, false, Some(id)).await {
+        return err;
+    }
     match sqlx::query("UPDATE users SET is_active = true WHERE id = $1 AND deleted_at IS NULL")
         .bind(id)
         .execute(&state.db)
@@ -746,12 +849,17 @@ pub(crate) struct RegenerateCredentialsResponse {
     ),
     responses(
         (status = 200, description = "New credentials", body = RegenerateCredentialsResponse),
+        (status = 403, description = "The target is a superuser and the caller is not"),
     ),
 )]
 pub(crate) async fn regenerate_credentials(
     State(state): State<AppState>,
+    claims: Claims,
     Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
+    if let Some(err) = superuser_ceiling(&state, &claims, false, Some(id)).await {
+        return err;
+    }
     let access_key = nasiko_auth::generate_access_key();
     let access_secret = nasiko_auth::generate_access_secret();
     let access_secret_hash = match nasiko_auth::hash_password_async(&access_secret).await {
@@ -774,12 +882,7 @@ pub(crate) async fn regenerate_credentials(
     .await
     {
         Ok(_) => {
-            let _ = sqlx::query(
-                "UPDATE auth_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL"
-            )
-            .bind(id)
-            .execute(&state.db)
-            .await;
+            revoke_sessions(&state, id).await;
 
             (
                 StatusCode::OK,
@@ -804,9 +907,35 @@ pub(crate) async fn regenerate_credentials(
 
 // ─── PUT /users/{id}/role ────────────────────────────────────────────────────
 
+/// The `user_role` values this database actually has, asked of Postgres.
+///
+/// A hardcoded list cannot be right here, because the set of roles is
+/// edition-dependent: OSS's schema declares `('admin', 'member')` and
+/// enterprise migrations `ALTER TYPE user_role ADD VALUE` on top. The list
+/// this replaced had drifted in both directions at once — it named three
+/// roles that no longer exist in either edition, and omitted one that does,
+/// so an OSS-only deployment accepted a role it could not store (passing
+/// validation, then failing the `::user_role` cast as a 500 rather than a
+/// 400) while an enterprise build had a valid role rejected on its way
+/// through this function.
+///
+/// Asking the database is correct in every edition, stays correct when a
+/// migration changes the enum, and — the point — lets this stay ignorant of
+/// any role name that isn't in OSS's own schema. Callers layer their own
+/// policy on top: enterprise narrows this to the roles it wants offered,
+/// since Postgres cannot remove an enum value once added, so retired names
+/// linger in `enum_range` forever.
+///
+/// One extra round trip on a rare administrative action; not worth caching.
+async fn valid_user_roles(state: &AppState) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT unnest(enum_range(NULL::user_role))::text")
+        .fetch_all(&state.db)
+        .await
+}
+
 /// Change a user's role and immediately revoke their live tokens. EE wraps
 /// this with a leadership-displacement cascade — see
-/// `ee/server/src/users.rs::ee_change_role`.
+/// the EE `ee_change_role` override.
 #[utoipa::path(
     put,
     path = "/api/users/{id}/role",
@@ -818,7 +947,7 @@ pub(crate) async fn regenerate_credentials(
     responses(
         (status = 204, description = "Role changed (or unchanged, a no-op)"),
         (status = 400, description = "Invalid role"),
-        (status = 403, description = "Cannot change your own role"),
+        (status = 403, description = "Cannot change your own role, or the target is a superuser and the caller is not"),
         (status = 404, description = "No such user"),
         (status = 409, description = "Cannot demote the last admin"),
     ),
@@ -838,15 +967,23 @@ pub async fn change_role(
             .into_response();
     }
 
+    if let Some(err) = superuser_ceiling(&state, &claims, false, Some(id)).await {
+        return err;
+    }
+
     let new_role = req.role.trim().to_lowercase();
-    let valid_roles = [
-        "admin",
-        "member",
-        "team_member",
-        "team_lead",
-        "department_manager",
-    ];
-    if !valid_roles.contains(&new_role.as_str()) {
+    let valid_roles = match valid_user_roles(&state).await {
+        Ok(roles) => roles,
+        Err(e) => {
+            tracing::error!(%e, "change_role: could not read the user_role enum");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+                .into_response();
+        }
+    };
+    if !valid_roles.iter().any(|r| r == &new_role) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("invalid role '{}'; valid: {}", new_role, valid_roles.join(", "))})),
@@ -903,7 +1040,7 @@ pub async fn change_role(
 
     // Revoke all live tokens — role is embedded in JWT so stale tokens would
     // carry the old (wrong) role until natural expiry.
-    let _ = state.auth.revoke_tokens_for_user(&id.to_string()).await;
+    revoke_sessions(&state, id).await;
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -954,7 +1091,7 @@ pub(crate) async fn list_admins(State(state): State<AppState>) -> impl IntoRespo
 // ─── GET /users/{id}/accessible-agents ──────────────────────────────────────
 
 /// Agents accessible to a user (owner ∪ public ∪ direct user-grant; EE's
-/// override in `ee/server/src/users.rs` additionally checks team/department
+/// EE override additionally checks team/department
 /// grants).
 #[utoipa::path(
     get,
@@ -999,7 +1136,7 @@ pub(crate) async fn my_accessible_agents(
 // ─── GET /users/me ──────────────────────────────────────────────────────────
 
 /// The caller's own user record (superuser-only route; EE overrides this
-/// with the same EE-aware shape as `get_user` — see `ee/server/src/users.rs`).
+/// with the same EE-aware shape as `get_user` — see the EE users module).
 #[utoipa::path(
     get,
     path = "/api/users/me",
@@ -1058,7 +1195,7 @@ pub(crate) struct AccessibleAgentsResponse {
 
 async fn accessible_agents_impl(db: &sqlx::PgPool, user_id: Uuid) -> axum::response::Response {
     // OSS: owner, public, or a direct user grant.
-    // EE overrides this in ee/server/src/users.rs to also check team and department grants.
+    // EE overrides this to also check team and department grants.
     let rows = sqlx::query_as::<_, AccessibleAgent>(
         r#"SELECT DISTINCT a.id, a.name, a.description, a.status, a.owner_id, a.is_public
            FROM agents a

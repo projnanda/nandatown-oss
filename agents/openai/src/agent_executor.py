@@ -25,8 +25,12 @@ class ResearchAgentExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         query = context.get_user_input()
 
-        task = context.current_task or new_task_from_user_message(context.message)
-        await event_queue.enqueue_event(task)
+        task = context.current_task
+        if task is None:
+            # Enqueue only a new task. Re-enqueueing a stored input-required task on resume makes
+            # the SDK replay the stale pause as the first event and drop the human's answer.
+            task = new_task_from_user_message(context.message)
+            await event_queue.enqueue_event(task)
 
         await event_queue.enqueue_event(
             TaskStatusUpdateEvent(

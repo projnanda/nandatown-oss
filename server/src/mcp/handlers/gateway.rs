@@ -1,15 +1,19 @@
 //! Agent-facing aggregating gateway — `POST /api/mcp`.
 //!
-//! Deliberately NOT behind `require_auth`: an agent's only credential is the
-//! delegation token (`x-nasiko-agent-token`, minted by `agent_proxy`). This
-//! handler is thin — identity, usage tracking, flow events — all protocol logic
-//! lives in `nasiko_mcp_gateway::protocol`.
+//! Deliberately NOT behind `require_auth`: agents authenticate with their own
+//! deploy-time credential (`Authorization: Bearer $MCP_GATEWAY_TOKEN`, minted
+//! by `mcp::wiring` and stored hashed in `agent_gateway_tokens`), and the user
+//! identity is resolved server-side — from the request's `traceparent` via the
+//! `flows` row + `flow_participants` check, or, for a CLI-bound local
+//! coding-agent row with no flow (or none that resolves), from the row's own
+//! owner instead — see docs/MCP_GATEWAY_AGENT_AUTH.md §2.4 rule 3b. This
+//! handler is thin — identity, usage tracking, flow events — all protocol
+//! logic lives in `nasiko_mcp_gateway::protocol`.
 
 use axum::{
     Json,
-    extract::{Request, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    middleware::Next,
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
@@ -18,100 +22,324 @@ use uuid::Uuid;
 use nasiko_mcp_gateway::protocol;
 use nasiko_mcp_gateway::types::codes;
 
-use crate::auth::Claims;
+use crate::mcp::identity::deny;
 use crate::state::AppState;
 use crate::usage::TokenUsageBuilder;
-
-const HEADER_AGENT_TOKEN: &str = "x-nasiko-agent-token";
-
-/// Auth layer for `POST /api/mcp` — validates the delegation token and inserts a
-/// `Claims { sub: user_id, .. }`, replacing `require_auth` for this one route.
-pub async fn require_delegation(mut req: Request, next: Next) -> Response {
-    let jwt_secret = match std::env::var("JWT_SECRET") {
-        Ok(s) => s,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "delegation auth unavailable").into_response(),
-    };
-    let Some(token) = req
-        .headers()
-        .get(HEADER_AGENT_TOKEN)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-    else {
-        return (StatusCode::UNAUTHORIZED, "missing x-nasiko-agent-token").into_response();
-    };
-    let Ok((user_id, _agent_id)) = nasiko_auth::jwt::validate_delegation_token(&jwt_secret, &token)
-    else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "invalid or expired delegation token",
-        )
-            .into_response();
-    };
-    req.extensions_mut().insert(Claims {
-        sub: user_id,
-        username: String::new(),
-        is_superuser: false,
-    });
-    next.run(req).await
-}
 
 /// Agent-facing MCP JSON-RPC gateway. Generic `tools/list` / `tools/call`
 /// JSON-RPC 2.0; request and response bodies are protocol-defined, not
 /// REST-shaped, so they are documented as free-form objects.
+///
+/// Authorization rules (docs/MCP_GATEWAY_AGENT_AUTH.md §2.4), all failing
+/// closed:
+/// 1. bearer token missing/unknown/revoked → 401
+/// 2. `tools/list` (and initialize/ping) → allowed with agent-only identity
+/// 3. `tools/call` with no/unknown/dead-flow traceparent → 403
+/// 3b. …unless the agent's row is a CLI-bound local coding agent
+///     (`coding_agent_integration_id` set) — such a row is never
+///     dispatched through a flow, so a flow-less `tools/call` resolves to its
+///     owner instead of 403 (`agent_owner`, below `dispatch`)
+/// 4. `tools/call` where the agent is not a recorded flow participant → 403
+/// 5. identity store unreachable → 403
 #[utoipa::path(
     post,
     path = "/api/mcp",
     tag = "mcp",
     params(
-        ("x-nasiko-agent-token" = String, Header, description = "Delegation token minted by the agent proxy — replaces session auth for this route"),
-        ("traceparent" = Option<String>, Header, description = "W3C trace context for flow tracking"),
+        ("Authorization" = String, Header, description = "`Bearer <MCP_GATEWAY_TOKEN>` — the per-agent gateway credential injected into the container env at deploy time"),
+        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`, except for a CLI-bound local coding-agent row (`coding_agent_integration_id` set), which resolves to its owner when the flow lookup fails; otherwise the user identity is resolved from the flow record"),
+        ("MCP-Protocol-Version" = Option<String>, Header, description = "Negotiated MCP protocol version; an unsupported value is rejected with 400 on implemented methods"),
     ),
     request_body(content = Object, description = "JSON-RPC 2.0 request: `tools/list` or `tools/call`"),
     responses(
         (status = 200, description = "JSON-RPC 2.0 response (result or error object)", body = Object),
         (status = 202, description = "Notification accepted (no `id` in request); empty object body", body = Object),
-        (status = 401, description = "Missing/invalid delegation token"),
+        (status = 400, description = "Unsupported or undecodable `MCP-Protocol-Version` on a method this gateway implements"),
+        (status = 401, description = "Missing/unknown/revoked gateway token"),
+        (status = 403, description = "`tools/call` outside a live flow the agent participates in (except a local coding-agent row, which resolves to its owner instead), or identity store unavailable"),
+        (status = 413, description = "Request body over the configured `MCP_GATEWAY_MAX_BODY_BYTES` limit"),
     ),
 )]
 pub async fn mcp_gateway(
     State(state): State<AppState>,
-    claims: Claims,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    let Ok(user_id) = claims.sub.parse::<Uuid>() else {
-        return rpc_error(
-            &body_req_id(&body),
-            codes::INTERNAL_ERROR,
-            "invalid user identity",
-        );
+    // Rule 1: authenticate the agent by its deploy-time gateway credential.
+    let Some(token) = bearer_token(&headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing Authorization: Bearer <MCP_GATEWAY_TOKEN>",
+        )
+            .into_response();
     };
-    let Some(agent_id) = acting_agent_id(&headers, &claims.sub) else {
-        return rpc_error(
-            &body_req_id(&body),
-            codes::INVALID_PARAMS,
-            "missing or invalid x-nasiko-agent-token — a delegation token is required",
-        );
-    };
+    dispatch(&state, token, &headers, body).await
+}
 
-    let traceparent = headers
-        .get(nasiko_flow::TRACEPARENT_HEADER)
-        .and_then(|v| v.to_str().ok());
+/// URL-credential form of [`mcp_gateway`] — `POST /api/mcp/s/{token}`.
+///
+/// Identical in every respect except where the agent credential is read from:
+/// the path instead of the `Authorization` header. It exists because MCP, unlike
+/// the OpenAI SDKs behind the LLM router, has no env-var convention for
+/// credentials — frameworks that register MCP servers declaratively often expose
+/// a `url` and no header hook, leaving the URL as the only place a credential
+/// can travel.
+///
+/// The trade-off is deliberate and documented (docs/MCP_GATEWAY_AGENT_AUTH.md):
+/// a credential in a URL is easier to leak than one in a header, so the server
+/// redacts this path before it reaches a span or log line
+/// (`crate::mcp::redact_credential_uri`). What keeps the exposure bounded is
+/// that this credential proves only *which agent* is calling — for a
+/// deployed agent, `tools/call` still requires a `traceparent` naming a live
+/// flow the agent participates in, so a leaked URL on its own cannot invoke a
+/// tool.
+///
+/// That bound does NOT hold for a CLI-bound local coding-agent row
+/// (`coding_agent_integration_id` set): such a row has no
+/// flow to require, so a leaked connect URL for one CAN call tools —
+/// attributed to, and scoped to, that row's owner: exactly the connectors the
+/// owner can access (their own, plus anything shared to them) that are also
+/// enabled for this specific agent row, never another user's. This is the
+/// same attribution the LLM router already applies to these rows with no flow
+/// at all (`oss/llm-router/src/handlers/chat.rs:312-323`). Nothing prevents
+/// such a row from being shared out or having its owner changed; whoever else
+/// can see the row, a flow-less call is attributed to its *current*
+/// `owner_id`, so an ownership transfer moves this attribution with it. The
+/// credential itself has no TTL of its own — it rotates only on re-mint
+/// (`nasiko_mcp_gateway::agent_tokens::mint`, same primitive every gateway
+/// token uses): the row's owner rotates it with `POST
+/// /api/agents/{id}/mcp-token` (owner-only), or kills it outright with
+/// `DELETE /api/agents/{id}/mcp-token` (owner or superuser); a deployed agent
+/// instead gets a fresh one on its next redeploy. `POST` alone does not cut
+/// off a leak immediately, though: the superseded token stays accepted for
+/// `ROTATION_GRACE_SECS` after a re-mint, same as a redeploy's rotation —
+/// `DELETE` is the one call with no such grace. Absent a `DELETE`, a leaked
+/// coding-agent connect URL is live for as long as the row is.
+#[utoipa::path(
+    post,
+    path = "/api/mcp/s/{token}",
+    tag = "mcp",
+    params(
+        ("token" = String, Path, description = "The per-agent `MCP_GATEWAY_TOKEN`, carried in the path for MCP clients that cannot set headers. Pre-composed as `MCP_GATEWAY_CONNECT_URL` in the container env."),
+        ("traceparent" = Option<String>, Header, description = "W3C trace context naming the flow this call belongs to — required for `tools/call`, except for a CLI-bound local coding-agent row (`coding_agent_integration_id` set), which resolves to its owner when the flow lookup fails; otherwise the user identity is resolved from the flow record"),
+        ("MCP-Protocol-Version" = Option<String>, Header, description = "Negotiated MCP protocol version; an unsupported value is rejected with 400 on implemented methods"),
+    ),
+    request_body(content = Object, description = "JSON-RPC 2.0 request: `tools/list` or `tools/call`"),
+    responses(
+        (status = 200, description = "JSON-RPC 2.0 response (result or error object)", body = Object),
+        (status = 202, description = "Notification accepted (no `id` in request); empty object body", body = Object),
+        (status = 400, description = "Unsupported or undecodable `MCP-Protocol-Version` on a method this gateway implements"),
+        (status = 401, description = "Unknown/revoked gateway token"),
+        (status = 403, description = "`tools/call` outside a live flow the agent participates in (except a local coding-agent row, which resolves to its owner instead), or identity store unavailable"),
+        (status = 413, description = "Request body over the configured `MCP_GATEWAY_MAX_BODY_BYTES` limit"),
+    ),
+)]
+pub async fn mcp_gateway_via_url(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if token.trim().is_empty() {
+        return (StatusCode::UNAUTHORIZED, "empty gateway token").into_response();
+    }
+    dispatch(&state, token.trim(), &headers, body).await
+}
+
+/// Shared body of both entry points: everything after the credential has been
+/// located. Keeping this single means the two forms cannot drift into different
+/// authorization behaviour — the URL form is a transport detail, not a weaker
+/// door.
+async fn dispatch(state: &AppState, token: &str, headers: &HeaderMap, body: Value) -> Response {
+    // `method` must be known before the protocol-version check below, because
+    // the check is gated on it: streamable-http clients (openai-agents,
+    // pydantic-ai, Claude Code) open a session with a method this gateway
+    // doesn't implement (e.g. `server/discover`), carrying whatever protocol
+    // version they intend to negotiate, and rely on our `-32601` to trigger
+    // their fallback to `initialize`. Rejecting that first probe with a bare
+    // 400 breaks the fallback outright, so the header is enforced only for
+    // methods this gateway actually answers (`protocol::implements`) — and
+    // never for `initialize` itself, which is the negotiation request.
     let method = body
         .get("method")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Per the MCP spec, a client that negotiated a protocol version in
+    // `initialize` sends `MCP-Protocol-Version` on every subsequent request.
+    // The header is optional — a client that never negotiated (or an old
+    // client predating this) never sends it — but on a method we do
+    // implement, a version we don't (or a header we can't even decode) is
+    // rejected outright rather than silently ignored.
+    if method != "initialize" && protocol::implements(&method) {
+        match headers
+            .get(nasiko_mcp_gateway::types::PROTOCOL_VERSION_HEADER)
+            .map(|v| v.to_str())
+        {
+            None => {}
+            Some(Ok(v)) if nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.contains(&v) => {}
+            Some(Ok(v)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "unsupported MCP-Protocol-Version '{v}' (supported: {})",
+                        nasiko_mcp_gateway::types::SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+                    ),
+                )
+                    .into_response();
+            }
+            Some(Err(_)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "MCP-Protocol-Version header is not valid visible ASCII",
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // `invoked_tool_name`, not `params.name`: a `nasiko_call_tool` call is
+    // recorded — usage, metrics, the approval event below — as the inner
+    // tool it ran, resolved by the same parse the protocol layer dispatches on.
     let tool_name = body
         .get("params")
-        .and_then(|p| p.get("name"))
-        .and_then(|v| v.as_str())
+        .map(protocol::invoked_tool_name)
         .unwrap_or("")
         .to_string();
+    let header_traceparent = headers
+        .get(nasiko_flow::TRACEPARENT_HEADER)
+        .and_then(|v| v.to_str().ok());
+
+    // Two doors onto the same tail:
+    //   - a coding-agent *session token* (NAS-839) carries {agent, user, flow}
+    //     in signed claims, so it needs neither the ngt_ lookup nor a
+    //     traceparent — the signature is the proof of the binding, so the
+    //     claims' flow id is the verified flow for everything downstream;
+    //   - otherwise the deploy-time ngt_ gateway token names the agent and the
+    //     user is resolved from the request's traceparent + flow (the A2A path,
+    //     docs/MCP_GATEWAY_AGENT_AUTH.md §2.4), with rule 3b for CLI-bound
+    //     coding-agent rows.
+    //
+    // `verified_flow_id` travels alongside `user_id` (rather than being
+    // re-derived from `traceparent` further down) because it's the one thing
+    // this function actually proved — by signature on the session path, or
+    // against `flows`/`flow_participants` on the A2A path. The raw
+    // `traceparent` a caller sends is not proof of anything on its own. On the
+    // owner-fallback branch below, `user_id` did NOT come from a verified flow,
+    // so `verified_flow_id` must be `None` even though `traceparent` may still
+    // be a well-formed (just unresolvable, or rejected) value:
+    // `protocol::handle_request` signs `verified_flow_id`, never `traceparent`,
+    // into the identity header it forwards to system backends, specifically so
+    // a caller can't launder an unverified trace id into a header a backend is
+    // told to trust unconditionally.
+    let (agent_id, user_id, verified_flow_id, synthesized_tp): (
+        Uuid,
+        Uuid,
+        Option<String>,
+        Option<String>,
+    ) = match try_session_identity(state, token).await {
+        SessionResolution::Session {
+            agent_id,
+            user_id,
+            flow_id,
+        } => {
+            let synthesized = synth_traceparent(&flow_id);
+            (agent_id, user_id, Some(flow_id), Some(synthesized))
+        }
+        SessionResolution::Deny(resp) => return resp,
+        SessionResolution::NotSession => {
+            let agent_id = match nasiko_mcp_gateway::agent_tokens::authenticate(&state.db, token)
+                .await
+            {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return (StatusCode::UNAUTHORIZED, "unknown or revoked gateway token")
+                        .into_response();
+                }
+                // Rule 5: identity store unreachable → fail closed (403, not
+                // a retryable 5xx that could be read as "try without auth"),
+                // matching FlowGuard's GuardUnavailable posture.
+                Err(e) => {
+                    tracing::error!(error = %e, "mcp gateway: token lookup failed — failing closed");
+                    return (StatusCode::FORBIDDEN, "identity store unavailable").into_response();
+                }
+            };
+
+            // Resolve the user identity. `tools/call` (rules 3+4) requires the
+            // traceparent to name a live flow this agent was dispatched into —
+            // the flow's user is the authorization subject — except for a
+            // CLI-bound local coding-agent row (rule 3b, `agent_owner` below),
+            // which has no flow to require and resolves to its owner instead.
+            // Read-only methods (initialize/ping/tools/list, rule 2) work
+            // agent-only: the flow user when one resolves, else the agent's
+            // owner (startup-time tool discovery happens outside any flow).
+            let (user_id, verified_flow_id) = match flow_user(state, header_traceparent, agent_id)
+                .await
+            {
+                Ok((user_id, flow_id)) => (user_id, Some(flow_id)),
+                Err(denial) => match agent_owner(state, agent_id).await {
+                    // Deliberate policy (MCP_GATEWAY_AGENT_AUTH.md §5, rule
+                    // 3b): a local coding agent — a row the CLI bound with
+                    // `coding_agent_integration_id` — is never dispatched
+                    // through the proxy, so it never has a flow; it acts as
+                    // its owner instead, even for `tools/call`. Same
+                    // predicate the LLM router uses for the same rows
+                    // (`oss/llm-router/src/resolver/mod.rs`,
+                    // `coding_agent_integration_id IS NOT NULL`), so the
+                    // gateway and the router agree on which rows count as
+                    // "personal desks" — though not on how they're billed:
+                    // the router always attributes these rows to their
+                    // owner with no flow at all, while the gateway takes a
+                    // verified flow first (above) and only reaches this
+                    // fallback when one doesn't resolve. That difference is
+                    // unreachable today: a coding-agent row is never
+                    // dispatched into, so nothing ever has an endpoint of
+                    // its own to route a flow to.
+                    Ok(Some((owner, true))) => (owner, None),
+                    // Every other flow-less `tools/call` stays denied
+                    // (rules 3+4).
+                    Ok(_) if method == "tools/call" => return denial,
+                    // Read-only methods (rule 2): agent-only identity via
+                    // the owner — unchanged from before the coding-agent
+                    // policy existed.
+                    Ok(Some((owner, false))) => (owner, None),
+                    Ok(None) => {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            "agent no longer exists — gateway token is stale",
+                        )
+                            .into_response();
+                    }
+                    // Rule 5 again: an unreachable identity store is not
+                    // "the agent is gone". Reporting 401 here would tell a
+                    // healthy agent its credential is stale and trigger a
+                    // pointless rotate/redeploy.
+                    Err(e) => {
+                        tracing::error!(error = %e, %agent_id, "mcp gateway: owner lookup failed — failing closed");
+                        return (StatusCode::FORBIDDEN, "identity store unavailable")
+                            .into_response();
+                    }
+                },
+            };
+            (agent_id, user_id, verified_flow_id, None)
+        }
+    };
+
+    // The session path supplies a flow via its claims; the A2A path uses the
+    // request's own header.
+    let traceparent: Option<&str> = synthesized_tp.as_deref().or(header_traceparent);
 
     let started = std::time::Instant::now();
-    let Some(result) =
-        protocol::handle_request(&state.mcp, user_id, agent_id, &body, traceparent).await
+    let Some(result) = protocol::handle_request(
+        &state.mcp,
+        user_id,
+        agent_id,
+        &body,
+        traceparent,
+        verified_flow_id.as_deref(),
+    )
+    .await
     else {
         return (StatusCode::ACCEPTED, Json(json!({}))).into_response();
     };
@@ -120,7 +348,7 @@ pub async fn mcp_gateway(
         let latency_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
         let success = result.get("error").is_none();
         record_tool_usage(
-            &state, user_id, agent_id, &tool_name, latency_ms, success, None,
+            state, user_id, agent_id, &tool_name, latency_ms, success, None,
         );
 
         if result
@@ -128,7 +356,17 @@ pub async fn mcp_gateway(
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_i64())
             == Some(codes::TOOL_ASK)
-            && let Some(flow_ctx) = traceparent.and_then(nasiko_flow::FlowContext::from_traceparent)
+            // `verified_flow_id`, never a re-parse of the raw `traceparent`:
+            // the owner-fallback path (coding-agent row, or a foreign/dead
+            // trace id) hands back `None` here specifically because nobody
+            // proved this call belongs to that flow. Re-parsing `traceparent`
+            // instead would let a coding-agent row — which resolves to its
+            // owner precisely because it has no flow of its own — name any
+            // OTHER user's live flow and land an approval card, naming an
+            // attacker-chosen server/tool, in that user's SSE stream
+            // (`a2a_dispatch.rs` forwards `FlowEventBus` events straight into
+            // the flow owner's chat).
+            && let Some(flow_id) = verified_flow_id.as_deref()
         {
             // Prefer the connector name the protocol layer attached (tool prefixes
             // are opaque connector-id hex); fall back to the prefix, then composio.
@@ -147,7 +385,7 @@ pub async fn mcp_gateway(
             state
                 .flow_events
                 .publish(
-                    &flow_ctx.flow_id,
+                    flow_id,
                     nasiko_flow::FlowEvent::ToolApprovalRequired {
                         agent_id: agent_id.to_string(),
                         server,
@@ -161,8 +399,138 @@ pub async fn mcp_gateway(
     Json(result).into_response()
 }
 
-fn body_req_id(body: &Value) -> Value {
-    body.get("id").cloned().unwrap_or(Value::Null)
+// Rules 3–5 (resolve the flow named by `traceparent` to its user, requiring a
+// live flow and recorded participation) live in `crate::mcp::identity`, which
+// this handler shares with every other layer that has to make the same
+// decision — see that module for why it is not a private helper here.
+// Returns `(user_id, flow_id)`: `dispatch` forwards the flow id onward as
+// `verified_flow_id`, the only form `protocol::handle_request` may sign into
+// the identity header sent to system backends — never a raw, unverified
+// `traceparent`.
+use crate::mcp::identity::{bearer_token, flow_user};
+
+/// Outcome of trying to read a coding-agent session token off the credential.
+enum SessionResolution {
+    /// A valid, non-revoked session token: use its signed identity directly.
+    Session {
+        agent_id: Uuid,
+        user_id: Uuid,
+        flow_id: String,
+    },
+    /// Not a session token (the ngt_ gateway token, or anything else) — the
+    /// caller should fall back to the deploy-time-token + traceparent path.
+    NotSession,
+    /// A session token that must be rejected (revoked, malformed claims, or the
+    /// store could not be reached).
+    Deny(Response),
+}
+
+/// Try to authenticate the credential as a coding-agent session token.
+///
+/// The signature is the proof of `{agent_id, user_id, flow_id}`, so — unlike the
+/// A2A path — this needs no live-flow freshness window (a long turn is never
+/// rejected for age) and no `flow_participants` lookup. The one DB touch is the
+/// `jti` revocation check, so a token can still be killed before its `exp`.
+async fn try_session_identity(state: &AppState, token: &str) -> SessionResolution {
+    let secret = &state.config.agent_jwt_secret;
+    // Unconfigured secret ⇒ this deployment doesn't issue session tokens; leave
+    // the legacy path untouched.
+    if secret.is_empty() {
+        return SessionResolution::NotSession;
+    }
+    let algorithm = nasiko_session_token::parse_algorithm(&state.config.agent_jwt_algorithm);
+
+    let claims = match nasiko_session_token::verify_session_token(token, secret, algorithm) {
+        Ok(claims) => claims,
+        Err(nasiko_session_token::SessionTokenError::NotSessionToken) => {
+            return SessionResolution::NotSession;
+        }
+        // Expired or otherwise unusable session token: reject rather than fall
+        // back (a fallback would just 401 on the ngt_ lookup anyway).
+        Err(e) => {
+            return SessionResolution::Deny(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    format!("session token rejected: {e}"),
+                )
+                    .into_response(),
+            );
+        }
+    };
+
+    let agent_id = match Uuid::parse_str(&claims.agent_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return SessionResolution::Deny(deny("session token agent_id is not a UUID".into()));
+        }
+    };
+    let user_id = match Uuid::parse_str(&claims.user_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return SessionResolution::Deny(deny("session token user_id is not a UUID".into()));
+        }
+    };
+
+    match is_session_token_revoked(&state.db, &claims.jti).await {
+        Ok(false) => SessionResolution::Session {
+            agent_id,
+            user_id,
+            flow_id: claims.flow_id,
+        },
+        Ok(true) => SessionResolution::Deny(deny("session token revoked".into())),
+        Err(e) => {
+            // Rule 5: fail closed on identity-store failure.
+            tracing::error!(error = %e, "mcp gateway: revocation check failed — failing closed");
+            SessionResolution::Deny(deny("identity store unavailable".into()))
+        }
+    }
+}
+
+/// True if this `jti` has been revoked.
+async fn is_session_token_revoked(db: &sqlx::PgPool, jti: &str) -> sqlx::Result<bool> {
+    let found: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM revoked_session_tokens WHERE jti = $1")
+            .bind(jti)
+            .fetch_optional(db)
+            .await?;
+    Ok(found.is_some())
+}
+
+/// Build a well-formed `traceparent` for a flow id from a session token, so the
+/// rest of the gateway (flow events, tool-approval context) sees the same W3C
+/// trace context the A2A path carries in a header.
+fn synth_traceparent(flow_id: &str) -> String {
+    let mut ctx = nasiko_flow::FlowContext::new_root();
+    ctx.flow_id = flow_id.to_owned();
+    ctx.to_traceparent()
+}
+
+/// `(owner_id, is_coding_agent)` for a live (non-deleted) agent — one query
+/// where there used to be two (a plain `agent_owner` for the read-only
+/// fallback, a separate `coding_agent_owner` for rule 3b), because the
+/// `Err(denial)` arm above always needs both facts about the very same row at
+/// once. `is_coding_agent` is `coding_agent_integration_id IS NOT NULL`
+/// (`oss/migrations/0019_coding_agent_identity.sql`) — deliberately the
+/// column itself, never agent metadata or name — matching `is_coding_agent`
+/// in `oss/llm-router/src/resolver/mod.rs`, so the gateway and the LLM router
+/// agree on which rows this policy covers. Such a row is single-owner by
+/// construction (the CLI only binds rows the login owns;
+/// `agent_owner_or_reject` gates every mint), so "the owner" is unambiguous.
+///
+/// `Ok(None)` means the agent is genuinely gone (401, stale credential);
+/// `Err` means the store could not answer (403, fail closed). Collapsing the
+/// two would misreport a database outage as a revoked agent.
+async fn agent_owner(
+    state: &AppState,
+    agent_id: Uuid,
+) -> Result<Option<(Uuid, bool)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT owner_id, coding_agent_integration_id IS NOT NULL
+         FROM agents WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(agent_id)
+    .fetch_optional(&state.db)
+    .await
 }
 
 fn record_tool_usage(
@@ -193,21 +561,4 @@ fn record_tool_usage(
             tracing::warn!(error = %e, "failed to record mcp_tool_call usage");
         }
     });
-}
-
-/// Validate the delegation token and return the acting agent's UUID, only if its
-/// `sub` matches the authenticated `user_id` (defense in depth).
-fn acting_agent_id(headers: &HeaderMap, user_id: &str) -> Option<Uuid> {
-    let token = headers.get(HEADER_AGENT_TOKEN)?.to_str().ok()?;
-    let jwt_secret = std::env::var("JWT_SECRET").ok()?;
-    let (delegated_user_id, agent_id) =
-        nasiko_auth::jwt::validate_delegation_token(&jwt_secret, token).ok()?;
-    if delegated_user_id != user_id {
-        return None;
-    }
-    agent_id.parse().ok()
-}
-
-fn rpc_error(id: &Value, code: i64, message: impl Into<String>) -> Response {
-    Json(protocol::rpc_error(id, code, message)).into_response()
 }
