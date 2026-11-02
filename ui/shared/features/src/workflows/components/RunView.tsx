@@ -99,7 +99,7 @@ export function RunView({ wf, exec, onBack }: { wf: Workflow; exec: string; onBa
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-6 [&>*]:min-w-0">
-      <title>{`${title} · Nasiko`}</title>
+      <title>{`${title} · Nandatown`}</title>
       <TopBar
         trail={[
           <Link

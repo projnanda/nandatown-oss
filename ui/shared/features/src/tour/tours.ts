@@ -233,7 +233,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
   deploy: [
     {
       title: 'Deploy an agent',
-      body: 'Bring an agent from a zip, a GitHub repository or a registry. Nasiko builds it and starts it.',
+      body: 'Bring an agent from a zip, a GitHub repository or a registry. Nandatown builds it and starts it.',
     },
     {
       target: 'deploy-methods',
@@ -285,7 +285,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
     {
       target: 'page-actions',
       title: 'Create a workflow',
-      body: 'Describe what you want and Nasiko drafts the steps, or add them yourself.',
+      body: 'Describe what you want and Nandatown drafts the steps, or add them yourself.',
     },
     {
       target: 'section-nav',
@@ -352,7 +352,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
     {
       target: 'page-actions',
       title: 'Add a server',
-      body: 'Register a remote MCP server, or upload your own and let Nasiko build it.',
+      body: 'Register a remote MCP server, or upload your own and let Nandatown build it.',
     },
     {
       target: 'mcp-toolbar',
@@ -473,7 +473,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
   optimization: [
     {
       title: 'Optimization',
-      body: 'How much history Nasiko trims before it reaches the model, and what that saves.',
+      body: 'How much history Nandatown trims before it reaches the model, and what that saves.',
     },
     {
       target: 'optimization-header',
@@ -614,7 +614,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
   'workflow-new': [
     {
       title: 'New workflow',
-      body: 'Chain agents into one job. Describe it and let Nasiko draft the steps, or write them yourself.',
+      body: 'Chain agents into one job. Describe it and let Nandatown draft the steps, or write them yourself.',
     },
     {
       target: 'wf-name',
@@ -699,7 +699,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
   account: [
     {
       title: 'Account settings',
-      body: 'Yours alone: how Nasiko looks in this browser, your password, and the keys Nasiko answers.',
+      body: 'Yours alone: how Nandatown looks in this browser, your password, and the keys Nandatown answers.',
     },
     {
       target: 'settings-sections',
@@ -729,7 +729,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
   status: [
     {
       title: 'Status',
-      body: 'Whether this page can reach the Nasiko server.',
+      body: 'Whether this page can reach the Nandatown server.',
     },
     {
       target: 'status-backend',

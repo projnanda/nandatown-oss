@@ -28,7 +28,7 @@ export const copy = {
   // Account settings → Appearance (/account/appearance): every user, stored in this browser only (theme.ts).
   appearance: {
     label: 'Appearance',
-    sub: 'How Nasiko looks in this browser.',
+    sub: 'How Nandatown looks in this browser.',
     mode: 'Mode',
     modeHint: 'System follows your device’s light or dark setting.',
     theme: 'Theme',
@@ -41,7 +41,7 @@ export const copy = {
   // ⌘ on a Mac, Ctrl elsewhere. Keep in step with the handlers (lib/keys.ts, TourHost, Composer, Waterfall, Swimlane…).
   shortcuts: {
     label: 'Keyboard shortcuts',
-    sub: 'Keys Nasiko answers. Letter keys do nothing while you type in a field.',
+    sub: 'Keys Nandatown answers. Letter keys do nothing while you type in a field.',
     groups: [
       {
         title: 'Everywhere',

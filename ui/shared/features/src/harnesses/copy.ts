@@ -74,7 +74,7 @@ export const copy = {
   // Coding-agent onboarding card (consent + discovery/import progress, reported by a local client).
   agentsOnboarding: {
     title: 'Bring in your coding agents?',
-    body: 'Nasiko can find Claude Code, Codex, OpenCode and Cursor on your computer, report their new sessions and import your past ones.',
+    body: 'Nandatown can find Claude Code, Codex, OpenCode and Cursor on your computer, report their new sessions and import your past ones.',
     yes: 'Yes, find my agents',
     notNow: 'Not now',
     declined: 'You chose not to bring in your coding agents.',
@@ -95,7 +95,7 @@ export const copy = {
       find: 'Find agents',
       connect: 'Connect',
       import: 'Import history',
-      send: 'Send to Nasiko',
+      send: 'Send to Nandatown',
     },
     stepState: { done: 'done', current: 'in progress', pending: 'not started', failed: 'failed' },
     stepsLabel: (device: string) => `Import steps on ${device}`,
@@ -167,7 +167,7 @@ export const copy = {
   // intro are the agent switch's own (agents/copy.ts).
   optimization: {
     label: 'On for your coding agents',
-    hint: "Compresses the tool output (logs, diffs, JSON) your coding agents send through Nasiko's LLM router, for every coding agent with an LLM config attached.",
+    hint: "Compresses the tool output (logs, diffs, JSON) your coding agents send through Nandatown's LLM router, for every coding agent with an LLM config attached.",
     needsConfig:
       'Attach an LLM config to a coding agent first: connect it under LLM routing, or attach one on the LLM router page.',
     some: (on: number, total: number) => `On for ${on} of ${total}.`,
@@ -192,7 +192,7 @@ export const copy = {
   // The desktop app's LLM routing card (components/RoutingCard.tsx): `nasiko connect <harness> [--config]`.
   routing: {
     title: 'LLM routing',
-    body: "Point a coding harness on this computer at Nasiko's LLM router, with the LLM config you choose. Nothing is routed until you connect it.",
+    body: "Point a coding harness on this computer at Nandatown's LLM router, with the LLM config you choose. Nothing is routed until you connect it.",
     listLabel: 'Coding harnesses on this computer',
     configLabel: (harness: string) => `LLM config for ${harness}`,
     configOption: (name: string, provider: string, model: string | null, isDefault: boolean) =>
@@ -202,10 +202,10 @@ export const copy = {
     configsFailed: "Couldn't load your LLM configs.",
     retry: 'Retry',
     notOnComputer: 'Not on this computer',
-    notRouted: 'Not routed through Nasiko',
-    routedVia: (config: string) => `Routed through Nasiko · ${config}`,
-    routedViaDefault: (config: string) => `Routed through Nasiko · your default (${config})`,
-    routed: 'Routed through Nasiko',
+    notRouted: 'Not routed through Nandatown',
+    routedVia: (config: string) => `Routed through Nandatown · ${config}`,
+    routedViaDefault: (config: string) => `Routed through Nandatown · your default (${config})`,
+    routed: 'Routed through Nandatown',
     byCli: 'Connected with the Nasiko CLI. Connecting here takes it over.',
     changed: 'Its settings changed since it was connected. Connect again to repair them.',
     noMcp: 'MCP tools are not connected.',
@@ -217,9 +217,9 @@ export const copy = {
     disconnecting: (name: string) => `Disconnecting ${name}…`,
     connected: (name: string, provider?: string | null, model?: string | null) =>
       provider
-        ? `${name} is routed through Nasiko (${provider}${model ? `/${model}` : ''}).`
-        : `${name} is routed through Nasiko.`,
-    disconnected: (name: string) => `${name} is no longer routed through Nasiko.`,
+        ? `${name} is routed through Nandatown (${provider}${model ? `/${model}` : ''}).`
+        : `${name} is routed through Nandatown.`,
+    disconnected: (name: string) => `${name} is no longer routed through Nandatown.`,
     failed: (name: string, detail: string | null) =>
       `Couldn't change ${name}'s routing${detail ? `: ${detail}` : '.'}`,
     loadFailed: "Couldn't read this computer's coding harnesses from the desktop app.",

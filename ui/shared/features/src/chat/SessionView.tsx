@@ -516,7 +516,7 @@ function SessionView({
 
   return (
     <>
-      <title>{`${titlePrefix}${row?.title ?? copy.chatsNav} · Nasiko`}</title>
+      <title>{`${titlePrefix}${row?.title ?? copy.chatsNav} · Nandatown`}</title>
       <SessionHeader
         sessionId={sessionId}
         row={row}

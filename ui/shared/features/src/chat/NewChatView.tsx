@@ -471,7 +471,7 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
 
   return (
     <>
-      <title>{`${titlePrefix}${agent ? copy.askAgent(agentLabel(agent)) : routed ? copy.askOrchestrator : copy.chatsNav} · Nasiko`}</title>
+      <title>{`${titlePrefix}${agent ? copy.askAgent(agentLabel(agent)) : routed ? copy.askOrchestrator : copy.chatsNav} · Nandatown`}</title>
       {/* No header strip on New chat (user, 2026-10-08): only the button that opens the chat history needs a row, and
           only while the history isn't shown. The heading stays for screen readers. */}
       {railButton ? (

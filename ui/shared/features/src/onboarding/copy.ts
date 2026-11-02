@@ -32,8 +32,8 @@ export const copy = {
     ready: { title: 'Ready', sub: 'Start exploring' },
   } satisfies Record<StepId, { title: string; sub: string }>,
   welcome: {
-    badge: 'New to Nasiko',
-    title: "Welcome to Nasiko. Let's set up your workspace.",
+    badge: 'New to Nandatown',
+    title: "Welcome to Nandatown. Let's set up your workspace.",
     intro:
       'OpenRuntime runs, observes, secures and pays for AI agents on any framework. Work flows through it in four stages.',
     stages: [
