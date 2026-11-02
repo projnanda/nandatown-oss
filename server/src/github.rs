@@ -519,11 +519,16 @@ async fn github_callback_login(
         crate::auth::login::request_is_https(headers),
     );
 
-    // Redirect to the app root (APP_BASE_URL override for split-origin dev).
+    // Back to /login, which finishes an external sign-in itself (lifts the
+    // local sign-out barrier, tells other tabs) before opening the app
+    // (APP_BASE_URL override for split-origin dev).
     let redirect_target = if state.config.app_base_url.is_empty() {
-        "/".to_string()
+        "/login?signin=external".to_string()
     } else {
-        format!("{}/", state.config.app_base_url.trim_end_matches('/'))
+        format!(
+            "{}/login?signin=external",
+            state.config.app_base_url.trim_end_matches('/')
+        )
     };
 
     (
