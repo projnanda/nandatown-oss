@@ -483,7 +483,7 @@ describe('desktop app: local consent and progress', () => {
     try {
       renderApp('/harnesses')
       const c = await card()
-      expect(within(c).getByText('The import stopped: signed out of Nasiko')).toBeInTheDocument()
+      expect(within(c).getByText('The import stopped: signed out of Nandatown')).toBeInTheDocument()
       await userEvent.click(within(c).getByRole('button', { name: 'Try again' }))
       expect(
         await within(c).findByRole('heading', { name: 'Bringing in your coding agents' }),

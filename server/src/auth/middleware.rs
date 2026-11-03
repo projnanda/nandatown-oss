@@ -226,6 +226,9 @@ const ASSET_EXTENSIONS: &[&str] = &[
     "xml",
     "webmanifest",
     "wasm",
+    // The CLI installers (`/install.sh`, `/install.ps1`) are fetched signed out by curl / irm.
+    "sh",
+    "ps1",
 ];
 
 /// A path is a gated page when it serves an HTML document.

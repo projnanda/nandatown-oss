@@ -204,7 +204,7 @@ function buildLogs(c: MockConnector, now: number): string[] {
     'Step 4/7 : RUN pip install -r requirements.txt',
     'Step 5/7 : EXPOSE 8080',
     'Step 6/7 : CMD ["python", "server.py"]',
-    `Successfully tagged nasiko/mcp-${c.name}:${b.version}`,
+    `Successfully tagged nandatown/mcp-${c.name}:${b.version}`,
     `MCP server listening on :8080 (${c.tools.length} tools)`,
   ]
 }

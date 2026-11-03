@@ -536,7 +536,7 @@ function seedRecorded(ctx: ChatMockContext, now: number) {
             name: 'git_diff',
             status: 'succeeded',
             args: { staged: true },
-            out: `{"diff":"${'+ extracted line\\n'.repeat(200)}… [truncated by nasiko CLI: 1048576 bytes]`,
+            out: `{"diff":"${'+ extracted line\\n'.repeat(200)}… [truncated by nandatown CLI: 1048576 bytes]`,
             ms: 60,
           },
           { name: 'telemetry', status: 'unknown', association: 'unknown' },

@@ -439,7 +439,7 @@ function toLocal(run: MockSyncRun): MockLocalRun {
 const failedLocalRun = (now: number): MockLocalRun =>
   toLocal(
     mockRun('failed', importingAgents(), now, {
-      error: 'signed out of Nasiko',
+      error: 'signed out of Nandatown',
       windows: mockWindows(now, 4, false),
     }),
   )
@@ -606,7 +606,7 @@ function desktopHandlers(ctx: Ctx): HttpHandler[] {
     http.post(`${BASE}/start`, () => {
       const d = desktop()
       if (!d) return absent()
-      if (!d.signedIn) return ctx.text('sign in to Nasiko first', 409)
+      if (!d.signedIn) return ctx.text('sign in to Nandatown first', 409)
       if (d.failStarts > 0) {
         d.failStarts -= 1
         return ctx.text('the desktop app could not start the import', 500)
@@ -637,7 +637,7 @@ function desktopHandlers(ctx: Ctx): HttpHandler[] {
     http.post(`${BASE}/routing/connect`, async ({ request }) => {
       const d = desktop()
       if (!d) return absent()
-      if (!d.signedIn) return ctx.text('Sign in to a Nasiko server in this window first.', 409)
+      if (!d.signedIn) return ctx.text('Sign in to a Nandatown server in this window first.', 409)
       const body = (await request.json().catch(() => ({}))) as { agent?: string; config?: string }
       const row = d.routing.find((r) => r.id === body.agent)
       if (!row)
