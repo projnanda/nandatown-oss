@@ -50,6 +50,8 @@ env:
 
 jobs:
   sync:
+    # Needs secrets only projnanda/nandatown-oss holds; forks skip this job.
+    if: github.repository == 'projnanda/nandatown-oss'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
