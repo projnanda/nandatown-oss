@@ -51,7 +51,7 @@ export const STATUS: Record<DisplayStatus, StatusInfo> = {
     label: 'Coding harness',
     tone: 'outline',
     actions: [],
-    hint: 'Reported by the nasiko CLI; it never runs as a container.',
+    hint: 'Reported by the Nandatown CLI; it never runs as a container.',
   },
   unknown: {
     label: 'Unknown',

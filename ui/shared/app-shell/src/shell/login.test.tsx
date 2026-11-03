@@ -214,7 +214,7 @@ describe('login error mapping', () => {
     await user.type(await screen.findByLabelText('Username'), 'admin')
     await user.type(screen.getByLabelText('Password'), 'x')
     await user.click(screen.getByRole('button', { name: 'Sign in' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent("Can't reach nasiko-server")
+    expect(await screen.findByRole('alert')).toHaveTextContent("Can't reach the Nandatown server")
     expect(screen.getByRole('alert')).not.toHaveTextContent('took too long')
   })
 
@@ -224,7 +224,7 @@ describe('login error mapping', () => {
     server.use(http.post('/api/auth/login', () => new HttpResponse('bad gateway', { status: 502 })))
     renderApp('/login')
     await user.click(await screen.findByRole('button', { name: 'Sign in' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent("Can't reach nasiko-server")
+    expect(await screen.findByRole('alert')).toHaveTextContent("Can't reach the Nandatown server")
     server.use(http.post('/api/auth/login', () => new HttpResponse('boom', { status: 500 })))
     await user.click(screen.getByRole('button', { name: 'Sign in' }))
     expect(await screen.findByText('Login failed. Check the server logs.')).toBeInTheDocument()

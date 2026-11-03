@@ -55,7 +55,7 @@ export function VersionsTab({ agent }: { agent: AgentView }) {
           ) : rb.outcome === 'timeout' ? (
             <>
               <p>{copy.stillRollingBack(rb.buildId ?? '—')}</p>
-              <CliCommand command={`nasiko logs ${agent.id}`} note={false} />
+              <CliCommand command={`nandatown logs ${agent.id}`} note={false} />
               <Button size="sm" variant="outline" onClick={() => w.begin('rollback', rb.buildId)}>
                 {copy.keepWatching}
               </Button>

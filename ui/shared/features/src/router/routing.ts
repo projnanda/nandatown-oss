@@ -377,7 +377,7 @@ export function cliLine(
   if (tierModels(c).length) return { unsupported: 'tiered' }
   if (!c.model) return { unsupported: 'no-model' }
   const parts = [
-    'nasiko',
+    'nandatown',
     'llm-config',
     'create',
     '--name',
@@ -400,8 +400,8 @@ export function cliLine(
 }
 
 export const cliAttach = (agent: string, config: string) =>
-  `nasiko llm-config attach ${q(agent)} ${q(config)}`
-export const cliDetach = (agent: string) => `nasiko llm-config detach ${q(agent)}`
+  `nandatown llm-config attach ${q(agent)} ${q(config)}`
+export const cliDetach = (agent: string) => `nandatown llm-config detach ${q(agent)}`
 
 /** Flags a generated line uses, for the test against the recorded `--help`. */
 export const cliFlags = (line: string): string[] => [

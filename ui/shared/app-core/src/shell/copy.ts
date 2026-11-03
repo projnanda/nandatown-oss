@@ -97,11 +97,11 @@ export const copy = {
   // The early-access card at the foot of the sidebar, its rail button and the login line (OSS only; WaitlistCta.tsx).
   waitlist: {
     badge: 'Early access',
-    title: 'Join the Nasiko waitlist',
+    title: 'Join the Nandatown waitlist',
     line: 'Get managed OpenRuntime early, with help from the team.',
     cta: 'Join the waitlist',
     newTab: '(opens in a new tab)',
-    loginLead: 'New to Nasiko?',
+    loginLead: 'New to Nandatown?',
   },
   // The free-assessment card above the sidebar footer and its rail row (AssessmentCta.tsx); it replaced the waitlist's.
   assessment: {
@@ -120,7 +120,7 @@ export const copy = {
   // The desktop app's sign-in, while it runs Nasiko on this computer (ForgotPassword.tsx).
   forgotPassword: {
     link: 'Forgot password?',
-    lead: "The password can't be recovered. You can reset Nasiko on this computer and start over.",
+    lead: "The password can't be recovered. You can reset Nandatown on this computer and start over.",
   },
   account: {
     menu: (name: string) => `Account: ${name}`,
@@ -164,7 +164,7 @@ export const copy = {
     // without saying the account exists, like the 401 message.
     locked: (minutes: number) =>
       `Too many failed sign-ins. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
-    unreachable: "Can't reach nasiko-server. Is `just run-stack` running?",
+    unreachable: "Can't reach the Nandatown server. Is `just run-stack` running?",
     timedOut: 'The server took too long to answer. Try again in a moment.',
     failed: 'Login failed. Check the server logs.',
     // The login cookie is HttpOnly: only the server can end it, so a failed logout leaves this

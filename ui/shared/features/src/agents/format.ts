@@ -2,10 +2,10 @@
 
 /** The three commands from an empty server to a deployed agent (checked against `--help`). */
 /** Deploys the project `nasiko new` scaffolded (`deploy` requires <IMAGE>: an image or agent directory). */
-export const DEPLOY_CMD = 'nasiko deploy ./my-agent'
+export const DEPLOY_CMD = 'nandatown deploy ./my-agent'
 
 export function firstRunCommands(origin: string): string[] {
-  return [`nasiko connect ${origin}`, 'nasiko new openai my-agent', DEPLOY_CMD]
+  return [`nandatown connect ${origin}`, 'nandatown new openai my-agent', DEPLOY_CMD]
 }
 
 const RTF = new Intl.RelativeTimeFormat('en', { numeric: 'auto' })

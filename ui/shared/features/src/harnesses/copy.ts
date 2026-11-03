@@ -17,7 +17,7 @@ export const copy = {
   loading: 'Loading harness usage',
   registered: 'Registered',
   registeredTip:
-    'A harness is registered when its agent row exists: `nasiko agents install` creates it, and so does `nasiko connect`, `use` or `auth login` for every harness found on the machine. Uninstalling keeps the row, so registered can overstate real use.',
+    'A harness is registered when its agent row exists: `nandatown agents install` creates it, and so does `nandatown connect`, `use` or `auth login` for every harness found on the machine. Uninstalling keeps the row, so registered can overstate real use.',
   estCost: 'Est. cost',
   estCostTip:
     'Tokens × the model list price. Harness seats are usually billed per seat, so this is not an invoice.',
@@ -63,12 +63,12 @@ export const copy = {
 
   // Onboarding (viewer only).
   connectSteps: (server: string, harness: string) => [
-    `nasiko connect ${server}`,
-    'nasiko auth login',
-    `nasiko agents install ${harness}`,
+    `nandatown connect ${server}`,
+    'nandatown auth login',
+    `nandatown agents install ${harness}`,
   ],
   connectHint:
-    'The harness must be installed on this machine. `nasiko auth login` registers every harness it finds; `agents install` is the fallback.',
+    'The harness must be installed on this machine. `nandatown auth login` registers every harness it finds; `agents install` is the fallback.',
   askToConnect: (name: string, harness: string) => `Ask ${name} to connect ${harness}.`,
 
   // Coding-agent onboarding card (consent + discovery/import progress, reported by a local client).
@@ -83,11 +83,11 @@ export const copy = {
     // Browser: running the command is the consent.
     commandTitle: 'Bring in your coding agents',
     commandBody: 'To discover your coding agents and load your previous sessions, run:',
-    command: 'nasiko agents setup',
+    command: 'nandatown agents setup',
     copyCommand: 'Copy command',
     thisComputer: 'This computer',
     actionFailed: (detail: string | null) =>
-      `Couldn't reach the Nasiko desktop app${detail ? `: ${detail}` : '.'} Try again.`,
+      `Couldn't reach the Nandatown desktop app${detail ? `: ${detail}` : '.'} Try again.`,
     tryAgain: 'Try again',
     runningTitle: 'Bringing in your coding agents',
     runningBody: 'This runs in the background. You can leave this page; it keeps going.',
@@ -206,7 +206,7 @@ export const copy = {
     routedVia: (config: string) => `Routed through Nandatown · ${config}`,
     routedViaDefault: (config: string) => `Routed through Nandatown · your default (${config})`,
     routed: 'Routed through Nandatown',
-    byCli: 'Connected with the Nasiko CLI. Connecting here takes it over.',
+    byCli: 'Connected with the Nandatown CLI. Connecting here takes it over.',
     changed: 'Its settings changed since it was connected. Connect again to repair them.',
     noMcp: 'MCP tools are not connected.',
     connect: 'Connect',

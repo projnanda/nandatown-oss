@@ -7,8 +7,6 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useRouter, useRouterState } from '@tanstack/react-router'
 import {
   ArrowLeft,
-  BookOpen,
-  CalendarClock,
   CircleAlert,
   CircleUser,
   Compass,
@@ -63,7 +61,6 @@ import { ApiError } from '@nasiko/data-access/client'
 import { SIDEBAR_HEALTH_INTERVAL_MS, useHealth } from '@nasiko/data-access/health'
 import { env } from '@nasiko/app-core/env'
 import { IS_MAC } from '@nasiko/ui/lib/keys'
-import { DOCS_URL, EXPERT_CALL_URL } from '@nasiko/app-core/links'
 import { askForTour } from '@nasiko/app-core/tour'
 import { cn } from '@nasiko/ui/lib/utils'
 import { pickShared, withoutWindow } from '@nasiko/app-core/shell/context'
@@ -89,9 +86,8 @@ import {
   type Theme,
 } from '@nasiko/app-core/shell/theme'
 import { SidebarPanelContext } from '@nasiko/app-core/shell/panelSlot'
-// The waitlist card gave way to the free-assessment card (user request 2026-10-22); WaitlistCta.tsx stays for now.
-// import { WaitlistCard } from './WaitlistCta'
-import { AssessmentCard } from './AssessmentCta'
+// Nandatown shows neither upstream's waitlist card nor the free-assessment card that replaced it: both lead to
+// Nasiko's own team. WaitlistCta.tsx and AssessmentCta.tsx stay, unused, so core syncs merge cleanly.
 
 /** How long a pending health check stays quiet before "Checking…" shows (design review 2A). */
 const CHECKING_DELAY_MS = 1_000
@@ -237,8 +233,6 @@ export function AppSidebar({
       ) : null}
       {/* Not while a page's panel holds the sidebar: Chat's history and Settings' sections keep the room, and Chat's dot
           background stays its page's one effect (CLAUDE.md, Aceternity effects). */}
-      {/* {holds ? null : <WaitlistCard />} */}
-      {holds || pathname === '/assessment' ? null : <AssessmentCard />}
       <SidebarFooter className={cn(GROUP, 'gap-0 border-t border-sidebar-border py-2')}>
         <SidebarMenu>
           <HelpRows pathname={pathname} onPick={pick} />
@@ -434,31 +428,11 @@ function NavGroups({
   )
 }
 
-/** How to use (the docs), the CLI guide (in the app) and Talk to an expert (the booking page), above the account. */
+/** The CLI guide (in the app), above the account. Nandatown drops upstream's How to use and Talk to an expert rows: they open Nasiko's docs and booking page. */
 function HelpRows({ pathname, onPick }: { pathname: string; onPick(): void }) {
   const { setOpenMobile } = useSidebar()
-  const external = (href: string, label: string, Icon: typeof BookOpen) => (
-    <SidebarMenuItem>
-      <SidebarMenuButton
-        tooltip={label}
-        className={ROW}
-        render={
-          <a
-            href={href}
-            target="_blank"
-            rel="noopener noreferrer"
-            aria-label={`${label} ${copy.help.newTab}`}
-          />
-        }
-      >
-        <Icon aria-hidden />
-        <span className={LABEL}>{label}</span>
-      </SidebarMenuButton>
-    </SidebarMenuItem>
-  )
   return (
     <>
-      {external(DOCS_URL, copy.help.docs, BookOpen)}
       <SidebarMenuItem>
         <SidebarMenuButton
           isActive={pathname === '/cli'}
@@ -478,7 +452,6 @@ function HelpRows({ pathname, onPick }: { pathname: string; onPick(): void }) {
           <span className={LABEL}>{copy.help.cli}</span>
         </SidebarMenuButton>
       </SidebarMenuItem>
-      {external(EXPERT_CALL_URL, copy.help.expert, CalendarClock)}
     </>
   )
 }

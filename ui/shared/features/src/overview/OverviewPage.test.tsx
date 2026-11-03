@@ -286,10 +286,10 @@ describe('first run (design 7A)', () => {
     const user = userEvent.setup()
     renderApp('/')
     const guideCard = await screen.findByTestId('overview-setup-guide')
-    // The deploy command alone fails before `nasiko connect` and `nasiko new`, so the CLI shows all three.
+    // The deploy command alone fails before `nandatown connect` and `nandatown new`, so the CLI shows all three.
     await user.click(screen.getByRole('button', { name: copy.firstRun.cli(3) }))
-    expect(await screen.findByText(/^nasiko connect /)).toBeInTheDocument()
-    expect(screen.getByText('nasiko deploy ./my-agent')).toBeInTheDocument()
+    expect(await screen.findByText(/^nandatown connect /)).toBeInTheDocument()
+    expect(screen.getByText('nandatown deploy ./my-agent')).toBeInTheDocument()
     await user.click(within(guideCard).getByRole('button', { name: /^Connect a model/ }))
     expect(
       await screen.findByRole('heading', { name: 'Connect a model provider' }),

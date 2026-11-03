@@ -1,5 +1,5 @@
 /**
- * The desktop app's LLM routing card on Harnesses (routing.ts, components/RoutingCard.tsx): `nasiko connect <harness>
+ * The desktop app's LLM routing card on Harnesses (routing.ts, components/RoutingCard.tsx): `nandatown connect <harness>
  * [--config]` from the page. Hidden in a browser; in the app, one row per routable harness, opt-in, with the config
  * to route with, take-over of a CLI connection, and Disconnect.
  */
@@ -69,7 +69,7 @@ describe('in the desktop app', () => {
     ).toHaveTextContent('anthropic-default (your default) · anthropic/claude-sonnet-4')
 
     const codex = await row('codex')
-    expect(within(codex).getByText(/Connected with the Nasiko CLI/)).toBeInTheDocument()
+    expect(within(codex).getByText(/Connected with the Nandatown CLI/)).toBeInTheDocument()
     expect(within(codex).getByRole('button', { name: 'Take over' })).toBeInTheDocument()
     expect(within(codex).getByRole('button', { name: 'Disconnect' })).toBeInTheDocument()
 
@@ -117,8 +117,8 @@ describe('in the desktop app', () => {
       await user.click(within(codex).getByRole('combobox', { name: 'LLM config for Codex' }))
       await user.click(await screen.findByRole('option', { name: /^fast-openai/ }))
       await user.click(within(codex).getByRole('button', { name: 'Take over' }))
-      await within(codex).findByText(/Took over Codex from the Nasiko CLI/)
-      expect(within(codex).queryByText(/Connected with the Nasiko CLI/)).toBeNull()
+      await within(codex).findByText(/Took over Codex from the Nandatown CLI/)
+      expect(within(codex).queryByText(/Connected with the Nandatown CLI/)).toBeNull()
       const connect = rec.requests.find((r) => r.url.pathname === `${ROUTING}/connect`)
       const body = connect?.body as { agent: string; config: string }
       expect(body.agent).toBe('codex')

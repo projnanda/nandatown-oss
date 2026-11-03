@@ -186,7 +186,7 @@ describe('TokenOps page', () => {
       http.get(`${FINOPS}/top-traces`, () => new HttpResponse('not found', { status: 404 })),
     )
     renderApp('/tokenops?open=all&traces=true')
-    expect(await screen.findByText(/needs a newer nasiko-server/)).toBeInTheDocument()
+    expect(await screen.findByText(/needs a newer Nandatown server/)).toBeInTheDocument()
   })
 
   it('F4: a 500 offers Retry, not the newer-server message', async () => {
@@ -196,7 +196,7 @@ describe('TokenOps page', () => {
     renderApp('/tokenops?open=all&traces=true')
     const drawer = await screen.findByRole('dialog')
     expect(await within(drawer).findByRole('button', { name: /Retry/ })).toBeInTheDocument()
-    expect(within(drawer).queryByText(/newer nasiko-server/)).toBeNull()
+    expect(within(drawer).queryByText(/newer Nandatown server/)).toBeNull()
   })
 
   it('F4: an empty result shows the empty state', async () => {
@@ -291,13 +291,13 @@ describe('TokenOps page', () => {
   it('/api/me 502 shows the server-down page, not endless skeletons', async () => {
     server.use(http.get('/api/me', () => new HttpResponse('bad gateway', { status: 502 })))
     renderApp('/tokenops?open=all')
-    expect(await screen.findByText(/Can't reach nasiko-server/)).toBeInTheDocument()
+    expect(await screen.findByText(/Can't reach the Nandatown server/)).toBeInTheDocument()
   })
 
   it('a dashboard network failure shows the server-down page', async () => {
     server.use(http.get(`${FINOPS}/dashboard`, () => HttpResponse.error()))
     renderApp('/tokenops?open=all')
-    expect(await screen.findByText(/Can't reach nasiko-server/)).toBeInTheDocument()
+    expect(await screen.findByText(/Can't reach the Nandatown server/)).toBeInTheDocument()
   })
 
   it('impossible or future custom dates fall back to 30d instead of crashing', async () => {

@@ -130,7 +130,7 @@ describe('overview', () => {
     renderApp(url(0, 'details'))
     const section = await screen.findByRole('region', { name: 'Active version' })
     expect(await within(section).findByText(/registry\.local\//)).toBeInTheDocument()
-    expect(screen.getByText(`nasiko chat --agent ${running.id} "hello"`)).toBeInTheDocument()
+    expect(screen.getByText(`nandatown chat --agent ${running.id} "hello"`)).toBeInTheDocument()
   })
 
   it('a failed clipboard write leaves the text selectable and says so', async () => {

@@ -120,9 +120,9 @@ describe('catalog', () => {
     server.use(http.get('/api/agents', () => HttpResponse.json([])))
     renderApp('/agents')
     expect(await screen.findByText('No agents yet')).toBeInTheDocument()
-    expect(screen.getByText(`nasiko connect ${window.location.origin}`)).toBeInTheDocument()
-    expect(screen.getByText('nasiko new openai my-agent')).toBeInTheDocument()
-    expect(screen.getByText('nasiko deploy ./my-agent')).toBeInTheDocument()
+    expect(screen.getByText(`nandatown connect ${window.location.origin}`)).toBeInTheDocument()
+    expect(screen.getByText('nandatown new openai my-agent')).toBeInTheDocument()
+    expect(screen.getByText('nandatown deploy ./my-agent')).toBeInTheDocument()
   })
 })
 

@@ -388,8 +388,8 @@ describe('Individual pieces', () => {
     const { rerender } = render(
       <ConnectHelp self name="Ada" harness="cursor" server="https://or.example" />,
     )
-    expect(screen.getByText(/nasiko connect https:\/\/or\.example/)).toBeInTheDocument()
-    expect(screen.getByText(/nasiko agents install cursor/)).toBeInTheDocument()
+    expect(screen.getByText(/nandatown connect https:\/\/or\.example/)).toBeInTheDocument()
+    expect(screen.getByText(/nandatown agents install cursor/)).toBeInTheDocument()
     rerender(<ConnectHelp self={false} name="Ada" harness="cursor" server="https://or.example" />)
     expect(screen.getByText('Ask Ada to connect Cursor.')).toBeInTheDocument()
   })
@@ -401,7 +401,7 @@ describe('Individual pieces', () => {
     render(<ConnectHelp self name="Ada" harness="codex" server="https://or.example" />)
     await user.click(screen.getByRole('button', { name: 'Copy' }))
     expect(writeText).toHaveBeenCalledWith(
-      'nasiko connect https://or.example\nnasiko auth login\nnasiko agents install codex',
+      'nandatown connect https://or.example\nnandatown auth login\nnandatown agents install codex',
     )
   })
 

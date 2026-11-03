@@ -199,7 +199,7 @@ function WhatItDoes({ agent }: { agent: AgentView }) {
       {agent.isHarness ? null : (
         <div className="mt-2 space-y-1.5 border-t pt-3">
           <h3 className="text-sm font-semibold">{copy.callThisAgent}</h3>
-          <CliCommand command={`nasiko chat --agent ${agent.id} "hello"`} />
+          <CliCommand command={`nandatown chat --agent ${agent.id} "hello"`} />
         </div>
       )}
     </Section>

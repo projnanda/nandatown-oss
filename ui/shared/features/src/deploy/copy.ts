@@ -109,9 +109,9 @@ export const copy = {
   },
   registry: {
     reference: 'Image reference',
-    placeholder: 'registry.nasiko.dev/acme/support-bot:1.2.0',
-    hint: (host: string) => `host/owner/name:tag. Allowed hosts: ${host} and any your admin added.`,
-    format: 'Use host/owner/name:tag, like registry.nasiko.dev/acme/support-bot:1.2.0.',
+    placeholder: 'registry.example.com/acme/support-bot:1.2.0',
+    hint: (_host: string) => 'host/owner/name:tag, from a registry your admin allowed.',
+    format: 'Use host/owner/name:tag, like registry.example.com/acme/support-bot:1.2.0.',
     submit: 'Import and deploy',
     importing: 'Importing (pull or build, then deploy)',
     usual: 'usually 1–5 min',
@@ -143,7 +143,7 @@ export const copy = {
   agentBuilds: {
     what: 'builds',
     empty: 'No builds from OpenRuntime yet',
-    emptyHint: 'Deployed with `nasiko deploy`? That path pushes an image without a build here.',
+    emptyHint: 'Deployed with `nandatown deploy`? That path pushes an image without a build here.',
     deploy: 'Deploy a new version',
     label: 'Builds of this agent',
     last20: 'The last 20 builds.',

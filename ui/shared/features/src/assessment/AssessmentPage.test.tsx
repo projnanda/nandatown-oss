@@ -1,9 +1,9 @@
-/** The free assessment (`/assessment`) and the sidebar's ways to it and to help (AssessmentCta, HelpRows). */
+/** The free assessment (`/assessment`) and the sidebar's help rows (HelpRows); Nandatown links neither to Nasiko. */
 import { screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 import { copy as shell } from '@nasiko/app-core/shell/copy'
-import { DOCS_URL, EXPERT_CALL_URL } from '@nasiko/app-core/links'
+import { EXPERT_CALL_URL } from '@nasiko/app-core/links'
 import { assessmentsMockState, configureMocks } from '@nasiko/mocks/handlers'
 import { setupPinnedSeed } from '@nasiko/testing/pinnedSeed'
 import { renderApp } from '@nasiko/testing/renderApp'
@@ -86,25 +86,16 @@ describe('assessment', () => {
     expect(assessmentsMockState()).toEqual([])
   })
 
-  it('puts the help rows and the assessment card in the sidebar, the waitlist gone', async () => {
+  it('keeps only the CLI guide in the sidebar: no docs, expert, assessment or waitlist rows (Nandatown)', async () => {
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1440 })
     renderApp('/')
     await screen.findByRole('navigation', { name: 'Main' })
     const sidebar = document.querySelector<HTMLElement>('[data-slot="sidebar"]')!
     const s = within(sidebar)
-    expect(s.getByRole('link', { name: new RegExp(`^${shell.help.docs}`) })).toHaveAttribute(
-      'href',
-      DOCS_URL,
-    )
-    expect(s.getByRole('link', { name: new RegExp(`^${shell.help.expert}`) })).toHaveAttribute(
-      'href',
-      EXPERT_CALL_URL,
-    )
+    expect(s.queryByRole('link', { name: new RegExp(`^${shell.help.docs}`) })).toBeNull()
+    expect(s.queryByRole('link', { name: new RegExp(`^${shell.help.expert}`) })).toBeNull()
     expect(s.getAllByRole('link', { name: shell.help.cli })[0]).toHaveAttribute('href', '/cli')
-    expect(s.getAllByRole('link', { name: shell.assessment.cta })[0]).toHaveAttribute(
-      'href',
-      '/assessment',
-    )
+    expect(s.queryByRole('link', { name: shell.assessment.cta })).toBeNull()
     expect(s.queryByText(shell.waitlist.badge)).toBeNull()
   })
 })

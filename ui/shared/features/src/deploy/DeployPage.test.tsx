@@ -213,7 +213,7 @@ describe('Deploy: upload a zip (plans/feat-deploy.md §4.1)', () => {
   it('shows the CLI equivalent', async () => {
     renderApp('/deploy?name=bot')
     expect(
-      await screen.findByText('nasiko upload ./bot', {}, { timeout: 5000 }),
+      await screen.findByText('nandatown upload ./bot', {}, { timeout: 5000 }),
     ).toBeInTheDocument()
   })
 })

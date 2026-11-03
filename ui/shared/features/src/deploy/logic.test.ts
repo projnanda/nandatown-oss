@@ -241,11 +241,11 @@ describe('GitHub helpers', () => {
   })
 })
 
-describe('the terminal alternative (plans/feat-deploy.md §7, recorded `nasiko upload --help`)', () => {
+describe('the terminal alternative (plans/feat-deploy.md §7, recorded `nasiko upload --help`, installed as `nandatown`)', () => {
   it('passes the directory as the optional [SOURCE], with no required option', () => {
     expect(uploadHelp).toMatch(/Usage: nasiko upload \[OPTIONS\] \[SOURCE\]/)
     expect(uploadHelp).toMatch(/\[SOURCE\]\s+Agent directory or \.zip file/)
-    expect(uploadCommand('support-bot')).toBe('nasiko upload ./support-bot')
+    expect(uploadCommand('support-bot')).toBe('nandatown upload ./support-bot')
     expect(uploadCommand('x').split(' ')).toHaveLength(3)
   })
 
@@ -263,8 +263,8 @@ describe('links and commands never carry shell characters (review D2)', () => {
   })
 
   it('builds the upload command only from a valid name', () => {
-    expect(uploadCommand('x;rm -rf ~')).toBe('nasiko upload ./my-agent')
-    expect(uploadCommand('')).toBe('nasiko upload ./my-agent')
+    expect(uploadCommand('x;rm -rf ~')).toBe('nandatown upload ./my-agent')
+    expect(uploadCommand('')).toBe('nandatown upload ./my-agent')
   })
 })
 

@@ -72,18 +72,17 @@ export const copy = {
   noMatchBody: 'Clear the agent, lane and status filters to see every session in this view.',
   clearFilters: 'Clear filters',
   sparseLive:
-    'Sessions come from chat traffic: run `nasiko chat <agent>` against a deployed agent, or use mock data with `npm run dev`.',
+    'Sessions come from chat traffic: run `nandatown chat <agent>` against a deployed agent, or use mock data with `npm run dev`.',
   noTraceData:
-    'No trace data found for these sessions: the agents may not export traces yet, or nasiko-server has no trace store configured.',
+    'No trace data found for these sessions: the agents may not export traces yet, or the server has no trace store configured.',
   noTraceDataFix:
-    'Set TEMPO_URL and LOKI_URL on nasiko-server (README › Live data), then reload. Each session still opens on its own page.',
+    'Set TEMPO_URL and LOKI_URL on the server (README › Live data), then reload. Each session still opens on its own page.',
   noTraceDataLongWindow:
     'Trace details are missing for this window, most likely because the server searches Tempo across all of it and Tempo refuses searches of 7 days or more.',
   noTraceDataLongWindowFix:
     'Open a session to see its trace, or pick 7d. If 7d is empty too, the trace store may be down (README › Live data).',
   notConfigured: "Observability isn't configured on this server.",
-  notConfiguredFix:
-    'Set TEMPO_URL and LOKI_URL on nasiko-server (README › Live data) and restart it.',
+  notConfiguredFix: 'Set TEMPO_URL and LOKI_URL on the server (README › Live data) and restart it.',
   traceStoreError: 'The trace store returned an error.',
   notFound: 'Not found, or not visible to you.',
   noAccess: "You don't have access to this.",
@@ -91,7 +90,7 @@ export const copy = {
   notFoundSession:
     "This session isn't available: it doesn't exist, or it belongs to another user (non-superusers see only their own sessions).",
   serverDown: (apiUrl: string) =>
-    `Is nasiko-server running at ${apiUrl}? Run \`just run-stack\` in nasiko-cloud-rs.`,
+    `Is the Nandatown server running at ${apiUrl}? Run \`just run-stack\`.`,
 
   traceNotFound: 'Trace not found, or not visible to you.',
   noTraces: 'No traces recorded for this session',

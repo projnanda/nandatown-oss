@@ -30,7 +30,7 @@ export function ErrorState({
     return (
       <StateCard
         tone="error"
-        title="Can't reach nasiko-server"
+        title="Can't reach the Nandatown server"
         fix={copy.serverDown('NASIKO_API_URL')}
         action={retry}
       />

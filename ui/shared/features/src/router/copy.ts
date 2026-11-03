@@ -143,7 +143,7 @@ export const copy = {
   notRoutable: (p: string) =>
     `The router can’t call ${p}: it isn’t built in or a registered custom provider.`,
   registryTitle: 'Models the router picks per tier',
-  registryWayOut: 'Superusers change these with nasiko model-registry set.',
+  registryWayOut: 'Superusers change these with nandatown model-registry set.',
   registryEmpty: 'No tier models set',
   tierLabels: ['Advanced reasoning', 'Balanced', 'Fast responses'] as const,
   catalogFailed: 'Couldn’t load the provider catalog',
@@ -248,7 +248,7 @@ export const copy = {
   cantSeeOwnerConfigs: 'You can’t see this owner’s configs.',
   requestFormat: 'Request format',
   requestFormatWayOut: (agent: string) =>
-    `Change with nasiko llm-config attach ${agent} <config> --inbound-format <format>.`,
+    `Change with nandatown llm-config attach ${agent} <config> --inbound-format <format>.`,
   checkHint: (by: string) =>
     `To check, start a new conversation after ${by}: ongoing ones may keep the old model.`,
   cantConfirm: 'This page can’t confirm routed calls yet.',
@@ -320,7 +320,7 @@ export const copy = {
   // Errors (errors.ts builds the entries)
   errUnmapped: (text: string, status: number) => `OpenRuntime said: ${text} (HTTP ${status})`,
   errDown: 'OpenRuntime isn’t answering.',
-  errDownFix: 'Check that nasiko-server is running, then retry.',
+  errDownFix: 'Check that the Nandatown server is running, then retry.',
 } as const
 
 /** Retired forms a copy test bans from this page (plan §2). */

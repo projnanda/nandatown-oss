@@ -389,7 +389,7 @@ describe('the CLI equivalent (DX #4)', () => {
     expect('line' in r).toBe(true)
     if (!('line' in r)) return
     expect(r.line).toBe(
-      "nasiko llm-config create --name 'my config' --provider anthropic --model claude-sonnet-4 --fallback openai/gpt-4o --temperature 0.2 --max-tokens 512 --api-key-secret K --pin --pinned-model claude-haiku --default",
+      "nandatown llm-config create --name 'my config' --provider anthropic --model claude-sonnet-4 --fallback openai/gpt-4o --temperature 0.2 --max-tokens 512 --api-key-secret K --pin --pinned-model claude-haiku --default",
     )
     for (const f of cliFlags(r.line)) expect(helpFlags, f).toContain(f)
     expect(r.line).not.toContain('--secret-value')
@@ -402,8 +402,9 @@ describe('the CLI equivalent (DX #4)', () => {
 
   it('quotes attach arguments and matches the recorded attach usage', () => {
     expect(cliAttach('support-bot', 'my config')).toBe(
-      "nasiko llm-config attach support-bot 'my config'",
+      "nandatown llm-config attach support-bot 'my config'",
     )
+    // The recording names the binary `nasiko`; Nandatown installs it as `nandatown`.
     expect(attachHelp).toContain('nasiko llm-config attach [OPTIONS] <AGENT> <CONFIG>')
     expect(attachHelp).toContain('--inbound-format')
   })

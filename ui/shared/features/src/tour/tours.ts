@@ -255,7 +255,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
       target: 'deploy-cli',
       side: 'left',
       title: 'Prefer the terminal?',
-      body: 'Copy the nasiko upload command and deploy from your shell instead.',
+      body: 'Copy the nandatown upload command and deploy from your shell instead.',
     },
   ],
 

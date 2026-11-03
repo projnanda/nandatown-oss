@@ -31,4 +31,4 @@ export function nameFromFile(fileName: string): string {
  * agent name goes into it (never shell characters from a link or a half-typed field); otherwise the placeholder.
  */
 export const uploadCommand = (dir: string) =>
-  `nasiko upload ./${nameProblem(dir) === null ? dir : checkCopy.placeholderDir}`
+  `nandatown upload ./${nameProblem(dir) === null ? dir : checkCopy.placeholderDir}`

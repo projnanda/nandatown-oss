@@ -881,8 +881,8 @@ function FirstRun() {
               <ol className="flex list-decimal flex-col gap-1.5 pl-5">
                 <li>
                   Set <code className="font-mono text-foreground">TEMPO_URL</code> and{' '}
-                  <code className="font-mono text-foreground">LOKI_URL</code> on nasiko-server and
-                  run the OTel collector.
+                  <code className="font-mono text-foreground">LOKI_URL</code> on the server and run
+                  the OTel collector.
                 </li>
                 <li>Deploy an agent and send it a few requests.</li>
                 <li>
@@ -910,7 +910,7 @@ function ServerDown() {
     <StateCard
       tone="error"
       className="mx-auto max-w-xl"
-      title="Can't reach nasiko-server"
+      title="Can't reach the Nandatown server"
       fix={
         <span className="text-xs">
           Or switch to mock data: <code>VITE_NASIKO_API_MODE=mock npm run dev</code>.
@@ -922,9 +922,8 @@ function ServerDown() {
         </Button>
       }
     >
-      The dev proxy couldn't connect to the API. Start the OSS stack in <code>nasiko-cloud-rs</code>{' '}
-      with <code>just run-stack</code>, or point <code>NASIKO_API_URL</code> at a running server and
-      restart <code>npm run dev</code>.
+      The dev proxy couldn't connect to the API. Start the stack with <code>just run-stack</code>,
+      or point the dev proxy's API URL at a running server and restart <code>npm run dev</code>.
     </StateCard>
   )
 }

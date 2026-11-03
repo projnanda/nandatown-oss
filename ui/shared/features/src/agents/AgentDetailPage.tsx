@@ -433,9 +433,9 @@ function Header({
                 ))}
                 {secondary.length ? <DropdownMenuSeparator className="sm:hidden" /> : null}
                 <DropdownMenuLabel>{copy.copyCli}</DropdownMenuLabel>
-                {agent.isHarness ? null : <CopyMenuItem text={`nasiko logs ${agent.id}`} />}
+                {agent.isHarness ? null : <CopyMenuItem text={`nandatown logs ${agent.id}`} />}
                 {agent.canManage && !agent.isHarness ? (
-                  <CopyMenuItem text={`nasiko restart ${agent.id}`} />
+                  <CopyMenuItem text={`nandatown restart ${agent.id}`} />
                 ) : null}
                 <CopyMenuItem text={agent.id} label={copy.copyUuid} />
                 <CopyMenuItem text={link} label={copy.copyLink} />

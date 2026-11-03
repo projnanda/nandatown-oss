@@ -661,7 +661,7 @@ function desktopHandlers(ctx: Ctx): HttpHandler[] {
       const notes = [
         ...(tookOver
           ? [
-              `Took over ${row.name} from the Nasiko CLI; \`nasiko status ${row.id}\` now reports it disconnected.`,
+              `Took over ${row.name} from the Nandatown CLI; \`nandatown status ${row.id}\` now reports it disconnected.`,
             ]
           : []),
         `Restart ${row.name} so it picks up the change.`,

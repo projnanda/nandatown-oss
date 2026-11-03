@@ -250,7 +250,7 @@ describe('the facts moved to Details', () => {
     renderApp(url('?tab=details'))
     for (const name of ['Active version', 'What it does', 'Technical details'])
       expect(await screen.findByRole('heading', { name })).toBeInTheDocument()
-    expect(screen.getByText(`nasiko chat --agent ${agent.id} "hello"`)).toBeInTheDocument()
+    expect(screen.getByText(`nandatown chat --agent ${agent.id} "hello"`)).toBeInTheDocument()
   })
 
   it('Activity no longer lists recent sessions (the hub does)', async () => {

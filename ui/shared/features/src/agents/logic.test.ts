@@ -1,7 +1,7 @@
 /**
  * Agents pure logic (plan §10, unit): status matrix, detail normalization, list dedupe,
  * truth-check / roll back timing, the error table, the URL guard, the retired-strings ban
- * and the first-run commands against the recorded `nasiko --help` output.
+ * and the first-run commands against the recorded `nasiko --help` output (the binary Nandatown installs as `nandatown`).
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -325,23 +325,25 @@ describe('copy', () => {
 })
 
 describe('first-run commands match the installed CLI', () => {
-  const usage = (help: string) => help.match(/^Usage: (.+)$/m)![1]!
+  // The recordings name the binary `nasiko`; Nandatown's installer puts it on the PATH as `nandatown`.
+  const usage = (help: string) =>
+    help.match(/^Usage: (.+)$/m)![1]!.replace(/^nasiko /, 'nandatown ')
   const cmds = firstRunCommands('https://nasiko.example')
 
   it('connect takes the page origin as <TARGET>', () => {
-    expect(usage(connectHelp)).toBe('nasiko connect [OPTIONS] <TARGET>')
-    expect(cmds[0]).toBe('nasiko connect https://nasiko.example')
+    expect(usage(connectHelp)).toBe('nandatown connect [OPTIONS] <TARGET>')
+    expect(cmds[0]).toBe('nandatown connect https://nasiko.example')
   })
 
   it('new takes [TEMPLATE] [NAME], and the template is one the help names', () => {
-    expect(usage(newHelp)).toBe('nasiko new [TEMPLATE] [NAME]')
+    expect(usage(newHelp)).toBe('nandatown new [TEMPLATE] [NAME]')
     const [, , template, name] = cmds[1]!.split(' ')
     expect(newHelp).toContain(template!)
     expect(cmds[2]).toContain(name!)
   })
 
   it('deploy passes the scaffolded directory as the required <IMAGE>', () => {
-    expect(usage(deployHelp)).toBe('nasiko deploy [OPTIONS] <IMAGE>')
+    expect(usage(deployHelp)).toBe('nandatown deploy [OPTIONS] <IMAGE>')
     expect(deployHelp).toMatch(/<IMAGE>\s+Local Docker image or agent directory/)
     expect(cmds[2]!.split(' ')).toHaveLength(3)
   })

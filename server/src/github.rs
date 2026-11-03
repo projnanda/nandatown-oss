@@ -369,7 +369,7 @@ async fn github_callback(
             );
             (
                 StatusCode::CONFLICT,
-                "this GitHub account is already linked to a different Nasiko account",
+                "this GitHub account is already linked to a different Nandatown account",
             )
                 .into_response()
         }

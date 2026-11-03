@@ -145,7 +145,7 @@ describe('browser: the command, no consent', () => {
     expect(
       within(c).getByText('To discover your coding agents and load your previous sessions, run:'),
     ).toBeInTheDocument()
-    expect(within(c).getByText('nasiko agents setup')).toBeInTheDocument()
+    expect(within(c).getByText('nandatown agents setup')).toBeInTheDocument()
     expect(within(c).getByRole('button', { name: 'Copy command' })).toBeInTheDocument()
     expect(within(c).queryByRole('button', { name: 'Yes, find my agents' })).toBeNull()
     await summary()
@@ -263,7 +263,7 @@ describe('browser: progress from the server', () => {
     expect(
       within(c).getByText(agentRow('Claude Code, Import failed: disk read error')),
     ).toBeInTheDocument()
-    expect(within(c).getByText('nasiko agents setup')).toBeInTheDocument()
+    expect(within(c).getByText('nandatown agents setup')).toBeInTheDocument()
   })
 
   it('the live fallback (usage endpoint absent) shows a run too', async () => {
@@ -433,7 +433,7 @@ describe('desktop app: local consent and progress', () => {
       await userEvent.click(within(c).getByRole('button', { name: 'Yes, find my agents' }))
       const alert = await within(c).findByRole('alert')
       expect(alert).toHaveTextContent(
-        "Couldn't reach the Nasiko desktop app: the desktop app could not start the import",
+        "Couldn't reach the Nandatown desktop app: the desktop app could not start the import",
       )
       await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
       expect(

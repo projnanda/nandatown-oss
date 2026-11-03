@@ -2,12 +2,12 @@
 export const copy = {
   title: 'Free TokenOps assessment',
   badge: 'Free developer assessment',
-  headline: 'Get your free assessment scheduled with Nasiko',
+  headline: 'Get your free assessment scheduled with the team',
   lead: 'Are your AI agents using more tokens than expected? Get a clearer picture of your token spend, model usage and the challenges slowing down your agent workflows.',
   points: [
     'Token usage and cost visibility',
     'Agent workflows and model routing',
-    'A direct line to the Nasiko team',
+    'A direct line to the team',
   ],
   form: {
     title: "Let's understand your setup",
@@ -44,7 +44,7 @@ export const copy = {
     title: (name: string) => (name ? `Almost there, ${name}` : 'Almost there'),
     saved: "We've received your answers.",
     notSaved: "We couldn't save your answers, so paste them into the booking note.",
-    line: 'Last step: pick a 30-minute slot with the Nasiko team.',
+    line: 'Last step: pick a 30-minute slot with the team.',
     book: 'Book your assessment',
     pasteHint: 'Paste your answers into the booking note so the team can prepare.',
     copyAnswers: 'Copy your answers',

@@ -269,7 +269,8 @@ export const copy = {
   copyLink: 'Copy link',
   copied: 'Copied',
   copyFailed: 'Copy failed — select and copy manually.',
-  cliNote: "Runs against your CLI's active cluster. Run `nasiko connect <origin>` first if needed.",
+  cliNote:
+    "Runs against your CLI's active cluster. Run `nandatown connect <origin>` first if needed.",
   openAgent: 'Open',
   viewLogs: 'View logs',
   details: 'Details',
@@ -316,7 +317,7 @@ export function errorCopy(err: unknown, context: ErrorContext = 'read'): ErrorCo
   if (s === 500 && context === 'lifecycle')
     return {
       message:
-        "The runtime couldn't find this agent's container. Redeploy it with `nasiko deploy`.",
+        "The runtime couldn't find this agent's container. Redeploy it with `nandatown deploy`.",
       detail,
     }
   if (s === 503) return { message: copy.obsOff, detail }
