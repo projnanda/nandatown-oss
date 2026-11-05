@@ -123,10 +123,16 @@ jobs:
       # If no PAT is in place, pushing upstream-main now fails outright
       # whenever it touches workflow files (see previous step) — it no longer
       # silently falls through to here. When it does succeed without a PAT
-      # (no workflow-file changes in this batch), this step's own fallback
-      # still applies: PR creation may fail, but the run does not; the
-      # tracking branch is already advanced, and this step prints a compare
-      # link to open by hand.
+      # (no workflow-file changes in this batch) but PR creation fails, the
+      # tracking branch is already advanced and this step prints a compare
+      # link to open by hand, then fails the run so someone sees it.
+      #
+      # Every gh call below names the repo with --repo. The previous step adds
+      # a git remote called `upstream`, and gh prefers a remote by that name
+      # over `origin` when it picks the repo to act on, so a bare `gh pr ...`
+      # here targets Nasiko-Labs/nasiko. That is where every create failed
+      # from 2026-10-15 on ("Head ref must be a branch", "No commits between
+      # main and upstream-main"): Nasiko has no upstream-main branch.
       - name: Open or refresh the sync PR
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
@@ -147,7 +153,8 @@ jobs:
 
           # An open PR from the tracking branch now points at the new head,
           # because the branch was just advanced. Refreshing it is enough.
-          EXISTING="$(gh pr list --base "${GITHUB_REF_NAME}" --head "$TRACKING_BRANCH" \
+          EXISTING="$(gh pr list --repo "$GITHUB_REPOSITORY" \
+                        --base "${GITHUB_REF_NAME}" --head "$TRACKING_BRANCH" \
                         --state open --json number --jq '.[0].number // empty')"
           if [ -n "$EXISTING" ]; then
             echo "PR #$EXISTING is open and now carries upstream $UP_SHORT." \
@@ -201,6 +208,7 @@ jobs:
           COMPARE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${GITHUB_REF_NAME}...${TRACKING_BRANCH}"
 
           if gh pr create \
+               --repo "$GITHUB_REPOSITORY" \
                --base "${GITHUB_REF_NAME}" \
                --head "$TRACKING_BRANCH" \
                --title "Sync upstream core through $UP_SHORT" \
@@ -223,4 +231,7 @@ jobs:
             echo "this repository with Contents + Pull requests write."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "::warning::Sync PR not opened automatically; tracking branch is current. See the run summary."
+          # Fail the run. A warning on a green run is what let this go unnoticed
+          # for weeks while upstream piled up on the tracking branch.
+          echo "::error::Sync PR could not be opened; $TRACKING_BRANCH is current but $BEHIND commit(s) are not on ${GITHUB_REF_NAME}. See the run summary."
+          exit 1
