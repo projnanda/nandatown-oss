@@ -7,13 +7,14 @@ COPY src/ /app
 RUN pip install --no-cache-dir \
     click>=8.1.8 \
     httpx>=0.28.1 \
-    langgraph>=0.3.18 \
+    "langgraph>=1.0,<2" \
+    "langgraph-checkpoint>=4.1,<5" \
     langchain-openai>=0.1.0 \
     langchain-core \
     pydantic>=2.10.6 \
     python-dotenv>=1.1.0 \
     uvicorn>=0.34.2 \
-    "a2a-sdk[http-server]==0.3.26" \
+    "a2a-sdk[http-server]==1.1.1" \
     "opentelemetry-sdk>=1.25.0" \
     "opentelemetry-distro>=0.46b0" \
     "opentelemetry-exporter-otlp>=1.25.0" \

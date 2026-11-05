@@ -13,6 +13,8 @@ fn agent_card_construction_with_all_fields() {
         skills: vec!["code-review".to_string(), "refactor".to_string()],
         tags: vec!["engineering".to_string()],
         url: Some("http://localhost:9000".to_string()),
+        embedding: None,
+        embedding_content_hash: None,
     };
     assert_eq!(card.id, id);
     assert_eq!(card.name, "coder");
@@ -29,6 +31,8 @@ fn agent_card_construction_minimal() {
         skills: vec![],
         tags: vec![],
         url: None,
+        embedding: None,
+        embedding_content_hash: None,
     };
     assert!(card.skills.is_empty());
     assert!(card.url.is_none());
@@ -46,6 +50,8 @@ fn agent_card_serializes_to_json() {
         skills: vec!["skill-a".to_string()],
         tags: vec!["tag-x".to_string()],
         url: Some("http://agent:9000".to_string()),
+        embedding: None,
+        embedding_content_hash: None,
     };
     let json = serde_json::to_string(&card).unwrap();
     assert!(json.contains("test-agent"));
@@ -63,6 +69,8 @@ fn agent_card_round_trips_through_json() {
         skills: vec!["s1".to_string(), "s2".to_string()],
         tags: vec!["t1".to_string()],
         url: None,
+        embedding: None,
+        embedding_content_hash: None,
     };
     let json = serde_json::to_string(&original).unwrap();
     let restored: AgentCard = serde_json::from_str(&json).unwrap();
@@ -81,6 +89,8 @@ fn agent_card_with_url_none_omits_null() {
         skills: vec![],
         tags: vec![],
         url: None,
+        embedding: None,
+        embedding_content_hash: None,
     };
     let json = serde_json::to_string(&card).unwrap();
     // url: null is still present (Option serializes as null by default unless skip_serializing_if)
@@ -98,6 +108,7 @@ fn route_request_construction() {
         session_id: "sess-abc".to_string(),
         user_id: Uuid::new_v4(),
         file_parts: vec![],
+        org_granted_agent_ids: vec![],
     };
     assert_eq!(req.query, "what is the status of BTC?");
     assert!(req.file_parts.is_empty());
@@ -111,6 +122,7 @@ fn route_request_with_file_parts() {
         session_id: "sess-xyz".to_string(),
         user_id: Uuid::new_v4(),
         file_parts: vec![fp],
+        org_granted_agent_ids: vec![],
     };
     assert_eq!(req.file_parts.len(), 1);
     assert_eq!(req.file_parts[0].filename, "report.pdf");
@@ -126,6 +138,7 @@ fn route_request_with_multiple_file_parts() {
         session_id: "sess-multi".to_string(),
         user_id: Uuid::nil(),
         file_parts: vec![fp1, fp2],
+        org_granted_agent_ids: vec![],
     };
     assert_eq!(req.file_parts.len(), 2);
 }

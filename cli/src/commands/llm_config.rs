@@ -6,10 +6,130 @@
 //! `GET /api/llm-router/providers` (the catalog of valid provider/model values).
 
 use anyhow::Result;
+use nasiko_utils::term;
 use serde_json::{Value, json};
 
-use crate::api::Client;
+use crate::EmbeddingArgs;
+use crate::api::{ApiFailure, Attempt, Client, unwrap_data};
 use crate::commands::agents::resolve_agent_id;
+
+/// The `code` the server returns when an embedding provider/model change needs the
+/// caller's explicit acknowledgement. Must match `oss/server/src/embedding_change.rs`.
+const EMBEDDING_CONFIRM_CODE: &str = "embedding_change_requires_confirmation";
+
+/// The embedding side of `llm-config update`, grouped so the already-long parameter list
+/// doesn't grow by three more positional booleans.
+pub struct EmbeddingUpdate {
+    pub args: EmbeddingArgs,
+    /// `--clear-embedding-model`: unset the destination entirely.
+    pub clear: bool,
+    /// `--yes`: confirm a destructive embedding change without prompting.
+    pub confirmed: bool,
+}
+
+/// Per-config tier → model overrides, named the way people talk about them. The API (and the
+/// router) number tiers by strength: 1 = strongest, 3 = smallest, so HIGH is `tier1_model`.
+/// The router only consults these when the config is not pinned.
+#[derive(Default)]
+pub struct TierModels {
+    pub high: Option<String>,
+    pub mid: Option<String>,
+    pub low: Option<String>,
+}
+
+/// `(api field, label)` for each tier, strongest first.
+const TIER_FIELDS: [(&str, &str); 3] = [
+    ("tier1_model", "high"),
+    ("tier2_model", "mid"),
+    ("tier3_model", "low"),
+];
+
+impl TierModels {
+    fn values(&self) -> [&Option<String>; 3] {
+        [&self.high, &self.mid, &self.low]
+    }
+}
+
+/// `high=… mid=… low=…` for the tiers a config sets, or `None` when it sets none.
+fn tier_summary(cfg: &Value) -> Option<String> {
+    let parts: Vec<String> = TIER_FIELDS
+        .iter()
+        .filter_map(|(field, label)| {
+            cfg.get(*field)
+                .and_then(|v| v.as_str())
+                .map(|m| format!("{label}={m}"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// Embedding fields as the API expects them, folded into a request body.
+fn embedding_body_fields(args: &EmbeddingArgs) -> Vec<(&'static str, Value)> {
+    vec![
+        ("embedding_provider", json!(args.embedding_provider)),
+        ("embedding_model", json!(args.embedding_model)),
+        (
+            "embedding_api_key_secret_name",
+            json!(args.embedding_secret_name),
+        ),
+        ("embedding_secret_value", json!(args.embedding_secret_value)),
+    ]
+}
+
+/// Send a request, and on the server's 428 show the exact transition and ask once.
+///
+/// The rule lives on the server (both write surfaces enforce it), so this function never
+/// decides *whether* a change is dangerous — it only relays the server's answer and
+/// retries with the flag. Any other failure is returned unchanged, so error messages are
+/// identical to every other command's.
+fn send_with_embedding_confirmation<F>(mut send: F, already_confirmed: bool) -> Result<Value>
+where
+    F: FnMut(bool) -> Result<Attempt<Value>>,
+{
+    match send(already_confirmed)? {
+        Attempt::Ok(v) => Ok(v),
+        Attempt::Rejected(failure) => {
+            if already_confirmed || failure.code() != Some(EMBEDDING_CONFIRM_CODE) {
+                return Err(failure.into_error());
+            }
+            if !confirm_embedding_change(&failure)? {
+                anyhow::bail!("Cancelled; the embedding model was not changed.");
+            }
+            match send(true)? {
+                Attempt::Ok(v) => Ok(v),
+                Attempt::Rejected(f) => Err(f.into_error()),
+            }
+        }
+    }
+}
+
+/// Show the server's `from` → `to` and ask. Without a TTY there is nobody to ask, so we
+/// fail with the server's own wording rather than blocking forever — `--yes` is the
+/// non-interactive path.
+fn confirm_embedding_change(failure: &ApiFailure) -> Result<bool> {
+    let side = |key: &str| -> String {
+        let Some(v) = failure.details().and_then(|d| d.get(key)) else {
+            return "none".to_string();
+        };
+        let field = |k: &str| v.get(k).and_then(|x| x.as_str());
+        match (field("provider"), field("model")) {
+            (Some(p), Some(m)) => format!("{p}/{m}"),
+            (Some(p), None) => p.to_string(),
+            (None, Some(m)) => m.to_string(),
+            (None, None) => "none".to_string(),
+        }
+    };
+    println!("{}", failure.message());
+    println!("  from: {}", side("from"));
+    println!("    to: {}", side("to"));
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!("Refusing to change the embedding model without confirmation; pass --yes.");
+    }
+    Ok(dialoguer::Confirm::new()
+        .with_prompt("Change the embedding model anyway?")
+        .default(false)
+        .interact()?)
+}
 
 /// `nasiko llm-config create --name … --provider … --model …` — add a reusable config.
 #[allow(clippy::too_many_arguments)]
@@ -24,10 +144,12 @@ pub fn create(
     secret_value: Option<String>,
     pin: bool,
     pinned_model: Option<String>,
+    tiers: TierModels,
     default: bool,
+    embedding: EmbeddingArgs,
 ) -> Result<()> {
     let client = Client::from_active_cluster()?;
-    let body = json!({
+    let mut body = json!({
         "name": name,
         "provider": provider,
         "model": model,
@@ -39,9 +161,23 @@ pub fn create(
         "pinned": pin,
         "pinned_model": pinned_model,
         "is_default": default,
+        "embedding_model_override": embedding.embedding_model_override,
     });
+    for (key, value) in embedding_body_fields(&embedding) {
+        body[key] = value;
+    }
+    for ((field, _), value) in TIER_FIELDS.iter().zip(tiers.values()) {
+        body[*field] = json!(value);
+    }
     let _: Value = client.post_json("/llm-configs", &body)?;
-    println!("Created LLM config '{name}' → {provider}/{model}");
+    term::print_success(&format!("Created LLM config '{name}' → {provider}/{model}"));
+    print_tier_note(&body);
+    if let (Some(p), Some(m)) = (&embedding.embedding_provider, &embedding.embedding_model) {
+        println!("  embeddings → {p}/{m}");
+        if embedding.embedding_model_override {
+            println!("  this embedding model overrides whatever the agent asks for");
+        }
+    }
     if default {
         println!("  marked as your default");
     }
@@ -55,14 +191,20 @@ pub fn create(
 /// `nasiko llm-config list` — show the configs in your library.
 pub fn list(json_out: bool) -> Result<()> {
     let client = Client::from_active_cluster()?;
-    let configs: Vec<Value> = client.get_json("/llm-configs")?;
+    let configs: Vec<Value> = unwrap_data(client.get_json("/llm-configs")?)?;
 
     if json_out {
         println!("{}", serde_json::to_string_pretty(&configs)?);
         return Ok(());
     }
     if configs.is_empty() {
-        println!("No LLM configs in your library. Create one with `nasiko llm-config create`.");
+        term::print_info(&format!(
+            "No LLM configs in your library. Create one with `{}`.",
+            term::cyan(&format!(
+                "{} create",
+                crate::commands::local_agents::llm_config_hint()
+            ))
+        ));
         return Ok(());
     }
     println!("Your LLM configs:");
@@ -74,8 +216,27 @@ pub fn list(json_out: bool) -> Result<()> {
             .get("is_default")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let marker = if is_default { " (default)" } else { "" };
-        println!("  {name:<24} {provider}/{model}{marker}");
+        let marker = if is_default {
+            format!(" {}", term::green("(default)"))
+        } else {
+            String::new()
+        };
+        let embedding = match (
+            c.get("embedding_provider").and_then(|v| v.as_str()),
+            c.get("embedding_model").and_then(|v| v.as_str()),
+        ) {
+            (Some(p), Some(m)) => format!("  embeddings: {p}/{m}"),
+            _ => String::new(),
+        };
+        let pinned = if c.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false) {
+            format!(" {}", term::yellow("[pinned]"))
+        } else {
+            String::new()
+        };
+        let tiers = tier_summary(c)
+            .map(|t| format!("  tiers: {t}"))
+            .unwrap_or_default();
+        println!("  {name:<24} {provider}/{model}{marker}{pinned}{tiers}{embedding}");
     }
     Ok(())
 }
@@ -103,12 +264,21 @@ pub fn update(
     no_pin: bool,
     pinned_model: Option<String>,
     clear_pinned_model: bool,
+    tiers: TierModels,
+    embedding: EmbeddingUpdate,
 ) -> Result<()> {
     if pin && no_pin {
         anyhow::bail!("--pin and --no-pin are mutually exclusive");
     }
     if clear_pinned_model && pinned_model.is_some() {
         anyhow::bail!("--clear-pinned-model and --pinned-model are mutually exclusive");
+    }
+    if embedding.clear
+        && (embedding.args.embedding_provider.is_some() || embedding.args.embedding_model.is_some())
+    {
+        anyhow::bail!(
+            "--clear-embedding-model cannot be combined with --embedding-provider/--embedding-model"
+        );
     }
     let client = Client::from_active_cluster()?;
     let existing = fetch_config_by_ref(&client, config)?;
@@ -128,7 +298,7 @@ pub fn update(
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
     };
-    let body = build_update_body(
+    let mut body = build_update_body(
         &existing,
         name,
         provider,
@@ -142,12 +312,29 @@ pub fn update(
         pinned,
         pinned_model,
         clear_pinned_model,
+        &tiers,
     );
-    let _: Value = client.patch_json(&format!("/llm-configs/{id}"), &body)?;
+    for (key, value) in embedding_body_fields(&embedding.args) {
+        body[key] = value;
+    }
+    body["clear_embedding_model"] = json!(embedding.clear);
+    if embedding.args.embedding_model_override {
+        body["embedding_model_override"] = json!(true);
+    }
+    // The server owns the rule; this only relays its 428 and retries once confirmed.
+    send_with_embedding_confirmation(
+        |confirmed| {
+            let mut attempt_body = body.clone();
+            attempt_body["confirm_embedding_change"] = json!(confirmed);
+            client.patch_json_attempt(&format!("/llm-configs/{id}"), &attempt_body)
+        },
+        embedding.confirmed,
+    )?;
 
     let p = body.get("provider").and_then(|v| v.as_str()).unwrap_or("?");
     let m = body.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-    println!("Updated LLM config '{config}' → {p}/{m}");
+    term::print_success(&format!("Updated LLM config '{config}' → {p}/{m}"));
+    print_tier_note(&body);
     if body
         .get("pinned")
         .and_then(|v| v.as_bool())
@@ -160,6 +347,21 @@ pub fn update(
         println!("  pinned to {pinned_to} (smart router will not re-select)");
     }
     Ok(())
+}
+
+/// Echo the tiers a create/update body carries, and say plainly when a pin makes them inert.
+fn print_tier_note(body: &Value) {
+    let Some(tiers) = tier_summary(body) else {
+        return;
+    };
+    println!("  tiers: {tiers}");
+    if body
+        .get("pinned")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        println!("  note: the config is pinned, so the router ignores these tiers (use --no-pin)");
+    }
 }
 
 /// Build the `PATCH /llm-configs/{id}` body by overlaying the caller's flags over the existing
@@ -180,6 +382,7 @@ fn build_update_body(
     pinned: bool,
     pinned_model: Option<String>,
     clear_pinned_model: bool,
+    tiers: &TierModels,
 ) -> Value {
     let keep_str = |field: &str| {
         existing
@@ -208,7 +411,7 @@ fn build_update_body(
             })
             .unwrap_or_default()
     };
-    json!({
+    let mut body = json!({
         // Server COALESCEs a null name to the current one, so an omitted --name is a no-op rename.
         "name": name,
         "provider": provider.or_else(|| keep_str("provider")),
@@ -220,7 +423,13 @@ fn build_update_body(
         "secret_value": secret_value,
         "pinned": pinned,
         "pinned_model": pinned_model,
-    })
+    });
+    // A tier flag sets that tier; an omitted one keeps the current model. The server
+    // COALESCEs tiers, so a tier can be changed here but not cleared.
+    for ((field, _), value) in TIER_FIELDS.iter().zip(tiers.values()) {
+        body[*field] = json!(value.clone().or_else(|| keep_str(field)));
+    }
+    body
 }
 
 /// `nasiko llm-config delete <name|id>` — soft-delete a config from your library. The server
@@ -239,7 +448,7 @@ pub fn delete(config: &str, force: bool) -> Result<()> {
         }
     }
     client.delete(&format!("/llm-configs/{id}"))?;
-    println!("Deleted LLM config '{config}'");
+    term::print_success(&format!("Deleted LLM config '{config}'"));
     Ok(())
 }
 
@@ -248,7 +457,7 @@ pub fn set_default(config: &str) -> Result<()> {
     let client = Client::from_active_cluster()?;
     let id = resolve_config_id(&client, config)?;
     client.post_void(&format!("/llm-configs/{id}/default"))?;
-    println!("'{config}' is now your default LLM config");
+    term::print_success(&format!("'{config}' is now your default LLM config"));
     Ok(())
 }
 
@@ -259,7 +468,7 @@ pub fn attach(agent: &str, config: &str, inbound_format: Option<String>) -> Resu
     let id = resolve_config_id(&client, config)?;
     let body = json!({ "llm_config_id": id, "inbound_format": inbound_format });
     let _: Value = client.patch_json(&format!("/agents/{agent_id}/llm-config"), &body)?;
-    println!("Attached config '{config}' to agent '{agent}'");
+    term::print_success(&format!("Attached config '{config}' to agent '{agent}'"));
     Ok(())
 }
 
@@ -270,7 +479,9 @@ pub fn detach(agent: &str) -> Result<()> {
     // Explicit JSON null ⇒ detach (vs. an absent field, which leaves it unchanged).
     let body = json!({ "llm_config_id": Value::Null });
     let _: Value = client.patch_json(&format!("/agents/{agent_id}/llm-config"), &body)?;
-    println!("Detached the config from agent '{agent}' (now uses your default, if any)");
+    term::print_success(&format!(
+        "Detached the config from agent '{agent}' (now uses your default, if any)"
+    ));
     Ok(())
 }
 
@@ -278,7 +489,7 @@ pub fn detach(agent: &str) -> Result<()> {
 pub fn get(agent: &str, json_out: bool) -> Result<()> {
     let client = Client::from_active_cluster()?;
     let agent_id = resolve_agent_id(agent)?;
-    let resp: Value = client.get_json(&format!("/agents/{agent_id}/llm-config"))?;
+    let resp: Value = unwrap_data(client.get_json(&format!("/agents/{agent_id}/llm-config"))?)?;
 
     if json_out {
         println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -318,6 +529,9 @@ pub fn get(agent: &str, json_out: bool) -> Result<()> {
             print_field("api_key_secret_name", cfg.get("api_key_secret_name"));
             print_field("pinned", cfg.get("pinned"));
             print_field("pinned_model", cfg.get("pinned_model"));
+            for (field, label) in TIER_FIELDS {
+                print_field(&format!("{label} ({field})"), cfg.get(field));
+            }
         }
         // llm_config is null ⇒ no attached config and no owner default (platform defaults apply).
         _ => println!("  (none — using platform default routing)"),
@@ -329,7 +543,7 @@ pub fn get(agent: &str, json_out: bool) -> Result<()> {
 /// `nasiko llm-config providers` — list the provider/model catalog (valid values for `create`).
 pub fn providers(json_out: bool) -> Result<()> {
     let client = Client::from_active_cluster()?;
-    let resp: Vec<Value> = client.get_json("/llm-router/providers")?;
+    let resp: Vec<Value> = unwrap_data(client.get_json("/llm-router/providers")?)?;
 
     if json_out {
         println!("{}", serde_json::to_string_pretty(&resp)?);
@@ -370,8 +584,8 @@ pub fn providers(json_out: bool) -> Result<()> {
 }
 
 /// Fetch one config (full JSON) by name or UUID from the caller's library.
-fn fetch_config_by_ref(client: &Client, config: &str) -> Result<Value> {
-    let configs: Vec<Value> = client.get_json("/llm-configs")?;
+pub(crate) fn fetch_config_by_ref(client: &Client, config: &str) -> Result<Value> {
+    let configs: Vec<Value> = unwrap_data(client.get_json("/llm-configs")?)?;
     for c in &configs {
         let id = c.get("id").and_then(|v| v.as_str());
         let name = c.get("name").and_then(|v| v.as_str());
@@ -450,6 +664,7 @@ mod tests {
             pinned,
             pinned_model.map(String::from),
             clear_pinned_model,
+            &TierModels::default(),
         )
     }
 
@@ -586,5 +801,47 @@ mod tests {
         let cleared = build(&existing, None, None, None, vec![], false, true, None, true);
         assert!(cleared["pinned_model"].is_null());
         assert_eq!(cleared["pinned"], true);
+    }
+
+    #[test]
+    fn update_sets_given_tiers_and_keeps_the_rest() {
+        let mut existing = sample();
+        existing["tier1_model"] = json!("gpt-5.4");
+        existing["tier3_model"] = json!("gpt-4.1-nano");
+        let tiers = TierModels {
+            mid: Some("gpt-4.1".into()),
+            low: Some("gpt-4o-mini".into()),
+            ..TierModels::default()
+        };
+        let body = build_update_body(
+            &existing,
+            None,
+            None,
+            None,
+            vec![],
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            false,
+            &tiers,
+        );
+        assert_eq!(body["tier1_model"], "gpt-5.4");
+        assert_eq!(body["tier2_model"], "gpt-4.1");
+        assert_eq!(body["tier3_model"], "gpt-4o-mini");
+    }
+
+    #[test]
+    fn tier_summary_lists_set_tiers_strongest_first() {
+        let cfg =
+            json!({"tier1_model": "gpt-5.4", "tier2_model": null, "tier3_model": "gpt-4.1-nano"});
+        assert_eq!(
+            tier_summary(&cfg).as_deref(),
+            Some("high=gpt-5.4 low=gpt-4.1-nano")
+        );
+        assert_eq!(tier_summary(&sample()), None);
     }
 }

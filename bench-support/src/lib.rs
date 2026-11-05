@@ -3,7 +3,7 @@
 //! LLM cost.
 //!
 //! Two consumers:
-//! - `cargo bench` targets (`oss/server/benches`, `ee/server/benches`) use
+//! - `cargo bench` targets (`oss/server/benches` and the enterprise equivalent) use
 //!   every module in-process: sim agent + mock LLM + `SimulatedRuntime` +
 //!   the real server, all inside one criterion binary.
 //! - The Goose load generator (`oss/bench`) runs against a separately
@@ -11,6 +11,7 @@
 //!   ships as a standalone binary (`src/bin/mock_llm.rs`) a developer points
 //!   `OPENAI_BASE_URL` at when starting the server with `AGENT_RUNTIME=simulated`.
 
+pub mod coding_agent_import;
 pub mod config;
 pub mod mock_llm;
 pub mod seed;

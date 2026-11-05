@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use nasiko_types::{CodingAgentEventBatchRequest, CodingAgentEventBatchResponse};
 use nasiko_utils::display::opt_dash;
 use serde::{Deserialize, Serialize};
 use tabled::Tabled;
@@ -15,9 +16,75 @@ fn check_status(resp: &mut ureq::http::Response<ureq::Body>, url: &str) -> Resul
         return Ok(());
     }
     let body = resp.body_mut().read_to_string().unwrap_or_default();
-    let detail = extract_error_detail(&body);
-    let hint = status_hint(status);
-    bail!("HTTP {status} from {url}: {detail}{hint}");
+    Err(ApiFailure::new(status, url, body).into_error())
+}
+
+/// A non-2xx response, kept as data so a caller can branch on the status and the body
+/// instead of only printing them.
+///
+/// [`check_status`] flattens every failure into one message, which is right for the
+/// ~50 call sites that can only report it. It is wrong for a status the CLI is expected
+/// to *handle* — the `428` that asks the user to confirm an embedding-model change is
+/// only useful if the command can read the code and the `from`/`to` it carries. Anything
+/// the caller chooses not to handle goes back through [`Self::into_error`] and produces
+/// the identical message it would have had.
+pub struct ApiFailure {
+    pub status: u16,
+    /// Parsed response body, when it was JSON.
+    pub body: Option<serde_json::Value>,
+    detail: String,
+    url: String,
+    /// The `Retry-After` header, as sent: delay-seconds or an HTTP-date.
+    retry_after: Option<String>,
+}
+
+impl ApiFailure {
+    fn new(status: u16, url: &str, raw: String) -> Self {
+        Self {
+            status,
+            body: serde_json::from_str(&raw).ok(),
+            detail: extract_error_detail(&raw),
+            url: url.to_string(),
+            retry_after: None,
+        }
+    }
+
+    /// The `Retry-After` header the server sent with this failure (a `429` or `503`), as sent.
+    pub fn retry_after(&self) -> Option<&str> {
+        self.retry_after.as_deref()
+    }
+
+    /// The machine-readable `code` slug (`API_CONVENTIONS` §2), when the body carries one.
+    pub fn code(&self) -> Option<&str> {
+        self.body.as_ref()?.get("code")?.as_str()
+    }
+
+    /// The `details` object clients switch on for structured context.
+    pub fn details(&self) -> Option<&serde_json::Value> {
+        self.body.as_ref()?.get("details")
+    }
+
+    /// The human-readable message from the body.
+    pub fn message(&self) -> &str {
+        &self.detail
+    }
+
+    /// The error this failure would have produced had the caller not handled it.
+    pub fn into_error(self) -> anyhow::Error {
+        let hint = status_hint(self.status);
+        anyhow::anyhow!(
+            "HTTP {} from {}: {}{hint}",
+            self.status,
+            self.url,
+            self.detail
+        )
+    }
+}
+
+/// A request whose non-2xx outcome the caller handles itself.
+pub enum Attempt<T> {
+    Ok(T),
+    Rejected(ApiFailure),
 }
 
 /// Pull a human-readable message out of a server error body.
@@ -86,17 +153,28 @@ pub struct Client {
 impl Client {
     pub fn from_active_cluster() -> Result<Self> {
         let (_, entry) = config::active_cluster()?;
+        Ok(Self::from_cluster_entry(&entry))
+    }
+
+    pub(crate) fn from_cluster_entry(entry: &config::ClusterEntry) -> Self {
+        Self::from_cluster_entry_with_timeout(entry, None)
+    }
+
+    pub(crate) fn from_cluster_entry_with_timeout(
+        entry: &config::ClusterEntry,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
         let agent = Agent::new_with_config(
             ureq::config::Config::builder()
-                .timeout_global(None)
+                .timeout_global(timeout)
                 .http_status_as_error(false)
                 .build(),
         );
-        Ok(Self {
+        Self {
             agent,
             base_url: entry.url.clone(),
-            token: entry.token,
-        })
+            token: entry.token.clone(),
+        }
     }
 
     /// Build a client against an arbitrary base URL (mock server in tests),
@@ -177,22 +255,34 @@ impl Client {
         Ok(resp.body_mut().read_json()?)
     }
 
-    /// GET returning `Ok(None)` on 404 instead of erroring, while still bailing
-    /// on other failures. Lets callers tell "resource is gone" (e.g. a stale
-    /// local agent binding after a server-side delete / DB reset) apart from a
-    /// real error, so they can recover rather than fail.
-    pub fn get_json_optional<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<Option<T>> {
+    /// GET that answers `Ok(Err(status))` instead of failing when the response status is one of
+    /// `expected` — for callers that treat, say, a 404 as an answer rather than an error. Every
+    /// other failure still fails.
+    pub fn get_json_or_status<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        expected: &[u16],
+    ) -> Result<std::result::Result<T, u16>> {
         let _spin = nasiko_utils::term::start_status(format!("GET {path}"));
         let url = self.api_url(path);
         let mut resp = self
             .auth_get(&url)
             .call()
             .context("cannot reach control plane")?;
-        if resp.status().as_u16() == 404 {
-            return Ok(None);
+        let status = resp.status().as_u16();
+        if expected.contains(&status) {
+            return Ok(Err(status));
         }
         check_status(&mut resp, &url)?;
-        Ok(Some(resp.body_mut().read_json()?))
+        Ok(Ok(resp.body_mut().read_json()?))
+    }
+
+    /// GET returning `Ok(None)` on 404 instead of erroring, while still bailing
+    /// on other failures. Lets callers tell "resource is gone" (e.g. a stale
+    /// local agent binding after a server-side delete / DB reset) apart from a
+    /// real error, so they can recover rather than fail.
+    pub fn get_json_optional<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<Option<T>> {
+        Ok(self.get_json_or_status(path, &[404])?.ok())
     }
 
     /// GET returning `Ok(None)` on 403 instead of erroring. For endpoints where
@@ -203,14 +293,7 @@ impl Client {
         &self,
         path: &str,
     ) -> Result<Option<T>> {
-        let _spin = nasiko_utils::term::start_status(format!("GET {path}"));
-        let url = self.api_url(path);
-        let mut resp = self.auth_get(&url).call().context("request failed")?;
-        if resp.status().as_u16() == 403 {
-            return Ok(None);
-        }
-        check_status(&mut resp, &url)?;
-        Ok(Some(resp.body_mut().read_json()?))
+        Ok(self.get_json_or_status(path, &[403])?.ok())
     }
 
     pub fn get_text(&self, path: &str) -> Result<String> {
@@ -239,12 +322,44 @@ impl Client {
         Ok(resp.body_mut().read_json()?)
     }
 
+    /// Authenticated JSON POST without terminal status output. Credential helpers
+    /// must write only the credential itself to stdout.
+    pub(crate) fn post_json_quiet<T: for<'de> Deserialize<'de>, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = self.api_url(path);
+        let mut resp = self
+            .auth_post(&url)
+            .send_json(body)
+            .context("cannot reach control plane")?;
+        check_status(&mut resp, &url)?;
+        Ok(resp.body_mut().read_json()?)
+    }
+
     pub fn put_json<T: for<'de> Deserialize<'de>, B: Serialize>(
         &self,
         path: &str,
         body: &B,
     ) -> Result<T> {
         let _spin = nasiko_utils::term::start_status(format!("PUT {path}"));
+        let url = self.api_url(path);
+        let mut resp = self
+            .auth_put(&url)
+            .send_json(body)
+            .context("cannot reach control plane")?;
+        check_status(&mut resp, &url)?;
+        Ok(resp.body_mut().read_json()?)
+    }
+
+    /// Authenticated JSON PUT without terminal status output, for calls made while a progress line
+    /// owns the terminal.
+    pub(crate) fn put_json_quiet<T: for<'de> Deserialize<'de>, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
         let url = self.api_url(path);
         let mut resp = self
             .auth_put(&url)
@@ -269,6 +384,57 @@ impl Client {
         Ok(resp.body_mut().read_json()?)
     }
 
+    /// POST that hands a non-2xx back as [`ApiFailure`] rather than bailing, so the
+    /// caller can act on it (see [`ApiFailure`]). Transport faults still error.
+    pub fn post_json_attempt<T: for<'de> Deserialize<'de>, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<Attempt<T>> {
+        let _spin = nasiko_utils::term::start_status(format!("POST {path}"));
+        let url = self.api_url(path);
+        let mut resp = self
+            .auth_post(&url)
+            .send_json(body)
+            .context("cannot reach control plane")?;
+        Self::into_attempt(&mut resp, &url)
+    }
+
+    /// PATCH counterpart of [`Self::post_json_attempt`].
+    pub fn patch_json_attempt<T: for<'de> Deserialize<'de>, B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<Attempt<T>> {
+        let _spin = nasiko_utils::term::start_status(format!("PATCH {path}"));
+        let url = self.api_url(path);
+        let mut resp = self
+            .auth_patch(&url)
+            .send_json(body)
+            .context("cannot reach control plane")?;
+        Self::into_attempt(&mut resp, &url)
+    }
+
+    fn into_attempt<T: for<'de> Deserialize<'de>>(
+        resp: &mut ureq::http::Response<ureq::Body>,
+        url: &str,
+    ) -> Result<Attempt<T>> {
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let raw = resp.body_mut().read_to_string().unwrap_or_default();
+            return Ok(Attempt::Rejected(ApiFailure {
+                retry_after,
+                ..ApiFailure::new(status, url, raw)
+            }));
+        }
+        Ok(Attempt::Ok(resp.body_mut().read_json()?))
+    }
+
     /// POST with no body and ignore the response body (for endpoints that return 200/204 with no JSON).
     pub fn post_void(&self, path: &str) -> Result<()> {
         let _spin = nasiko_utils::term::start_status(format!("POST {path}"));
@@ -291,6 +457,30 @@ impl Client {
             .context("cannot reach control plane")?;
         check_status(&mut resp, &url)?;
         Ok(())
+    }
+
+    /// Delivers a batch of coding-agent events. A non-2xx comes back as [`Attempt::Rejected`], so
+    /// delivery can tell a refusal it should give up on from one worth retrying; a transport fault or a
+    /// response it can't read is an error.
+    pub(crate) fn post_coding_agent_batch(
+        &self,
+        body: &CodingAgentEventBatchRequest,
+    ) -> Result<Attempt<CodingAgentEventBatchResponse>> {
+        let path = "/telemetry/coding-agent/events/batch";
+        let url = self.api_url(path);
+        let mut resp = self
+            .auth_post(&url)
+            .send_json(body)
+            .context("cannot reach control plane")?;
+        let envelope = match Self::into_attempt::<serde_json::Value>(&mut resp, &url)
+            .with_context(|| format!("invalid coding-agent batch response from {url}"))?
+        {
+            Attempt::Ok(envelope) => envelope,
+            Attempt::Rejected(failure) => return Ok(Attempt::Rejected(failure)),
+        };
+        unwrap_data(envelope)
+            .map(Attempt::Ok)
+            .with_context(|| format!("invalid coding-agent batch response from {url}"))
     }
 
     pub fn delete(&self, path: &str) -> Result<()> {
@@ -383,9 +573,48 @@ impl Client {
         Ok(resp.body_mut().read_json()?)
     }
 
+    // ─── LLM router surface (no /api prefix, agent-scoped credential) ───────
+
+    /// POST a JSON body to a non-`/api` path with an explicit bearer token, returning the
+    /// HTTP status and the raw body without treating a non-2xx as an error. The LLM
+    /// router's `/v1/*` routes authenticate an agent's own routing credential rather than
+    /// the user session (`server/src/lib.rs:388`), and the only caller — the coding-agent
+    /// connect preflight — needs the status itself to tell a rejected configuration apart
+    /// from an unreachable upstream.
+    pub(crate) fn post_raw_with_token<B: Serialize>(
+        &self,
+        path: &str,
+        token: &str,
+        body: &B,
+    ) -> Result<(u16, String)> {
+        let url = self.raw_url(path);
+        let mut resp = self
+            .agent
+            .post(&url)
+            .header("Authorization", &format!("Bearer {token}"))
+            .send_json(body)
+            .context("cannot reach control plane")?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .body_mut()
+            .read_to_string()
+            .with_context(|| format!("unreadable response body from {url}"))?;
+        Ok((status, body))
+    }
+
     pub fn health_check(url: &str) -> Result<()> {
+        Self::health_check_with_timeout(url, None)
+    }
+
+    /// [`Self::health_check`] bounded by `timeout`, so a probe against an address that never
+    /// answers fails instead of hanging.
+    pub(crate) fn health_check_with_timeout(
+        url: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
         let agent = Agent::new_with_config(
             ureq::config::Config::builder()
+                .timeout_global(timeout)
                 .http_status_as_error(false)
                 .build(),
         );
@@ -714,6 +943,7 @@ impl Client {
         env: &std::collections::HashMap<String, String>,
         writable: bool,
         writable_path: Option<&str>,
+        workload_kind: Option<&str>,
     ) -> anyhow::Result<UploadQueued> {
         let file_bytes = std::fs::read(zip_path)
             .with_context(|| format!("cannot read {}", zip_path.display()))?;
@@ -760,6 +990,12 @@ impl Client {
         if let Some(path) = writable_path {
             body.extend_from_slice(
                 format!("--{boundary}\r\nContent-Disposition: form-data; name=\"writable_path\"\r\n\r\n{path}\r\n").as_bytes(),
+            );
+        }
+        // workload_kind (acp_coding_agent marks an ACP coding agent)
+        if let Some(kind) = workload_kind {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"workload_kind\"\r\n\r\n{kind}\r\n").as_bytes(),
             );
         }
         // file (the zip file)
@@ -908,12 +1144,34 @@ impl Client {
         drop(spin);
 
         if failed {
+            if let Some(msg) = self.version_conflict_message(build_id) {
+                bail!("{msg}");
+            }
             bail!("build failed");
         }
         if !succeeded {
             bail!("build did not complete successfully");
         }
         Ok(())
+    }
+
+    /// Checks `/agents/uploads/{build_id}` for a `VERSION_CONFLICT:` error
+    /// detail and formats it into a helpful message, instead of the generic
+    /// "build failed" [`poll_build_status`] would otherwise print.
+    ///
+    /// Wire format: `VERSION_CONFLICT:<version>:<suggested>:<message>`.
+    fn version_conflict_message(&self, build_id: &str) -> Option<String> {
+        let item: serde_json::Value = self.get_json(&format!("/agents/uploads/{build_id}")).ok()?;
+        let detail = item.get("error_details")?.get(0)?.as_str()?;
+        let rest = detail.strip_prefix("VERSION_CONFLICT:")?;
+        let mut parts = rest.splitn(3, ':');
+        let _version = parts.next()?;
+        let suggested = parts.next()?;
+        let message = parts.next().unwrap_or("").trim();
+        Some(format!(
+            "Import failed: {message}.\n\nSuggested next version: {suggested}\n\n\
+             Update the version and import again."
+        ))
     }
 
     /// Upload a zip file to `POST /api/mcp/connectors/upload` and return the
@@ -1069,6 +1327,14 @@ pub struct AgentRecord {
     pub id: String,
     #[tabled(rename = "NAME")]
     pub name: String,
+    /// The server's human-facing label (e.g. "Claude Code (ankit@nasiko.com)")
+    /// — same string the web UI shows. `None` for agents registered before
+    /// the server started returning it. `name` above stays the real
+    /// identifier used everywhere else (chat targeting, resolution); this is
+    /// display-only, rendered by `cmd_ls` in place of `name` when present.
+    #[tabled(skip)]
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[tabled(rename = "STATUS", display = "opt_dash")]
     #[serde(default)]
     pub status: Option<String>,
@@ -1082,6 +1348,12 @@ pub struct AgentRecord {
     #[tabled(skip)]
     #[serde(default)]
     pub transport_path: Option<String>,
+    /// `agent` (default) | `mcp_connector` | `acp_coding_agent`. Lets `chat` label
+    /// the agent's kind and `--coding-agent` assert on it. `None` from an older
+    /// server that doesn't return it.
+    #[tabled(skip)]
+    #[serde(default)]
+    pub workload_kind: Option<String>,
     #[tabled(skip)]
     #[serde(default)]
     pub framework: Option<String>,
@@ -1244,10 +1516,33 @@ impl Client {
             .collect())
     }
 
+    /// The exact history status of one specific version ("pushed", "active",
+    /// "archived"), or `None` if this version has never been recorded at
+    /// all. Unlike [`Client::used_versions`], this does NOT exclude
+    /// `"pushed"` rows — `push` needs to see them to reject re-pushing an
+    /// already-pushed version instead of silently repointing its registry
+    /// tag.
+    pub fn version_status(&self, agent_id: &str, version: &str) -> Result<Option<String>> {
+        Ok(self
+            .version_history(agent_id)?
+            .into_iter()
+            .find(|v| v.version == version)
+            .map(|v| v.status))
+    }
+
     /// Looks up an agent by UUID or name. `None` if it doesn't exist yet.
     pub fn get_agent(&self, id_or_name: &str) -> Result<Option<serde_json::Value>> {
+        Ok(self.get_agent_or_status(id_or_name, &[404])?.ok())
+    }
+
+    /// [`Client::get_agent`], answering `Ok(Err(status))` for each of `expected`.
+    pub fn get_agent_or_status(
+        &self,
+        id_or_name: &str,
+        expected: &[u16],
+    ) -> Result<std::result::Result<serde_json::Value, u16>> {
         Ok(self
-            .get_json_optional::<serde_json::Value>(&format!("/agents/{id_or_name}"))?
+            .get_json_or_status::<serde_json::Value>(&format!("/agents/{id_or_name}"), expected)?
             .map(|raw| raw.get("data").cloned().unwrap_or(raw)))
     }
 }
@@ -1264,6 +1559,10 @@ pub struct DeploySpec {
     pub writable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writable_path: Option<String>,
+    /// Workload kind (`acp_coding_agent` for an ACP coding agent). Omitted for an
+    /// ordinary HTTP agent, so the server defaults to `agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_kind: Option<String>,
 }
 
 #[cfg(test)]
@@ -1293,6 +1592,29 @@ mod tests {
         let out: Option<serde_json::Value> = client.get_json_optional("/agents/ghost").unwrap();
         assert!(out.is_none());
         m.assert();
+    }
+
+    #[test]
+    fn get_json_or_status_answers_expected_statuses_and_fails_on_others() {
+        let mut srv = mockito::Server::new();
+        for (path, status) in [("/api/agents/gone", 404), ("/api/agents/theirs", 403)] {
+            srv.mock("GET", path).with_status(status).create();
+        }
+        srv.mock("GET", "/api/agents/broken")
+            .with_status(500)
+            .create();
+        let client = Client::for_test(&srv.url(), None);
+        for (path, status) in [("/agents/gone", 404), ("/agents/theirs", 403)] {
+            let out = client
+                .get_json_or_status::<serde_json::Value>(path, &[403, 404])
+                .unwrap();
+            assert_eq!(out.unwrap_err(), status, "{path}");
+        }
+        assert!(
+            client
+                .get_json_or_status::<serde_json::Value>("/agents/broken", &[403, 404])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1358,6 +1680,47 @@ mod tests {
             .create();
         let client = Client::for_test(&srv.url(), None);
         assert!(client.used_versions("a1").is_err());
+    }
+
+    // ─── version_status: sees "pushed" rows that used_versions hides ───────────
+
+    #[test]
+    fn version_status_finds_a_pushed_row() {
+        let mut srv = mockito::Server::new();
+        srv.mock("GET", "/api/agents/a1/versions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data": [
+                    {"version": "1.0.0", "status": "active", "is_active": true,
+                     "can_rollback": false, "created_at": "2024-01-01T00:00:00Z"},
+                    {"version": "2.0.0", "status": "pushed", "is_active": false,
+                     "can_rollback": false, "created_at": "2024-01-02T00:00:00Z"}
+                ]}"#,
+            )
+            .create();
+        let client = Client::for_test(&srv.url(), None);
+        assert_eq!(
+            client.version_status("a1", "2.0.0").unwrap(),
+            Some("pushed".to_string())
+        );
+    }
+
+    #[test]
+    fn version_status_is_none_for_an_unrecorded_version() {
+        let mut srv = mockito::Server::new();
+        srv.mock("GET", "/api/agents/a1/versions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data": [
+                    {"version": "1.0.0", "status": "active", "is_active": true,
+                     "can_rollback": false, "created_at": "2024-01-01T00:00:00Z"}
+                ]}"#,
+            )
+            .create();
+        let client = Client::for_test(&srv.url(), None);
+        assert_eq!(client.version_status("a1", "9.9.9").unwrap(), None);
     }
 
     #[test]

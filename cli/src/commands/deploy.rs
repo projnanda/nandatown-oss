@@ -3,8 +3,10 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use nasiko_utils::term;
 
 use crate::api::{Client, ContainerStatus, DeploySpec};
+use crate::commands::local_agents::agent_command;
 use crate::oci;
 use crate::util::parse_image_name_and_tag;
 use crate::version_prompt::{
@@ -22,6 +24,11 @@ const AGENT_FILE: &str = ".nasiko/agent.json";
 ///    - Exists → update agent + restart container
 ///    - Not found → create new agent, save ID
 /// 4. Deploy/restart container
+///
+/// With `dry_run`, stops after step 1's lookups (existing agent, version history, whether the
+/// version was already pushed) and prints the plan — nothing is built, pushed, registered,
+/// deployed, or written to disk. Version selection runs exactly as in a real deploy, prompt
+/// included, so the dry run fails the same way the real deploy would.
 #[allow(clippy::too_many_arguments)]
 pub fn deploy_with_version_flags(
     image: &str,
@@ -32,6 +39,9 @@ pub fn deploy_with_version_flags(
     flags: VersionFlags,
     writable: bool,
     writable_path: Option<&str>,
+    coding_agent: bool,
+    hitl: bool,
+    dry_run: bool,
 ) -> Result<()> {
     let client = Client::from_active_cluster()?;
     let env = parse_env(env_file, env_args)?;
@@ -47,6 +57,9 @@ pub fn deploy_with_version_flags(
             flags,
             writable,
             writable_path,
+            coding_agent,
+            hitl,
+            dry_run,
             &client,
         )
     } else {
@@ -58,19 +71,178 @@ pub fn deploy_with_version_flags(
             flags,
             writable,
             writable_path,
+            coding_agent,
+            hitl,
+            dry_run,
             &client,
         )
     }
 }
 
+/// What a deploy would do, as shown by `deploy --dry-run`.
+struct DeployPlan<'a> {
+    agent_name: &'a str,
+    /// The agent is already registered, so the deploy updates it rather than creating it.
+    agent_exists: bool,
+    /// The live version being replaced; `None` when nothing is deployed yet.
+    current_version: Option<&'a str>,
+    version: &'a str,
+    image_ref: &'a str,
+    /// The version is already in the registry (`nasiko push`), so it would be reused as-is.
+    already_pushed: bool,
+    /// Deploying from source, so the image is built first; a raw image is only pushed.
+    builds_image: bool,
+    port: u16,
+    /// `--coding-agent` or the card's `workloadKind`; `None` for an ordinary HTTP agent.
+    workload_kind: Option<&'a str>,
+    /// Whether the deploy turns HITL on (only ever sent as on).
+    hitl: bool,
+    writable: bool,
+    writable_path: Option<&'a str>,
+    env: &'a HashMap<String, String>,
+}
+
+/// The dry-run plan as printable lines. Env values are never included — deploy env commonly
+/// carries API keys and passwords, which must not end up in scrollback or CI logs.
+fn plan_lines(plan: &DeployPlan) -> Vec<String> {
+    let action = match (plan.current_version, plan.agent_exists) {
+        (Some(current), _) => format!("update {current} → {}", plan.version),
+        (None, true) => format!("deploy {} to the existing agent", plan.version),
+        (None, false) => format!("register new agent at {}", plan.version),
+    };
+    let image_step = if plan.already_pushed {
+        "reuse the already-pushed image"
+    } else if plan.builds_image {
+        "build + push"
+    } else {
+        "push the local image"
+    };
+    let writable = match (plan.writable, plan.writable_path) {
+        (_, Some(path)) => format!("yes, at {path}"),
+        (true, None) => "yes, at /workspace".to_string(),
+        (false, None) => "no".to_string(),
+    };
+    let env = if plan.env.is_empty() {
+        "(none)".to_string()
+    } else {
+        let mut keys: Vec<&str> = plan.env.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys.iter()
+            .map(|k| format!("{k}=****"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    // The same rule the deploy itself applies, so the plan can't disagree with it.
+    let port = match deploy_ports(plan.workload_kind, plan.port).as_slice() {
+        [] => "none (driven over stdio)".to_string(),
+        ports => ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    let mut lines = vec![
+        format!("Plan for {}:", plan.agent_name),
+        format!("  action    {action}"),
+        format!("  image     {}   ({image_step})", plan.image_ref),
+    ];
+    if let Some(kind) = plan.workload_kind {
+        let line = if kind == "acp_coding_agent" {
+            // HITL is only ever sent as on; otherwise the server leaves an existing agent's
+            // setting alone and creates a new agent with it off.
+            let hitl = match (plan.hitl, plan.agent_exists) {
+                (true, _) => "on",
+                (false, true) => "unchanged",
+                (false, false) => "off",
+            };
+            format!("coding agent, HITL {hitl}")
+        } else {
+            kind.to_string()
+        };
+        lines.push(format!("  kind      {line}"));
+    }
+    lines.extend([
+        format!("  port      {port}"),
+        format!("  writable  {writable}"),
+        format!("  env       {env}"),
+    ]);
+    lines
+}
+
+fn print_deploy_plan(plan: &DeployPlan) {
+    for line in plan_lines(plan) {
+        println!("{line}");
+    }
+    println!();
+    println!(
+        "{}",
+        term::dim("# dry run — nothing built, pushed, or deployed")
+    );
+}
+
+/// The success line plus where to go next; the MCP-gateway hint follows when the agent's
+/// source references the gateway.
+fn print_deploy_success(
+    agent_name: &str,
+    version: &str,
+    agent_id: Option<&str>,
+    references_mcp_gateway: bool,
+) {
+    println!();
+    match agent_id {
+        Some(id) => term::print_success(&format!("Deployed {agent_name}:{version} (id: {id})")),
+        None => term::print_success(&format!("Deployed {agent_name}:{version}")),
+    }
+    println!(
+        "  {}   ·   {}",
+        term::cyan(&format!(
+            "→ {}",
+            agent_command(&format!("logs {agent_name}"))
+        )),
+        term::cyan(&format!(
+            "→ {}",
+            agent_command(&format!("chat {agent_name}"))
+        ))
+    );
+    if references_mcp_gateway {
+        print_mcp_gateway_hint(agent_name);
+    }
+}
+
+/// Resolve the agent's workload kind for a deploy: an explicit `--coding-agent`
+/// flag wins; otherwise a `"workloadKind"` string in AgentCard.json is the
+/// default; otherwise `None` (an ordinary HTTP agent — the server defaults the
+/// column to `agent`). Returned as the DB token the server validates. Shared
+/// with `push` (same flag + card-default rule).
+pub(crate) fn resolve_workload_kind(
+    coding_agent: bool,
+    card: &serde_json::Value,
+) -> Option<String> {
+    if coding_agent {
+        return Some("acp_coding_agent".to_owned());
+    }
+    card.get("workloadKind")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// The container ports for a deploy: a coding agent is driven over stdio and
+/// exposes none, so it deploys port-less; every other agent uses its service
+/// port.
+fn deploy_ports(workload_kind: Option<&str>, port: u16) -> Vec<u16> {
+    if workload_kind == Some("acp_coding_agent") {
+        Vec::new()
+    } else {
+        vec![port]
+    }
+}
+
 /// Gets the currently-deployed version and full version history from an
-/// already-looked-up agent. Both come back empty for a brand-new agent.
-/// Shared by `deploy_from_directory` and `deploy_from_image`.
+/// already-looked-up agent. Empty for a brand-new agent.
 ///
-/// Propagates a history-fetch failure instead of treating it as "no
-/// history" — failing open there would let a duplicate/already-used version
-/// through the check in `resolve_deploy_version` and push/deploy over that
-/// version's content before the server gets a chance to reject the update.
+/// A history-fetch failure is propagated, not treated as "no history" —
+/// otherwise a reused version could slip past `resolve_deploy_version`.
 fn used_version_context<'a>(
     client: &Client,
     existing: Option<&'a (String, serde_json::Value)>,
@@ -99,12 +271,7 @@ fn already_pushed(
     let Some((id, _)) = existing else {
         return Ok(false);
     };
-    let status = client
-        .version_history(id)?
-        .into_iter()
-        .find(|v| v.version == version)
-        .map(|v| v.status);
-    Ok(status.as_deref() == Some("pushed"))
+    Ok(client.version_status(id, version)?.as_deref() == Some("pushed"))
 }
 
 /// Finds the existing agent for a directory deploy: first checks the local
@@ -125,7 +292,10 @@ fn find_existing_agent_binding(
         return Ok(cached);
     }
     if existing_id.is_some() {
-        println!("  ! Cached agent binding is stale — checking by name");
+        println!(
+            "  {} Cached agent binding is stale — checking by name",
+            term::yellow("!")
+        );
     }
 
     Ok(client.get_agent(agent_name)?.map(|current| {
@@ -176,6 +346,9 @@ fn deploy_from_directory(
     flags: VersionFlags,
     writable: bool,
     writable_path: Option<&str>,
+    coding_agent: bool,
+    hitl: bool,
+    dry_run: bool,
     client: &Client,
 ) -> Result<()> {
     let root = Path::new(dir);
@@ -185,10 +358,19 @@ fn deploy_from_directory(
     )
     .context("invalid AgentCard.json")?;
 
+    // Flag wins, AgentCard `workloadKind` is the default. Used both to mark the
+    // catalog row and to deploy a coding agent port-less.
+    let workload_kind = resolve_workload_kind(coding_agent, &card);
+
     let agent_name = name_override
         .map(String::from)
         .or_else(|| card.get("name").and_then(|n| n.as_str()).map(String::from))
         .unwrap_or_else(|| "agent".into());
+
+    // Checked once up front, same signal `upload.rs`'s `source_references_mcp_gateway` uses for
+    // `nasiko upload` — this path builds straight from `root` and never zips it, so it walks the
+    // directory directly instead of scanning zip entries.
+    let references_mcp_gateway = crate::util::dir_references_mcp_gateway(root);
 
     // Find the agent first, so we can catch a same-version redeploy below.
     let agent_file = root.join(AGENT_FILE);
@@ -206,8 +388,28 @@ fn deploy_from_directory(
     let version = decision.version;
     let repo = format!("nasiko/{agent_name}");
     let image_ref = format!("{repo}:{version}");
+    let reuse_pushed = already_pushed(client, existing.as_ref(), &version)?;
 
-    if already_pushed(client, existing.as_ref(), &version)? {
+    if dry_run {
+        print_deploy_plan(&DeployPlan {
+            agent_name: &agent_name,
+            agent_exists: existing.is_some(),
+            current_version: current_deployed_version,
+            version: &version,
+            image_ref: &image_ref,
+            already_pushed: reuse_pushed,
+            builds_image: true,
+            port,
+            workload_kind: workload_kind.as_deref(),
+            hitl,
+            writable,
+            writable_path,
+            env,
+        });
+        return Ok(());
+    }
+
+    if reuse_pushed {
         println!(
             "  Version {version} was already pushed — deploying the existing registry image \
              without rebuilding."
@@ -243,10 +445,11 @@ fn deploy_from_directory(
             let spec = DeploySpec {
                 image: image_ref.clone(),
                 name: agent_name.clone(),
-                ports: vec![port],
+                ports: deploy_ports(workload_kind.as_deref(), port),
                 env: env.clone(),
                 writable,
                 writable_path: writable_path.map(str::to_owned),
+                workload_kind: workload_kind.clone(),
             };
             let status: ContainerStatus = client.post_json("/containers", &spec)?;
             println!("  {} → {}", agent_name, status.state);
@@ -257,12 +460,17 @@ fn deploy_from_directory(
                 "description": card.get("description"),
                 "skills": card.get("skills"),
                 "capabilities": card.get("capabilities"),
+                "workload_kind": workload_kind,
+                // Only send when set, so a plain redeploy never flips HITL off.
+                "hitl_enabled": hitl.then_some(true),
             });
             let _: serde_json::Value = client.put_json(&format!("/agents/{id}"), &update)?;
             if let Err(e) = crate::util::sync_card_version(&card_path, &card, &version) {
-                eprintln!("  ! Deployed, but failed to update AgentCard.json's version: {e}");
+                term::print_warning(&format!(
+                    "Deployed, but failed to update AgentCard.json's version: {e}"
+                ));
             }
-            println!("\n✓ Deployed {agent_name}:{version} (id: {id})");
+            print_deploy_success(&agent_name, &version, Some(&id), references_mcp_gateway);
             return Ok(());
         }
         None => {
@@ -278,6 +486,8 @@ fn deploy_from_directory(
                 "image": image_ref,
                 "skills": card.get("skills").unwrap_or(&serde_json::json!([])),
                 "capabilities": card.get("capabilities"),
+                "workload_kind": workload_kind,
+                "hitl_enabled": hitl.then_some(true),
             });
             let resp: serde_json::Value = client.post_json("/agents", &create)?;
             let id = resp
@@ -295,20 +505,42 @@ fn deploy_from_directory(
     let spec = DeploySpec {
         image: image_ref.clone(),
         name: agent_name.clone(),
-        ports: vec![port],
+        ports: deploy_ports(workload_kind.as_deref(), port),
         env: env.clone(),
         writable,
         writable_path: writable_path.map(str::to_owned),
+        workload_kind: workload_kind.clone(),
     };
     let status: ContainerStatus = client.post_json("/containers", &spec)?;
     println!("  {} → {}", agent_name, status.state);
     if let Err(e) = crate::util::sync_card_version(&card_path, &card, &version) {
-        eprintln!("  ! Deployed, but failed to update AgentCard.json's version: {e}");
+        term::print_warning(&format!(
+            "Deployed, but failed to update AgentCard.json's version: {e}"
+        ));
     }
-    println!("\n✓ Deployed {agent_name}:{version} (id: {agent_id})");
+    print_deploy_success(
+        &agent_name,
+        &version,
+        Some(&agent_id),
+        references_mcp_gateway,
+    );
     Ok(())
 }
 
+/// Same "give it tool access" suggestion `upload.rs` prints for a source that references the MCP
+/// gateway — kept here too since `deploy_from_directory` has its own two success points.
+fn print_mcp_gateway_hint(agent_name: &str) {
+    println!(
+        "\nThis agent's source references the MCP gateway — to give it tool access:\n\
+         \x20 nasiko mcp catalog                                      # find a connector\n\
+         \x20 nasiko mcp connect --connector-id <id>                  # connect your account (if not already)\n\
+         \x20 nasiko mcp agent-tools enable {agent_name} <id>                   # grant this agent access"
+    );
+}
+
+// Same values `deploy_with_version_flags` threads into
+// `deploy_from_directory` above, which carries the same allow.
+#[allow(clippy::too_many_arguments)]
 fn deploy_from_image(
     image: &str,
     name_override: Option<&str>,
@@ -317,8 +549,28 @@ fn deploy_from_image(
     flags: VersionFlags,
     writable: bool,
     writable_path: Option<&str>,
+    coding_agent: bool,
+    hitl: bool,
+    dry_run: bool,
     client: &Client,
 ) -> Result<()> {
+    // No AgentCard.json on the raw-image path, so only the explicit flag can mark
+    // a coding agent here.
+    let workload_kind: Option<String> = coding_agent.then(|| "acp_coding_agent".to_owned());
+
+    // A bare image name means Docker's implicit `:latest`, not a real
+    // choice — require an explicit tag so the deployed version always
+    // matches what `nasiko build` actually produced.
+    if !crate::util::image_has_explicit_tag(image) {
+        anyhow::bail!(
+            "deploy requires an explicit image:tag (e.g. {image}:1.0.1) — run `nasiko build` \
+             first, then deploy exactly the tag it printed."
+        );
+    }
+    if !oci::local_image_exists(image)? {
+        anyhow::bail!("no local image found for {image} — build it first with `nasiko build`.");
+    }
+
     let (image_name, image_tag_version) = parse_image_name_and_tag(image);
     let agent_name = name_override.map(String::from).unwrap_or(image_name);
     let repo = format!("nasiko/{agent_name}");
@@ -345,17 +597,41 @@ fn deploy_from_image(
     let version = decision.version;
 
     let image_ref = format!("{repo}:{version}");
+    let reuse_pushed = already_pushed(client, existing.as_ref(), &version)?;
 
-    if already_pushed(client, existing.as_ref(), &version)? {
+    if dry_run {
+        print_deploy_plan(&DeployPlan {
+            agent_name: &agent_name,
+            agent_exists: existing.is_some(),
+            current_version: current_deployed_version,
+            version: &version,
+            image_ref: &image_ref,
+            already_pushed: reuse_pushed,
+            builds_image: false,
+            port,
+            workload_kind: workload_kind.as_deref(),
+            hitl,
+            writable,
+            writable_path,
+            env,
+        });
+        return Ok(());
+    }
+
+    if reuse_pushed {
         println!(
             "  Version {version} was already pushed — deploying the existing registry image \
              without re-pushing."
         );
     } else {
         // Tag locally so Docker can find it by the canonical ref without a registry pull.
-        let _ = std::process::Command::new("docker")
+        let tag_status = std::process::Command::new(crate::util::container_bin())
             .args(["tag", image, &image_ref])
-            .status();
+            .status()
+            .context("failed to run container tag command — is the container runtime running?")?;
+        if !tag_status.success() {
+            anyhow::bail!("failed to tag {image} as {image_ref}");
+        }
 
         println!("Pushing {image} → {image_ref}...");
         oci::push_image(image, &repo, &version)?;
@@ -370,10 +646,11 @@ fn deploy_from_image(
         let spec = DeploySpec {
             image: image_ref.clone(),
             name: agent_name.clone(),
-            ports: vec![port],
+            ports: deploy_ports(workload_kind.as_deref(), port),
             env: env.clone(),
             writable,
             writable_path: writable_path.map(str::to_owned),
+            workload_kind: workload_kind.clone(),
         };
         let status: ContainerStatus = client.post_json("/containers", &spec)?;
         println!("  {} → {}", agent_name, status.state);
@@ -381,9 +658,12 @@ fn deploy_from_image(
         let update = serde_json::json!({
             "version": version,
             "image": image_ref,
+            "workload_kind": workload_kind,
+            // Only send when set, so a plain redeploy never flips HITL off.
+            "hitl_enabled": hitl.then_some(true),
         });
         let _: serde_json::Value = client.put_json(&format!("/agents/{id}"), &update)?;
-        println!("\n✓ Deployed {agent_name}:{version}");
+        print_deploy_success(&agent_name, &version, Some(&id), false);
         return Ok(());
     }
 
@@ -393,6 +673,8 @@ fn deploy_from_image(
         "display_name": agent_name,
         "version": version,
         "image": image_ref,
+        "workload_kind": workload_kind,
+        "hitl_enabled": hitl.then_some(true),
     });
     let _: serde_json::Value = client.post_json("/agents", &create)?;
 
@@ -402,14 +684,15 @@ fn deploy_from_image(
     let spec = DeploySpec {
         image: image_ref,
         name: agent_name.clone(),
-        ports: vec![port],
+        ports: deploy_ports(workload_kind.as_deref(), port),
         env: env.clone(),
         writable,
         writable_path: writable_path.map(str::to_owned),
+        workload_kind: workload_kind.clone(),
     };
     let status: ContainerStatus = client.post_json("/containers", &spec)?;
     println!("  {} → {}", agent_name, status.state);
-    println!("\n✓ Deployed {agent_name}:{version}");
+    print_deploy_success(&agent_name, &version, None, false);
     Ok(())
 }
 

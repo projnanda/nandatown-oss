@@ -8,6 +8,7 @@ use chrono::{DateTime, FixedOffset, NaiveTime, TimeZone, Utc};
 
 mod agent;
 mod github;
+mod mcp;
 mod slack;
 mod telemetry;
 mod tools;
@@ -42,7 +43,14 @@ async fn main() {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PORT);
 
-    let agent = RepoWatchAgent::new();
+    // MCP gateway: configured once from the deploy-injected env. Only a health
+    // check here — the tool set is query-scoped and fetched per request
+    // (docs/MCP_TOOL_SEARCH_DESIGN.md), see McpSession.
+    let mcp = mcp::McpClient::from_env().map(Arc::new);
+    if let Some(client) = &mcp {
+        client.probe().await;
+    }
+    let agent = RepoWatchAgent::new(mcp);
     spawn_digest_scheduler(agent.clone());
 
     let handler = Arc::new(DefaultRequestHandler::new(agent, InMemoryTaskStore::new()));

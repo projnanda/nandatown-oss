@@ -1,0 +1,42 @@
+{
+  "name": "@nasiko/features",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The control plane's pages and their logic, one folder per feature.",
+  "dependencies": {
+    "@hookform/resolvers": "^5.9.1",
+    "@nasiko/app-core": "workspace:*",
+    "@nasiko/data-access": "workspace:*",
+    "@nasiko/ui": "workspace:*",
+    "@tanstack/react-query": "^5.103.3",
+    "@tanstack/react-router": "^1.170.39",
+    "@visx/axis": "^4.0.0",
+    "@visx/grid": "^4.0.0",
+    "@visx/group": "^4.0.0",
+    "@visx/responsive": "^4.0.0",
+    "@visx/scale": "^4.0.0",
+    "class-variance-authority": "^0.7.1",
+    "d3-shape": "^3.2.0",
+    "fflate": "^0.8.3",
+    "lucide-react": "^1.48.0",
+    "motion": "^13.4.4",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-hook-form": "^7.89.0",
+    "react-markdown": "^10.1.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "sonner": "^2.0.8",
+    "zod": "^4.6.5",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@storybook/react-vite": "10.6.0",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "axe-core": "^4.13.0",
+    "msw": "^2.15.0",
+    "vitest": "^4.1.11"
+  }
+}

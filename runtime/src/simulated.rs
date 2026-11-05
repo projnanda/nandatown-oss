@@ -171,6 +171,7 @@ mod tests {
             image: "example/agent:latest".to_owned(),
             min_replicas: 1,
             max_replicas: 1,
+            replica_target: None,
             env_vars: HashMap::new(),
             ports: vec![8080],
             resources: None,
@@ -182,6 +183,7 @@ mod tests {
             writable: false,
             writable_path: None,
             owner_id: uuid::Uuid::nil(),
+            force_pull: false,
         }
     }
 

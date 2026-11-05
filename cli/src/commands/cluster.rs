@@ -7,21 +7,26 @@ use crate::config;
 
 /// Register an existing control plane by URL.
 pub fn connect(url: &str, name: Option<&str>) -> Result<()> {
+    let cluster_name = match name {
+        Some(name) => name.to_string(),
+        None => {
+            let derived = config::cluster_name_from_url(url);
+            let existing = config::load()?
+                .clusters
+                .get(&derived)
+                .map(|c| c.url.clone());
+            config::refuse_derived_name_clash(&derived, url, existing.as_deref())?;
+            derived
+        }
+    };
+
     eprint!("Checking {url}... ");
     Client::health_check(url)?;
     eprintln!("ok");
 
-    let cluster_name = name.map(|n| n.to_string()).unwrap_or_else(|| {
-        url.replace("https://", "")
-            .replace("http://", "")
-            .split('.')
-            .next()
-            .unwrap_or("cluster")
-            .to_string()
-    });
-
     config::connect(&cluster_name, url)?;
     println!("Connected: {cluster_name} ({url})");
+    crate::commands::integration::auto_install_if_authenticated();
     Ok(())
 }
 
@@ -71,5 +76,6 @@ struct ClusterTableRow {
 pub fn use_cluster(name: &str) -> Result<()> {
     config::use_cluster(name)?;
     println!("Switched to: {name}");
+    crate::commands::integration::auto_install_if_authenticated();
     Ok(())
 }

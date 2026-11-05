@@ -22,6 +22,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/agents", post(create))
         .route("/agents", get(list))
+        .route("/agents/coding-integrations", post(register_coding_agent))
         .route("/agents/{id}", get(get_one))
         .route("/agents/{id}", put(update))
         .route("/agents/{id}", axum::routing::delete(delete))
@@ -35,6 +36,192 @@ pub fn router() -> Router<AppState> {
         .route("/search/users", get(search_users))
         .route("/registry/user/agents", get(registry_user_agents))
         .route("/registries/{id}", get(get_by_registry_id))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct RegisterCodingAgentRequest {
+    integration_id: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct RegisterCodingAgentResponse {
+    id: Uuid,
+    name: String,
+    owner_id: Uuid,
+    coding_agent_integration_id: String,
+    created: bool,
+}
+
+fn coding_agent_spec(integration_id: &str) -> Option<(&'static str, &'static str)> {
+    match integration_id {
+        "claude" => Some(("claude-code", "Claude Code")),
+        "opencode" => Some(("opencode", "OpenCode")),
+        "codex" => Some(("codex", "Codex")),
+        "cursor" => Some(("cursor", "Cursor")),
+        _ => None,
+    }
+}
+
+fn coding_agent_name(username: &str, base_name: &str) -> Option<String> {
+    let mut normalized = String::new();
+    let mut pending_separator = false;
+    for character in username.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if pending_separator && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            normalized.push(character);
+            pending_separator = false;
+        } else {
+            pending_separator = true;
+        }
+    }
+    (!normalized.is_empty()).then(|| format!("{normalized}-{base_name}"))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/agents/coding-integrations",
+    tag = "catalog",
+    request_body = RegisterCodingAgentRequest,
+    responses(
+        (status = 200, description = "Existing coding-agent registration", body = RegisterCodingAgentResponse),
+        (status = 201, description = "Coding-agent registration created", body = RegisterCodingAgentResponse),
+        (status = 409, description = "Canonical name or integration identity conflict"),
+    ),
+)]
+pub(crate) async fn register_coding_agent(
+    State(state): State<AppState>,
+    claims: Claims,
+    Json(body): Json<RegisterCodingAgentRequest>,
+) -> impl IntoResponse {
+    let owner_id = match claims.user_uuid() {
+        Ok(id) => id,
+        Err(error) => return error.into_response(),
+    };
+    let integration_id = body.integration_id.trim();
+    let Some((base_name, display_name)) = coding_agent_spec(integration_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "unsupported coding-agent integration",
+        )
+            .into_response();
+    };
+    let profile =
+        sqlx::query_as::<_, (String, String)>("SELECT username, email FROM users WHERE id = $1")
+            .bind(owner_id)
+            .fetch_optional(&state.db)
+            .await;
+    let (username, email) = match profile {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::error!(%error, %owner_id, "coding-agent profile lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let Some(name) = coding_agent_name(&username, base_name) else {
+        return (
+            StatusCode::CONFLICT,
+            "account username cannot form an agent name",
+        )
+            .into_response();
+    };
+    let label = format!("{display_name} ({email})");
+    let description = format!("Local {display_name} sessions and LLM traffic managed by Nandatown");
+    let metadata = serde_json::json!({
+        "source": "nasiko-cli-integration",
+        "integration_id": integration_id,
+    });
+
+    #[derive(sqlx::FromRow)]
+    struct RegistrationRow {
+        id: Uuid,
+        name: String,
+        owner_id: Uuid,
+        coding_agent_integration_id: Option<String>,
+    }
+
+    let inserted = sqlx::query_as::<_, RegistrationRow>(
+        r#"INSERT INTO agents
+               (name, display_name, description, owner_id, tags, metadata,
+                coding_agent_integration_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT DO NOTHING
+           RETURNING id, name, owner_id, coding_agent_integration_id"#,
+    )
+    .bind(&name)
+    .bind(&label)
+    .bind(&description)
+    .bind(owner_id)
+    .bind(vec!["local", "coding-agent"])
+    .bind(metadata)
+    .bind(integration_id)
+    .fetch_optional(&state.db)
+    .await;
+
+    let (row, created) = match inserted {
+        Ok(Some(row)) => (row, true),
+        Ok(None) => {
+            let existing = sqlx::query_as::<_, RegistrationRow>(
+                r#"SELECT id, name, owner_id, coding_agent_integration_id
+                   FROM agents
+                   WHERE owner_id = $1 AND name = $2 AND deleted_at IS NULL"#,
+            )
+            .bind(owner_id)
+            .bind(&name)
+            .fetch_optional(&state.db)
+            .await;
+            match existing {
+                Ok(Some(row))
+                    if row.coding_agent_integration_id.as_deref() == Some(integration_id) =>
+                {
+                    (row, false)
+                }
+                Ok(Some(_)) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        "agent name is already used by an unrelated agent",
+                    )
+                        .into_response();
+                }
+                Ok(None) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        "coding-agent integration is already registered under another name",
+                    )
+                        .into_response();
+                }
+                Err(error) => {
+                    tracing::error!(%error, %owner_id, %name, "coding-agent conflict lookup failed");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, %owner_id, %name, "coding-agent registration failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let Some(coding_agent_integration_id) = row.coding_agent_integration_id else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    (
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(RegisterCodingAgentResponse {
+            id: row.id,
+            name: row.name,
+            owner_id: row.owner_id,
+            coding_agent_integration_id,
+            created,
+        }),
+    )
+        .into_response()
 }
 
 /// WHERE-clause fragment implementing the baseline catalog access predicate —
@@ -56,16 +243,16 @@ pub fn router() -> Router<AppState> {
 /// `org_bind` carries the ids of agents reachable through an org-hierarchy grant
 /// (`team`/`department`/`organization`), as resolved by
 /// `AuthService::org_granted_agent_ids`. `EeAuthService::can_access_agent`
-/// (ee/auth/src/lib.rs) grants access via team/department membership by joining on
+/// (the EE auth service) grants access via team/department membership by joining on
 /// `users.team_id` / `users.department_id` — columns that only exist after the EE
 /// `1002_org_hierarchy` migration. This file is compiled into and shared by both
-/// the OSS and EE server binaries (`ee/server` wraps this crate's router rather
+/// the OSS and EE server binaries (the EE server wraps this crate's router rather
 /// than forking it — see `nasiko_server::build_app_with_user_router`), so a single
 /// static SQL string here cannot reference those EE-only columns; the trait
 /// resolves them per edition and hands back plain ids instead, which is what
 /// closes the gap this comment used to describe. OSS returns an empty list, so
 /// the extra disjunct never matches there.
-fn agent_access_predicate(user_bind: &str, org_bind: &str, table_ref: &str) -> String {
+pub(crate) fn agent_access_predicate(user_bind: &str, org_bind: &str, table_ref: &str) -> String {
     format!(
         r#"({user_bind}::uuid IS NULL
              OR {table_ref}.owner_id = {user_bind}
@@ -86,7 +273,11 @@ fn agent_access_predicate(user_bind: &str, org_bind: &str, table_ref: &str) -> S
 /// it, which is what the helper has always documented but never actually did:
 /// every call site passed `Some(user_id)` unconditionally, so an admin saw
 /// exactly what a `member` saw.
-async fn listing_scope(state: &AppState, claims: &Claims) -> Result<ListingScope, Response> {
+#[allow(clippy::result_large_err)]
+pub(crate) async fn listing_scope(
+    state: &AppState,
+    claims: &Claims,
+) -> Result<ListingScope, Response> {
     if claims.is_superuser {
         return Ok(ListingScope {
             user: None,
@@ -104,9 +295,9 @@ async fn listing_scope(state: &AppState, claims: &Claims) -> Result<ListingScope
     })
 }
 
-struct ListingScope {
-    user: Option<Uuid>,
-    org_granted: Vec<String>,
+pub(crate) struct ListingScope {
+    pub(crate) user: Option<Uuid>,
+    pub(crate) org_granted: Vec<String>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -160,6 +351,7 @@ pub(crate) async fn by_skill(
                   a.version, a.status, a.tags, a.created_at
            FROM agents a
            WHERE ({access})
+             AND NOT a.is_internal
              AND EXISTS (
                  SELECT 1 FROM agent_skills s
                  WHERE s.agent_id = a.id AND s.tags @> ARRAY[$1]::text[]
@@ -231,10 +423,36 @@ pub(crate) async fn create(
         }
     }
     let skills = serde_json::to_value(&skills_vec).unwrap_or_default();
+    // The card decides whether this agent is offered the minimal-code ladder at all, so it may as
+    // well decide the starting position too: an agent registered with coding skills comes up with
+    // the ladder on. Reversible from the Settings switch, and scoped to *registration* on purpose —
+    // nothing here rewrites an existing agent, whose owner may have turned it off deliberately.
+    //
+    // `has_coding_skills` rather than a local predicate: the dispatch-time gate
+    // (`a2a_dispatch.rs`) calls the same function, and the two disagreeing is precisely the drift
+    // that produced the `/code/i`-vs-`ILIKE '%code%'` bug this helper was extracted to fix.
+    let minimal_code_enabled = super::models::has_coding_skills(&skills_vec);
     let meta = body.metadata.unwrap_or(serde_json::json!({}));
     let owner_id = match claims.user_uuid() {
         Ok(id) => id,
         Err(e) => return e.into_response(),
+    };
+
+    // Validate the workload kind at the edge so a bad value is a clean 400 rather
+    // than a database CHECK violation. Omitted = `agent` (every existing on-ramp
+    // and caller is unaffected).
+    let workload_kind = match body.workload_kind.as_deref() {
+        None => nasiko_runtime::WorkloadKind::Agent,
+        Some(raw) => match nasiko_runtime::WorkloadKind::from_db_str(raw) {
+            Some(kind) => kind,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "workload_kind must be one of: agent, mcp_connector, acp_coding_agent",
+                )
+                    .into_response();
+            }
+        },
     };
 
     let mut tx = match state.db.begin().await {
@@ -247,8 +465,8 @@ pub(crate) async fn create(
 
     let result = sqlx
         ::query_as::<_, Agent>(
-            r#"INSERT INTO agents (name, display_name, description, owner_id, url, icon_url, version, documentation_url, capabilities, skills, tags, metadata, image)
-           VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, '1.0.0'), $8, $9, $10, $11, $12, $13)
+            r#"INSERT INTO agents (name, display_name, description, owner_id, url, icon_url, version, documentation_url, capabilities, skills, tags, metadata, image, minimal_code_enabled, workload_kind, hitl_enabled)
+           VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, '1.0.0'), $8, $9, $10, $11, $12, $13, $14, $15, COALESCE($16, false))
            RETURNING *"#
         )
         .bind(&body.name)
@@ -264,6 +482,9 @@ pub(crate) async fn create(
         .bind(&tags)
         .bind(meta)
         .bind(&body.image)
+        .bind(minimal_code_enabled)
+        .bind(workload_kind.as_db_str())
+        .bind(body.hitl_enabled)
         .fetch_one(&mut *tx).await;
 
     let agent = match result {
@@ -366,6 +587,7 @@ pub(crate) async fn list(
     let sql = format!(
         r#"SELECT * FROM agents
            WHERE deleted_at IS NULL
+             AND NOT is_internal
              AND ($1::uuid IS NULL OR owner_id = $1)
              AND ({access})
              AND ($2::text IS NULL OR status = $2)
@@ -406,20 +628,30 @@ pub(crate) async fn list(
 /// harmless where a stale write would linger.
 async fn reconcile_running_status(state: &AppState, agents: &mut [Agent]) {
     for agent in agents.iter_mut() {
-        if agent.status != "running" {
-            continue;
-        }
-        let container_id = ContainerId::from_uuid(agent.id);
-        if let Ok(live) = state.runtime.status(&container_id).await {
-            use nasiko_runtime::RuntimeState;
-            if matches!(
-                live.state,
-                RuntimeState::Crashed | RuntimeState::Failed | RuntimeState::Stopped
-            ) {
-                agent.status = live.state.to_string();
-            }
+        if let Some(live) = live_status(state, agent.id, &agent.status).await {
+            agent.status = live;
         }
     }
+}
+
+/// The runtime's own word on a row that reads `running`, when it disagrees: `crashed`, `failed`
+/// or `stopped`. `None` keeps the stored status (not running, agreed, or the runtime didn't
+/// answer). The Overview's estate reads it too, so the map and the catalog never disagree.
+pub(crate) async fn live_status(state: &AppState, agent_id: Uuid, status: &str) -> Option<String> {
+    if status != "running" {
+        return None;
+    }
+    let live = state
+        .runtime
+        .status(&ContainerId::from_uuid(agent_id))
+        .await
+        .ok()?;
+    use nasiko_runtime::RuntimeState;
+    matches!(
+        live.state,
+        RuntimeState::Crashed | RuntimeState::Failed | RuntimeState::Stopped
+    )
+    .then(|| live.state.to_string())
 }
 
 #[derive(Serialize, ToSchema)]
@@ -438,6 +670,39 @@ pub(crate) struct AgentDetailResponse {
     /// tabs without guessing.
     #[serde(rename = "can_manage")]
     can_manage: bool,
+    #[serde(rename = "is_coding_agent")]
+    is_coding_agent: bool,
+    #[serde(rename = "coding_agent_integration_id")]
+    coding_agent_integration_id: Option<String>,
+    /// Per-agent payload-compression opt-in. The Settings toggle renders from this, so a
+    /// projection that omits it shows the switch off however the column reads.
+    #[serde(rename = "compress_enabled")]
+    compress_enabled: bool,
+    /// Drives the control plane's minimal-code ladder injection at A2A dispatch
+    /// time (a2a_dispatch.rs). Same reasoning as compress_enabled above — omit
+    /// it here and the Settings toggle shows off regardless of the real value.
+    #[serde(rename = "minimal_code_enabled")]
+    minimal_code_enabled: bool,
+    /// Whether this coding agent gates its tool use behind human approval
+    /// (NAS-842). Served so a client can show and toggle the current state.
+    #[serde(rename = "hitl_enabled")]
+    hitl_enabled: bool,
+    /// Whether this agent's card reads as code work, and so should be offered minimal-code
+    /// mode at all. Served rather than re-derived in the browser: the settings page used to
+    /// run its own `/code/i` over the skills, mirroring a Postgres `ILIKE '%code%'` in the
+    /// dispatch path, and the two could disagree — which is exactly what happened, since both
+    /// missed `coding` (no "code" in it) while matching `encode`.
+    #[serde(rename = "has_coding_skills")]
+    has_coding_skills: bool,
+    /// Owner-writable bag, and the home of `features.*` — the flags
+    /// `AppState::agent_env` turns into `NASIKO_<KEY>` on the container.
+    ///
+    /// Third occurrence of the same trap the two fields above warn about, and the worst of
+    /// them: the Settings feature switches render from `metadata.features`, and the UI builds
+    /// its `PUT` body by spreading the value it read back. Omitted here it was always
+    /// `undefined`, so every switch showed off however the column read *and* each save
+    /// replaced the whole column with just the one feature it was toggling.
+    metadata: serde_json::Value,
     status: String,
     version: String,
     description: String,
@@ -531,6 +796,19 @@ pub(crate) async fn get_one(
     }
 
     let can_manage = crate::acl::can_manage_agent(&state, &claims, agent.id).await;
+    let coding_agent_integration_id = match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT coding_agent_integration_id FROM agents WHERE id = $1",
+    )
+    .bind(agent.id)
+    .fetch_one(&state.db)
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, agent_id = %agent.id, "coding-agent identity lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     let skills: Vec<serde_json::Value> = agent
         .skills
@@ -545,6 +823,13 @@ pub(crate) async fn get_one(
         display_name: agent.display_name.clone(),
         owner_id: agent.owner_id,
         can_manage,
+        is_coding_agent: coding_agent_integration_id.is_some(),
+        coding_agent_integration_id,
+        compress_enabled: agent.compress_enabled,
+        minimal_code_enabled: agent.minimal_code_enabled,
+        hitl_enabled: agent.hitl_enabled,
+        has_coding_skills: super::models::has_coding_skills(&agent.skills),
+        metadata: agent.metadata.0.clone(),
         status: agent.status.clone(),
         version: agent.version.clone(),
         description: agent.description.unwrap_or_default(),
@@ -703,6 +988,23 @@ pub(crate) async fn update(
         return StatusCode::FORBIDDEN.into_response();
     }
 
+    // Validate workload_kind at the edge (clean 400 vs a DB CHECK violation).
+    // `None` leaves the column untouched via the COALESCE below, so a plain
+    // metadata edit never clears an agent's coding-agent marking.
+    let workload_kind = match body.workload_kind.as_deref() {
+        None => None,
+        Some(raw) => match nasiko_runtime::WorkloadKind::from_db_str(raw) {
+            Some(kind) => Some(kind.as_db_str()),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "workload_kind must be one of: agent, mcp_connector, acp_coding_agent",
+                )
+                    .into_response();
+            }
+        },
+    };
+
     let mut tx = match state.db.begin().await {
         Ok(t) => t,
         Err(e) => {
@@ -768,6 +1070,10 @@ pub(crate) async fn update(
              metadata = COALESCE($11, metadata),
              status = COALESCE($12, status),
              image = COALESCE($13, image),
+             minimal_code_enabled = COALESCE($14, minimal_code_enabled),
+             compress_enabled = COALESCE($15, compress_enabled),
+             workload_kind = COALESCE($16, workload_kind),
+             hitl_enabled = COALESCE($17, hitl_enabled),
              updated_at = now()
            WHERE id = $1
            RETURNING *"#,
@@ -789,6 +1095,10 @@ pub(crate) async fn update(
     .bind(&body.metadata)
     .bind(&body.status)
     .bind(&agent_image)
+    .bind(body.minimal_code_enabled)
+    .bind(body.compress_enabled)
+    .bind(workload_kind)
+    .bind(body.hitl_enabled)
     .fetch_optional(&mut *tx)
     .await;
 
@@ -884,6 +1194,28 @@ pub(crate) async fn delete(
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
         }
     };
+
+    // Tombstone the agent's credentials - a destroyed agent's leaked env must not
+    // keep authenticating at /api/mcp or the agent state API. Best-effort: the soft
+    // delete above already stands (both lookups also refuse a deleted agent), and the
+    // gateway's flow-participant check still bounds any residual credential to flows
+    // actively routed here.
+    if let Err(e) = nasiko_mcp_gateway::agent_tokens::revoke(&state.db, id).await {
+        tracing::warn!(%e, %id, "delete agent: gateway token revoke failed");
+    }
+    if let Err(e) = nasiko_mcp_gateway::agent_tokens::revoke_scoped(
+        &state.db,
+        id,
+        nasiko_mcp_gateway::agent_tokens::TokenScope::State,
+    )
+    .await
+    {
+        tracing::warn!(%e, %id, "delete agent: state token revoke failed");
+    }
+
+    // Let enterprise-only, agent-keyed state clean itself up (e.g. a reserved name that has no
+    // FK a soft delete could cascade through) — see `agent_lifecycle` module docs.
+    state.agent_deletion_hook.on_agent_deleted(id).await;
 
     // Every real deploy path keys the running container on the agent's UUID, never the
     // display name (see build_agent_spec's doc comment) — so the UUID-keyed id must always

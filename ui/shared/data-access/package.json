@@ -1,0 +1,16 @@
+{
+  "name": "@nasiko/data-access",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The API client, its schemas and query helpers, and server-sent events.",
+  "dependencies": {
+    "@tanstack/react-query": "^5.103.3",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.3",
+    "msw": "^2.15.0",
+    "vitest": "^4.1.11"
+  }
+}

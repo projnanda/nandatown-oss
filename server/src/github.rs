@@ -16,8 +16,9 @@ use std::collections::HashMap;
 
 use crate::agents::upload::BuildJobPayload;
 use crate::agents::utils::set_upload_status;
-use crate::{auth::Claims, state::AppState};
 use nasiko_secrets::SecretsCrypto;
+
+use crate::{auth::Claims, state::AppState};
 
 /// Public routes — no auth required (GitHub redirects the browser here).
 /// Merged at the root level in `lib.rs` so the callback URL is reachable
@@ -368,7 +369,7 @@ async fn github_callback(
             );
             (
                 StatusCode::CONFLICT,
-                "this GitHub account is already linked to a different Nasiko account",
+                "this GitHub account is already linked to a different Nandatown account",
             )
                 .into_response()
         }
@@ -438,6 +439,14 @@ async fn github_callback_login(
         .await
     {
         Ok(r) => r,
+        // Deactivated or deprovisioned: an expected rejection, so 403 and a
+        // message the person can act on — not the 500 that every other failure
+        // here gets. Matches the password path, which answers `AuthError::Disabled`
+        // the same way.
+        Err(nasiko_auth::AuthError::Disabled) => {
+            tracing::warn!(github_login = %github_user.login, "GitHub SSO login rejected: account deactivated");
+            return (StatusCode::FORBIDDEN, "account deactivated").into_response();
+        }
         Err(e) => {
             tracing::error!(%e, github_login = %github_user.login, "GitHub SSO login: upsert_oauth_user failed");
             return (
@@ -510,11 +519,16 @@ async fn github_callback_login(
         crate::auth::login::request_is_https(headers),
     );
 
-    // Redirect to the app root (APP_BASE_URL override for split-origin dev).
+    // Back to /login, which finishes an external sign-in itself (lifts the
+    // local sign-out barrier, tells other tabs) before opening the app
+    // (APP_BASE_URL override for split-origin dev).
     let redirect_target = if state.config.app_base_url.is_empty() {
-        "/".to_string()
+        "/login?signin=external".to_string()
     } else {
-        format!("{}/", state.config.app_base_url.trim_end_matches('/'))
+        format!(
+            "{}/login?signin=external",
+            state.config.app_base_url.trim_end_matches('/')
+        )
     };
 
     (

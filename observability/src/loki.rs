@@ -108,8 +108,13 @@ impl LokiClient {
 
     /// Fetch all log lines for a given `trace_id` from a specific Loki service stream.
     ///
-    /// Tries three LogQL queries in order (different traceid field name conventions used
-    /// by different OTel Collector/SDK combinations) and merges results.
+    /// One query, not one per field-name convention. OTel Collector/SDK
+    /// combinations disagree on how the trace id is spelled in a JSON log line,
+    /// and this used to issue three sequential `query_range` calls and merge the
+    /// results — three HTTP round-trips per trace, on a path that already runs
+    /// once per trace in a session. LogQL label-filter expressions support `or`,
+    /// so one query covers all three spellings and Loki evaluates them in a
+    /// single pass.
     pub async fn get_trace_logs(
         &self,
         service_name: &str,
@@ -117,34 +122,11 @@ impl LokiClient {
         start: Option<DateTime<Utc>>,
         end: Option<DateTime<Utc>>,
     ) -> Result<Vec<String>, ObservabilityError> {
-        // Different OTel exporters use different field names for the trace ID in JSON logs.
-        let queries = [
-            format!(r#"{{service_name="{service_name}"}} | json | traceid = "{trace_id}""#),
-            format!(r#"{{service_name="{service_name}"}} | json | trace_id = "{trace_id}""#),
-            format!(r#"{{service_name="{service_name}"}} | json | traceId = "{trace_id}""#),
-        ];
-
-        let mut all_lines: Vec<String> = Vec::new();
-        let mut last_err: Option<ObservabilityError> = None;
-
-        for query in &queries {
-            match self.query_range(query, start, end, 500).await {
-                Ok(entries) => {
-                    all_lines.extend(entries.into_iter().map(|(_, line)| line));
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        if all_lines.is_empty()
-            && let Some(e) = last_err
-        {
-            return Err(e);
-        }
-
-        Ok(all_lines)
+        let query = format!(
+            r#"{{service_name="{service_name}"}} | json | traceid = "{trace_id}" or trace_id = "{trace_id}" or traceId = "{trace_id}""#
+        );
+        let entries = self.query_range(&query, start, end, 500).await?;
+        Ok(entries.into_iter().map(|(_, line)| line).collect())
     }
 }
 

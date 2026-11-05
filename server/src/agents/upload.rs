@@ -95,6 +95,12 @@ pub(crate) struct UploadAndDeployForm {
     /// Absolute path; implies `writable`. Omit to keep an existing agent's
     /// stored path (`/workspace` for a new agent).
     writable_path: Option<String>,
+    /// `agent` (default) | `mcp_connector` | `acp_coding_agent` — the workload
+    /// kind. `acp_coding_agent` registers an ACP coding agent, deployed port-less
+    /// and driven over a stdio turn. Tri-state like `writable`: omit to keep an
+    /// existing agent's stored kind (`agent` for a new agent) — the CLI only
+    /// sends it when `--coding-agent` (or an AgentCard `workloadKind`) applies.
+    workload_kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
@@ -132,12 +138,23 @@ pub enum BuildJobPayload {
         zip_path: String,
         image_tag: String,
         ports: Vec<u16>,
+        /// The caller's own `env` field. Values are sealed (`seal_job_env`) when
+        /// `env_encrypted` is set; rows queued before sealing existed carry plaintext and no
+        /// flag, and are still read (`open_job_env`).
         env: HashMap<String, String>,
+        #[serde(default)]
+        env_encrypted: bool,
         writable: bool,
         /// `--writable-path`; `None` = `/workspace`. `#[serde(default)]` so
         /// job rows queued before this field existed still deserialize.
         #[serde(default)]
         writable_path: Option<String>,
+        /// The agent's workload kind as its `agents.workload_kind` token. Empty
+        /// (`#[serde(default)]`) for job rows queued before this field existed —
+        /// those deserialize to `""`, which the worker reads as the default
+        /// `agent` (an HTTP agent), preserving their behavior.
+        #[serde(default)]
+        workload_kind: String,
     },
     /// In-place agent update (PUT /api/agents/{id}/update).
     Update {
@@ -227,9 +244,20 @@ pub enum BuildJobPayload {
         image_tag: String,
         ports: Vec<u16>,
         env: HashMap<String, String>,
+        /// User-chosen version overriding whatever the cloned source
+        /// declares (e.g. an auto-suggested patch bump after a conflict).
+        /// Versions are immutable, so there's no overwrite option.
+        #[serde(default)]
         version_override: Option<String>,
+        /// This agent's `version`/`image`/`status` before the queueing
+        /// handler optimistically overwrote them with a placeholder —
+        /// `None` for a brand-new agent. Restored verbatim if this clone is
+        /// rejected for a version conflict before any build/deploy runs.
+        #[serde(default)]
         prior_version: Option<String>,
+        #[serde(default)]
         prior_image: Option<String>,
+        #[serde(default)]
         prior_status: Option<String>,
     },
     /// MCP-server-upload build+deploy (POST /api/mcp/connectors/upload or
@@ -245,6 +273,32 @@ pub enum BuildJobPayload {
         image_tag: String,
         env: HashMap<String, String>,
     },
+}
+
+/// Seals the values of a job's `env` with the owner's key, so a user's secrets are never
+/// plaintext in `build_jobs.payload`. The same scheme MCP connector builds use.
+pub fn seal_job_env(owner_id: Uuid, env: HashMap<String, String>) -> HashMap<String, String> {
+    let crypto = nasiko_secrets::SecretsCrypto::for_user(owner_id);
+    env.into_iter()
+        .map(|(key, value)| (key, crypto.encrypt(&value)))
+        .collect()
+}
+
+/// Reverses [`seal_job_env`]; plaintext (`encrypted == false`, a row queued before sealing
+/// existed) passes through. A sealed value that does not open is an error, not a dropped key:
+/// deploying without a variable the user set would fail later and more confusingly.
+pub fn open_job_env(
+    owner_id: Uuid,
+    env: HashMap<String, String>,
+    encrypted: bool,
+) -> Result<HashMap<String, String>, nasiko_secrets::SecretsError> {
+    if !encrypted {
+        return Ok(env);
+    }
+    let crypto = nasiko_secrets::SecretsCrypto::for_user(owner_id);
+    env.into_iter()
+        .map(|(key, value)| Ok((key, crypto.decrypt(&value)?)))
+        .collect()
 }
 
 /// Source payload for `BuildJobPayload::McpServerUpload` — mirrors
@@ -331,6 +385,10 @@ pub(crate) async fn upload_and_deploy(
     // Tri-state for the same reason: an unspecified path must not move an
     // existing agent's mount back to /workspace.
     let mut writable_path: Option<String> = None;
+    // Workload kind (`acp_coding_agent` for a coding agent). Tri-state like
+    // `writable`: None = keep the stored kind (`agent` for a new agent), so a
+    // plain re-upload never silently demotes a coding agent back to HTTP.
+    let mut workload_kind: Option<String> = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name().unwrap_or("") {
@@ -348,6 +406,9 @@ pub(crate) async fn upload_and_deploy(
             }
             "writable_path" => {
                 writable_path = field.text().await.ok().filter(|s| !s.is_empty());
+            }
+            "workload_kind" => {
+                workload_kind = field.text().await.ok().filter(|s| !s.is_empty());
             }
             "source" | "file" => {
                 use crate::multipart_util::{StreamUploadError, stream_field_to_fresh_temp_file};
@@ -422,6 +483,22 @@ pub(crate) async fn upload_and_deploy(
         Some("anthropic") => "anthropic",
         Some("gemini") => "gemini",
         _ => "openai",
+    };
+
+    // Validate the workload kind at the edge (clean 400 vs a DB CHECK violation).
+    // `None` keeps the stored kind via the COALESCE upsert below.
+    let workload_kind: Option<String> = match workload_kind.as_deref() {
+        None => None,
+        Some(raw) => match nasiko_runtime::WorkloadKind::from_db_str(raw) {
+            Some(_) => Some(raw.to_owned()),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "workload_kind must be one of: agent, mcp_connector, acp_coding_agent",
+                )
+                    .into_response();
+            }
+        },
     };
 
     // Validate name charset (RUN-10): flows into the OCI image reference.
@@ -518,17 +595,18 @@ pub(crate) async fn upload_and_deploy(
     // back the effective values so the deploy uses the DB's truth. (There is
     // deliberately no way to clear a stored writable_path back to NULL here —
     // pass an explicit new path instead; clearing would move the mount.)
-    let (agent_id, writable, writable_path) = {
-        match sqlx::query_as::<_, (Uuid, bool, Option<String>)>(
-            "INSERT INTO agents (name, owner_id, version, image, status, inbound_format, writable, writable_path) \
-             VALUES ($1, $2, $3, $4, 'deploying', $5, COALESCE($6, false), $7) \
+    let (agent_id, writable, writable_path, workload_kind) = {
+        match sqlx::query_as::<_, (Uuid, bool, Option<String>, String)>(
+            "INSERT INTO agents (name, owner_id, version, image, status, inbound_format, writable, writable_path, workload_kind) \
+             VALUES ($1, $2, $3, $4, 'deploying', $5, COALESCE($6, false), $7, COALESCE($8, 'agent')) \
              ON CONFLICT (owner_id, name) WHERE deleted_at IS NULL \
              DO UPDATE SET version = EXCLUDED.version, image = EXCLUDED.image, \
                            inbound_format = EXCLUDED.inbound_format, \
                            writable = COALESCE($6, agents.writable), \
                            writable_path = COALESCE($7, agents.writable_path), \
+                           workload_kind = COALESCE($8, agents.workload_kind), \
                            status = 'deploying', updated_at = now() \
-             RETURNING id, writable, writable_path",
+             RETURNING id, writable, writable_path, workload_kind",
         )
         .bind(&name)
         .bind(owner_id)
@@ -537,6 +615,7 @@ pub(crate) async fn upload_and_deploy(
         .bind(inbound_format)
         .bind(writable)
         .bind(&writable_path)
+        .bind(&workload_kind)
         .fetch_one(&mut *tx)
         .await
         {
@@ -598,18 +677,14 @@ pub(crate) async fn upload_and_deploy(
         }
     };
 
-    // Wire the agent's LLM SDK through the gateway (mint JWT + inject base-URL/key per the
-    // agent's inbound_format). Best-effort; skipped (with a warning) if the gateway isn't
-    // configured. Injected before the build job is enqueued so the worker deploys with it.
-    crate::llm_router::wiring::inject_agent_llm_env(&state.db, &mut env, agent_id, Some(owner_id))
-        .await;
-
+    // The platform's own env (LLM router wiring, gateway and state credentials) is NOT
+    // built here: the worker assembles it through `deploy_env` when it claims the job, so no
+    // credential is ever written into `build_jobs.payload`. What is queued is only the
+    // caller's own `env` field, sealed below because it may carry the user's secrets.
     let upload_id = build_id.to_string();
 
-    // NOTE: server-level secrets (OPENAI_API_KEY / OPENAI_BASE_URL) are deliberately
-    // NOT injected here — that would serialize the server API key in cleartext into
-    // build_jobs.payload (RUN-5). The worker injects them from live config at
-    // execution time (see execute_upload_and_deploy), mirroring update/rollback.
+    // Server-level secrets (OPENAI_API_KEY / OPENAI_BASE_URL) are likewise left to the
+    // worker (see execute_upload_and_deploy) so they are never persisted (RUN-5).
 
     // ── Insert build job (worker picks this up via SKIP LOCKED) ──────────────
     let payload = BuildJobPayload::Upload {
@@ -621,9 +696,11 @@ pub(crate) async fn upload_and_deploy(
         zip_path: zip_path.to_string_lossy().into_owned(),
         image_tag: image_tag.clone(),
         ports,
-        env,
+        env: seal_job_env(owner_id, env),
+        env_encrypted: true,
         writable,
         writable_path: writable_path.clone(),
+        workload_kind: workload_kind.clone(),
     };
 
     let payload_value = match serde_json::to_value(&payload) {
@@ -735,13 +812,29 @@ fn validate_agent_zip(
         return Err("Dockerfile has no FROM instruction".into());
     }
 
-    // At least one Python entrypoint must exist
+    // The agent must declare how it starts — in a language-agnostic way. Either
+    // the Dockerfile carries its own CMD/ENTRYPOINT (any runtime: Node, Rust, Go,
+    // a prebuilt binary), or a conventional Python entrypoint file is present
+    // (kept for Python agents whose Dockerfile relies on the base image's CMD).
+    //
+    // This replaced a Python-only `main.py` requirement that was coupled to a
+    // long-removed Dockerfile OTel-patching step (`patch_dockerfile_for_otel`,
+    // deleted 2026-08-01) and wrongly rejected every non-Python agent even though
+    // the rest of the pipeline builds from the Dockerfile alone.
+    let dockerfile_declares_start = contents.lines().any(|l| {
+        let u = l.trim_start().to_ascii_uppercase();
+        u.starts_with("CMD ")
+            || u.starts_with("CMD[")
+            || u.starts_with("ENTRYPOINT ")
+            || u.starts_with("ENTRYPOINT[")
+    });
     let entrypoints = ["main.py", "src/main.py", "src/__main__.py", "__main__.py"];
-    let has_entrypoint = entrypoints.iter().any(|p| dest.join(p).exists());
-    if !has_entrypoint {
-        tracing::warn!(zip_path = %zip_path.display(), reason = "missing entrypoint", "upload rejected: invalid agent structure");
+    let has_entrypoint_file = entrypoints.iter().any(|p| dest.join(p).exists());
+    if !dockerfile_declares_start && !has_entrypoint_file {
+        tracing::warn!(zip_path = %zip_path.display(), reason = "no startup command", "upload rejected: invalid agent structure");
         return Err(
-            "no Python entrypoint found (main.py, src/main.py, __main__.py, or src/__main__.py)"
+            "no startup command found — add a CMD or ENTRYPOINT to your Dockerfile, or include \
+             a Python entrypoint (main.py, src/main.py, __main__.py, or src/__main__.py)"
                 .into(),
         );
     }
@@ -855,171 +948,36 @@ async fn record_uploaded_version(
     .await;
 }
 
-// ─── Build-time OTel patching ────────────────────────────────────────────────
+/// Bumps `base`'s patch number until it finds a version not already used —
+/// server-side mirror of the CLI's `suggest_unused_version`.
+async fn suggest_next_version(db: &sqlx::PgPool, agent_id: Uuid, base: &str) -> String {
+    let used: Vec<String> =
+        sqlx::query_scalar("SELECT version FROM agent_versions WHERE agent_id = $1")
+            .bind(agent_id)
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
 
-/// Python bootstrap script injected as `_nasiko_otel_boot.py` and loaded via
-/// `PYTHONSTARTUP`. Runs before the agent's own code, so the agent doesn't need
-/// to call `init_telemetry()` or install any OTel packages explicitly.
-///
-/// What it does:
-/// - Sets up W3C TraceContext propagation (`traceparent` on all outbound HTTP)
-/// - Auto-instruments httpx, requests, and the OpenAI/Anthropic SDKs
-/// - Exports traces + metrics to the OTLP collector if `OTEL_EXPORTER_OTLP_ENDPOINT` is set
-///
-/// Gracefully no-ops if the OTel packages aren't installed (shouldn't happen
-/// since `patch_otel_into_dockerfile` adds them to the Dockerfile).
-const OTEL_BOOTSTRAP_PY: &str = r#""""Auto-injected by the Nasiko build pipeline — DO NOT EDIT."""
-import os as _os, logging as _logging
-
-def _nasiko_otel_boot():
-    try:
-        from opentelemetry import trace, metrics
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor
-        from opentelemetry.sdk.resources import Resource
-        from opentelemetry.propagate import set_global_textmap
-        from opentelemetry.propagators.composite import CompositePropagator
-        from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-    except ImportError:
-        return
-
-    name = _os.environ.get("OTEL_SERVICE_NAME", "nasiko-agent")
-    resource = Resource.create({"service.name": name})
-    set_global_textmap(CompositePropagator([TraceContextTextMapPropagator()]))
-    tp = TracerProvider(resource=resource)
-
-    endpoint = _os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
-    if endpoint:
-        try:
-            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-            from opentelemetry.sdk.metrics import MeterProvider
-            from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-            from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-            tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, insecure=True)))
-            metrics.set_meter_provider(MeterProvider(
-                resource=resource,
-                metric_readers=[PeriodicExportingMetricReader(
-                    OTLPMetricExporter(endpoint=endpoint, insecure=True),
-                    export_interval_millis=10000,
-                )],
-            ))
-        except Exception:
-            pass
-
-    trace.set_tracer_provider(tp)
-
-    # Auto-instrument HTTP clients + LLM SDKs (best-effort per library).
-    for mod_path, cls in [
-        ("opentelemetry.instrumentation.httpx", "HTTPXClientInstrumentor"),
-        ("opentelemetry.instrumentation.requests", "RequestsInstrumentor"),
-        ("opentelemetry.instrumentation.openai_v2", "OpenAIInstrumentor"),
-        ("opentelemetry.instrumentation.openai", "OpenAIInstrumentor"),
-        ("opentelemetry.instrumentation.anthropic", "AnthropicInstrumentor"),
-    ]:
-        try:
-            import importlib
-            instrumentor = getattr(importlib.import_module(mod_path), cls)()
-            if not instrumentor.is_instrumented_by_opentelemetry:
-                instrumentor.instrument()
-        except Exception:
-            pass
-
-_nasiko_otel_boot()
-del _nasiko_otel_boot
-"#;
-
-/// OTel pip packages injected into the Dockerfile. Kept minimal — only what the
-/// bootstrap script actually imports. `--no-deps` would be ideal but some of
-/// these have transitive deps, so we let pip resolve.
-const OTEL_PIP_PACKAGES: &str = "\
-    opentelemetry-api \
-    opentelemetry-sdk \
-    opentelemetry-exporter-otlp-proto-grpc \
-    opentelemetry-instrumentation-httpx \
-    opentelemetry-instrumentation-requests \
-    opentelemetry-instrumentation-openai-v2";
-
-/// Patch a Python agent's Dockerfile to auto-install OTel packages and inject
-/// the bootstrap script. Skips non-Python Dockerfiles (no `python` base image).
-/// Best-effort: errors are logged and the build proceeds unpatched.
-fn patch_otel_into_dockerfile(source_dir: &std::path::Path, dockerfile: &std::path::Path) {
-    let contents = match std::fs::read_to_string(dockerfile) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(%e, "otel patch: cannot read Dockerfile, skipping");
-            return;
-        }
+    let bump = |v: &str| {
+        super::versions::parse_plain_version(v)
+            .map(|mut sv| {
+                sv.patch += 1;
+                sv.to_string()
+            })
+            .unwrap_or_else(|| "0.1.0".to_string())
     };
-
-    // Only patch Python-based images. Matching bare `slim`/`alpine` here also
-    // catches `FROM node:20-slim`, `FROM ruby:3-alpine`, and friends — and since
-    // the injected `pip install` layer then fails on an image with no pip, that
-    // mismatch doesn't merely skip instrumentation, it fails the whole build for
-    // an agent that was never Python to begin with. Require `python` in the base
-    // image ref, matching this function's documented contract.
-    let is_python = contents
-        .lines()
-        .any(|l| l.trim().starts_with("FROM ") && l.contains("python"));
-    if !is_python {
-        tracing::debug!("otel patch: Dockerfile does not appear Python-based, skipping");
-        return;
+    let mut candidate = bump(base);
+    while used.iter().any(|u| u == &candidate) {
+        candidate = bump(&candidate);
     }
-
-    // Don't double-patch if the agent already bundles the bootstrap.
-    if source_dir.join("_nasiko_otel_boot.py").exists() {
-        tracing::debug!("otel patch: _nasiko_otel_boot.py already exists, skipping");
-        return;
-    }
-
-    // Write the bootstrap script.
-    if let Err(e) = std::fs::write(source_dir.join("_nasiko_otel_boot.py"), OTEL_BOOTSTRAP_PY) {
-        tracing::warn!(%e, "otel patch: failed to write bootstrap script, skipping");
-        return;
-    }
-
-    // Append to Dockerfile: install OTel deps, copy bootstrap, set PYTHONSTARTUP.
-    // Inserted before the last CMD/ENTRYPOINT line so the layer order is correct.
-    // `PIP_BREAK_SYSTEM_PACKAGES=1` is scoped to this RUN layer (not a persistent
-    // ENV) and keeps the install working on a distro-managed interpreter, where
-    // PEP 668 otherwise aborts with `error: externally-managed-environment`.
-    // pip older than 23.1 doesn't know the flag and simply ignores the env var.
-    let patch = format!(
-        "\n# ── Nasiko OTel auto-instrumentation (injected at build time) ──\n\
-         RUN PIP_BREAK_SYSTEM_PACKAGES=1 pip install --no-cache-dir {OTEL_PIP_PACKAGES}\n\
-         COPY _nasiko_otel_boot.py /opt/nasiko/_nasiko_otel_boot.py\n\
-         ENV PYTHONSTARTUP=/opt/nasiko/_nasiko_otel_boot.py\n"
-    );
-
-    // Find the last CMD or ENTRYPOINT line and insert before it.
-    let lines: Vec<&str> = contents.lines().collect();
-    let insert_pos = lines
-        .iter()
-        .rposition(|l| {
-            let t = l.trim();
-            t.starts_with("CMD ") || t.starts_with("ENTRYPOINT ")
-        })
-        .unwrap_or(lines.len());
-
-    let mut patched = lines[..insert_pos].join("\n");
-    patched.push_str(&patch);
-    patched.push_str(&lines[insert_pos..].join("\n"));
-    patched.push('\n');
-
-    if let Err(e) = std::fs::write(dockerfile, &patched) {
-        tracing::warn!(%e, "otel patch: failed to write patched Dockerfile");
-        return;
-    }
-
-    tracing::info!("otel patch: injected OTel auto-instrumentation into Dockerfile");
+    candidate
 }
 
 /// Execute the full upload-and-deploy pipeline: extract, OTel patch, docker build, deploy.
 /// Called by the build worker.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_upload_and_deploy(
-    runtime: std::sync::Arc<dyn nasiko_runtime::ContainerRuntime>,
-    db: sqlx::PgPool,
-    http: reqwest::Client,
+    state: &AppState,
     build_id: Uuid,
     agent_id: Uuid,
     owner_id: Uuid,
@@ -1028,26 +986,19 @@ pub async fn execute_upload_and_deploy(
     zip_path: PathBuf,
     image_tag: String,
     ports: Vec<u16>,
-    mut env: HashMap<String, String>,
-    // Server-level LLM defaults, injected here (not baked into the DB payload) so
-    // the API key is never persisted in cleartext (RUN-5). Caller env wins.
-    openai_api_key: Option<String>,
-    openai_base_url: Option<String>,
-    agent_runtime: String,
-    agent_image_registry: String,
-    max_replicas: u32,
+    // The caller's own `env` field, opened. The platform's env is assembled only once the image
+    // has built (below), so a failed build never rotates the running agent's credentials.
+    job_env: HashMap<String, String>,
     writable: bool,
     writable_path: Option<String>,
-    default_memory: String,
+    workload_kind: nasiko_runtime::WorkloadKind,
 ) {
-    if let Some(key) = openai_api_key {
-        env.entry("OPENAI_API_KEY".to_owned()).or_insert(key);
-    }
-    if let Some(url) = openai_base_url {
-        env.entry("OPENAI_BASE_URL".to_owned()).or_insert(url);
-    }
-    set_build_status(&db, build_id, BuildStatus::Building).await;
-    set_upload_status(&db, &upload_id, &name, owner_id, "initiated", None, None).await;
+    let db = &state.db;
+    let runtime = &state.runtime;
+    // Before the deploy env, which may reset the agent's state mode for the new image.
+    let scaling = state.agent_scaling.begin_deploy(agent_id).await;
+    set_build_status(db, build_id, BuildStatus::Building).await;
+    set_upload_status(db, &upload_id, &name, owner_id, "initiated", None, None).await;
 
     let tmp_dir = std::env::temp_dir().join(format!("nasiko-agent-{build_id}"));
 
@@ -1059,29 +1010,30 @@ pub async fn execute_upload_and_deploy(
             .await
             .map_err(|e| format!("spawn_blocking extract: {e}"))??;
 
-        set_upload_status(&db, &upload_id, &name, owner_id, "processing", None, None).await;
+        set_upload_status(db, &upload_id, &name, owner_id, "processing", None, None).await;
 
         let dockerfile_path = tmp_dir.join("Dockerfile");
         if !dockerfile_path.exists() {
             return Err("no Dockerfile found in source zip".into());
         }
 
-        // ── OTel patch ───────────────────────────────────────────────────────
-        // Inject traceparent propagation + GenAI instrumentation into Python
-        // agents so they get traces, LLM spans, and classifier support without
-        // any agent-side code changes. Best-effort: a non-Python Dockerfile is
-        // left untouched.
-        patch_otel_into_dockerfile(&tmp_dir, &dockerfile_path);
-
-        // Build Docker image.
-        let tar_bytes = build::tar_directory(&tmp_dir).map_err(|e| format!("tar source: {e}"))?;
+        // Build Docker image. tar_directory walks the whole source tree and
+        // builds the archive in memory — synchronous CPU + IO, so it goes on the
+        // blocking pool. With build_concurrency > 1 running it inline would block
+        // one runtime thread per in-flight build, on the same runtime serving the
+        // HTTP API.
+        let src = tmp_dir.clone();
+        let tar_bytes = tokio::task::spawn_blocking(move || build::tar_directory(&src))
+            .await
+            .map_err(|e| format!("spawn_blocking tar: {e}"))?
+            .map_err(|e| format!("tar source: {e}"))?;
         runtime
             .build(&tar_bytes, &image_tag)
             .await
             .map_err(|e| format!("docker build: {e}"))?;
 
         set_upload_status(
-            &db,
+            db,
             &upload_id,
             &name,
             owner_id,
@@ -1091,6 +1043,34 @@ pub async fn execute_upload_and_deploy(
         )
         .await;
 
+        // Read before the deploy env is built: a failed read must not rotate the running
+        // agent's credentials or reset its state mode for a deploy that never happens.
+        let replica_bounds = scaling
+            .bounds()
+            .await
+            .map_err(|e| format!("read replica bounds: {e}"))?;
+        // Minted only now that the image exists: this rotates the agent's gateway and state
+        // credentials, and a build that failed must leave the running pods' credentials alone.
+        // Nothing below can fail before `scaling.deploy` (spec building and the pull
+        // credential attach are infallible; the latter logs its errors), so the durable state
+        // mode the build above may have reset needs no restoring on an early exit.
+        let mut env = crate::agents::deploy_env::build(
+            state,
+            agent_id,
+            owner_id,
+            job_env,
+            crate::agents::deploy_env::StateModeOnDeploy::Reset,
+        )
+        .await;
+        // Server-level LLM defaults, injected here (not baked into the DB payload) so the API
+        // key is never persisted in cleartext (RUN-5). Caller env wins.
+        if let Some(key) = state.config.openai_api_key.clone() {
+            env.entry("OPENAI_API_KEY".to_owned()).or_insert(key);
+        }
+        if let Some(url) = state.config.openai_base_url.clone() {
+            env.entry("OPENAI_BASE_URL".to_owned()).or_insert(url);
+        }
+
         // Deploy container keyed on agent UUID (not name) — see build_agent_spec.
         let mut spec = crate::agents::build_agent_spec(
             agent_id,
@@ -1098,27 +1078,37 @@ pub async fn execute_upload_and_deploy(
             image_tag.clone(),
             ports,
             env,
-            &default_memory,
-            max_replicas,
+            &state.config.agent_default_memory,
+            replica_bounds,
             writable,
             writable_path.clone(),
             owner_id,
         );
+        // An ACP coding agent is driven over a stdio turn, not reverse-proxied:
+        // tag the workload and strip the inbound port (and the PORT env
+        // `build_agent_spec` injects for it) so it deploys port-less, matching the
+        // spec the coding-turn path builds (`coding::proxy::build_spec`).
+        spec.workload_kind = workload_kind;
+        if workload_kind == nasiko_runtime::WorkloadKind::AcpCodingAgent {
+            spec.ports.clear();
+            spec.env_vars.remove("PORT");
+            spec.writable = true;
+        }
         crate::agents::attach_pull_credential(
-            &db,
-            &agent_runtime,
-            &agent_image_registry,
+            db,
+            &state.config.agent_runtime,
+            &state.config.agent_image_registry,
             &mut spec,
             agent_id,
         )
         .await;
-        let deploy_status = runtime
+        let deploy_status = scaling
             .deploy(&spec)
             .await
             .map_err(|e| format!("deploy: {e}"))?;
 
         set_upload_status(
-            &db,
+            db,
             &upload_id,
             &name,
             owner_id,
@@ -1140,9 +1130,9 @@ pub async fn execute_upload_and_deploy(
 
     match result {
         Ok(deploy_status) => {
-            set_build_status(&db, build_id, BuildStatus::Success).await;
+            set_build_status(db, build_id, BuildStatus::Success).await;
             set_upload_status(
-                &db,
+                db,
                 &upload_id,
                 &name,
                 owner_id,
@@ -1155,9 +1145,9 @@ pub async fn execute_upload_and_deploy(
             // already-deployed agent must land here too, which this activates and
             // archives whatever was previously running for (mirroring `update.rs`'s
             // redeploy path). A genuinely first upload has nothing to archive yet.
-            record_uploaded_version(&db, agent_id, build_id, &image_tag).await;
+            record_uploaded_version(db, agent_id, build_id, &image_tag).await;
             let agent_url = crate::agents::resolve_agent_url(
-                &runtime,
+                runtime,
                 &deploy_status,
                 &nasiko_runtime::ContainerId::from_uuid(agent_id),
             )
@@ -1167,13 +1157,13 @@ pub async fn execute_upload_and_deploy(
             )
             .bind(agent_id)
             .bind(&agent_url)
-            .execute(&db)
+            .execute(db)
             .await;
             // Fetch the agent's card in the background to persist skills,
             // description and the advertised transport_path (chat URL).
             tokio::spawn(super::utils::fetch_agent_card_with_retry(
                 db.clone(),
-                http,
+                state.http_client.clone(),
                 agent_id,
                 agent_url.clone(),
             ));
@@ -1189,17 +1179,17 @@ pub async fn execute_upload_and_deploy(
             .bind(build_id)
             .bind(owner_id)
             .bind(agent_id.to_string())
-            .execute(&db)
+            .execute(db)
             .await;
             tracing::info!(build_id = %build_id, agent_id = %agent_id, "upload-and-deploy succeeded");
         }
         Err(e) => {
-            set_build_status(&db, build_id, BuildStatus::Failed).await;
+            set_build_status(db, build_id, BuildStatus::Failed).await;
             // `e` may embed raw docker/tar/IO error text — log it, but
             // upload_status.error_message is read back by clients via
             // GET /agents/uploads, so store a generic reason there.
             set_upload_status(
-                &db,
+                db,
                 &upload_id,
                 &name,
                 owner_id,
@@ -1208,45 +1198,91 @@ pub async fn execute_upload_and_deploy(
                 Some("upload and deploy failed"),
             )
             .await;
-            super::utils::delete_agent_or_mark_failed(&db, agent_id).await;
+            super::utils::delete_agent_or_mark_failed(db, agent_id, &state.agent_deletion_hook)
+                .await;
             tracing::error!(build_id = %build_id, %e, "upload-and-deploy failed");
         }
     }
 }
 
+/// Restores this agent to `prior_version`/`prior_image`/`prior_status` — what
+/// it was before the queueing handler optimistically overwrote it with a
+/// placeholder — for any rejection that happened before a build/deploy ever
+/// ran. A brand-new agent has nothing to restore to, so it's cleaned up like
+/// any other pre-build rejection instead.
+async fn restore_prior_state_or_clean_up(
+    db: &sqlx::PgPool,
+    agent_id: Uuid,
+    prior_version: &Option<String>,
+    prior_image: &Option<String>,
+    prior_status: &Option<String>,
+    deletion_hook: &std::sync::Arc<crate::agent_lifecycle::SwappableAgentDeletionHook>,
+) {
+    match (prior_version, prior_status) {
+        (Some(pv), Some(ps)) => {
+            let _ = sqlx::query(
+                "UPDATE agents SET version = $2, image = $3, status = $4, \
+                 updated_at = now() WHERE id = $1",
+            )
+            .bind(agent_id)
+            .bind(pv)
+            .bind(prior_image)
+            .bind(ps)
+            .execute(db)
+            .await;
+        }
+        _ => {
+            super::utils::delete_agent_or_mark_failed(db, agent_id, deletion_hook).await;
+        }
+    }
+}
+
 /// Execute the full clone-and-deploy pipeline: extract tar.gz, OTel patch, docker build, deploy.
-/// Called by the build worker for `BuildJobPayload::Clone` jobs.
+/// Called by the build worker for `BuildJobPayload::Clone` jobs, and internally
+/// by [`execute_github_clone_and_deploy`] once its git-clone step succeeds.
+///
+/// `prior_version`/`prior_image`/`prior_status` are `Some` only if this
+/// pipeline overwrote a pre-existing agent — see
+/// [`restore_prior_state_or_clean_up`], which decides whether a failure here
+/// restores that snapshot or cleans up a genuinely brand-new agent.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_clone_and_deploy(
-    runtime: std::sync::Arc<dyn nasiko_runtime::ContainerRuntime>,
-    db: sqlx::PgPool,
-    http: reqwest::Client,
+    state: &AppState,
     build_id: Uuid,
     agent_id: Uuid,
     owner_id: Uuid,
     upload_id: String,
     name: String,
     tar_gz_path: PathBuf,
-    image_tag: String,
     ports: Vec<u16>,
-    mut env: HashMap<String, String>,
-    openai_api_key: Option<String>,
-    openai_base_url: Option<String>,
-    agent_runtime: String,
-    agent_image_registry: String,
-    max_replicas: u32,
-    default_memory: String,
+    // The caller's own `env` field. The platform's env is assembled only once the image has
+    // built (below), so a failed clone or build never rotates the running agent's credentials.
+    job_env: HashMap<String, String>,
+    version_override: Option<String>,
+    // What this agent's `version`/`image`/`status` were before the queueing
+    // handler optimistically overwrote them with a placeholder — `None` for
+    // a brand-new agent with nothing to restore. Used to put the row back
+    // exactly as it was if this attempt is rejected for a version conflict
+    // before any build/deploy runs (see the `VERSION_CONFLICT` branch below).
+    prior_version: Option<String>,
+    prior_image: Option<String>,
+    prior_status: Option<String>,
 ) {
-    if let Some(key) = openai_api_key {
-        env.entry("OPENAI_API_KEY".to_owned()).or_insert(key);
-    }
-    if let Some(url) = openai_base_url {
-        env.entry("OPENAI_BASE_URL".to_owned()).or_insert(url);
-    }
-    set_build_status(&db, build_id, BuildStatus::Building).await;
-    set_upload_status(&db, &upload_id, &name, owner_id, "initiated", None, None).await;
+    let db = &state.db;
+    let runtime = &state.runtime;
+    // Before the deploy env, which may reset the agent's state mode for the new image.
+    let scaling = state.agent_scaling.begin_deploy(agent_id).await;
+    let agent_image_registry = &state.config.agent_image_registry;
+    set_build_status(db, build_id, BuildStatus::Building).await;
+    set_upload_status(db, &upload_id, &name, owner_id, "initiated", None, None).await;
 
     let tmp_dir = std::env::temp_dir().join(format!("nasiko-clone-{build_id}"));
+
+    // Set once `reserve_version` below actually claims a version — lets the
+    // success/failure handling finalize or release that exact reservation
+    // without needing to thread the version string through every error
+    // variant.
+    let mut claimed_version: Option<String> = None;
 
     let result: Result<(DeploymentStatus, String), String> = async {
         // Read tar.gz bytes then extract on the blocking pool.
@@ -1259,45 +1295,73 @@ pub async fn execute_clone_and_deploy(
         .await
         .map_err(|e| format!("spawn_blocking extract: {e}"))??;
 
-        set_upload_status(&db, &upload_id, &name, owner_id, "processing", None, None).await;
+        set_upload_status(db, &upload_id, &name, owner_id, "processing", None, None).await;
 
         // ── Extract version from project files (same logic as zip upload) ────
         // Resolution order: AgentCard.json → pyproject.toml → Cargo.toml.
         // If a valid x.y.z version is found, update the image tag and DB records
         // so the clone path doesn't default everything to "latest".
         let image_tag = {
-            let detected = detect_version_from_dir(&tmp_dir);
-            if let Some(ref ver) = detected {
-                if super::versions::parse_plain_version(ver).is_some() {
-                    let new_tag = crate::agents::build_image_tag(
-                        &agent_image_registry, &name, ver,
+            // An explicit override (the UI's "deploy as vX.Y.Z" suggestion)
+            // takes precedence over whatever the source repo declares.
+            let detected = version_override.clone().or_else(|| detect_version_from_dir(&tmp_dir));
+            // No default here (used to be the placeholder "latest", which
+            // broke version history) — the caller must end up with a real
+            // x.y.z version, whether the repo declares one or the UI's
+            // version-bump override supplied it.
+            let ver = match detected
+                .as_deref()
+                .filter(|v| super::versions::parse_plain_version(v).is_some())
+            {
+                Some(v) => v.to_string(),
+                None => {
+                    return Err(
+                        "no valid version found — add an x.y.z \"version\" field to \
+                         AgentCard.json (or pyproject.toml/Cargo.toml) before importing"
+                            .to_string(),
                     );
-                    // Update agents.version + agent_builds.version_tag/image_reference
-                    // to reflect the real version instead of the placeholder.
-                    let _ = sqlx::query(
-                        "UPDATE agents SET version = $2, image = $3, updated_at = now() WHERE id = $1",
-                    )
-                    .bind(agent_id)
-                    .bind(ver)
-                    .bind(&new_tag)
-                    .execute(&db)
-                    .await;
-                    let _ = sqlx::query(
-                        "UPDATE agent_builds SET version_tag = $2, image_reference = $3 WHERE id = $1",
-                    )
-                    .bind(build_id)
-                    .bind(ver)
-                    .bind(&new_tag)
-                    .execute(&db)
-                    .await;
-                    tracing::info!(%build_id, %agent_id, version = %ver, "clone: detected version from source");
-                    new_tag
-                } else {
-                    image_tag
                 }
-            } else {
-                image_tag
-            }
+            };
+
+            let new_tag = crate::agents::build_image_tag(agent_image_registry, &name, &ver);
+
+            // Atomically claim this version before any build/deploy work
+            // starts, via the real `UNIQUE(agent_id, version)` constraint —
+            // two concurrent imports racing for the same version can no
+            // longer both build and deploy before either one notices; only
+            // one `reserve_version` call can win. Released on failure below
+            // (see the `Err(e)` match), or finalized into the real active
+            // record on success.
+            super::versions::reserve_version(db, agent_id, build_id, &ver, &new_tag)
+                .await
+                .map_err(|e| match e {
+                    super::versions::VersionChangeError::VersionAlreadyExists(_) => {
+                        format!("VERSION_CONFLICT:{ver}")
+                    }
+                    e => format!("reserve version: {e}"),
+                })?;
+            claimed_version = Some(ver.clone());
+
+            // Update agents.version + agent_builds.version_tag/image_reference
+            // to reflect the real version instead of the placeholder.
+            let _ = sqlx::query(
+                "UPDATE agents SET version = $2, image = $3, updated_at = now() WHERE id = $1",
+            )
+            .bind(agent_id)
+            .bind(&ver)
+            .bind(&new_tag)
+            .execute(db)
+            .await;
+            let _ = sqlx::query(
+                "UPDATE agent_builds SET version_tag = $2, image_reference = $3 WHERE id = $1",
+            )
+            .bind(build_id)
+            .bind(&ver)
+            .bind(&new_tag)
+            .execute(db)
+            .await;
+            tracing::info!(%build_id, %agent_id, version = %ver, "clone: detected version from source");
+            new_tag
         };
 
         let dockerfile_path = tmp_dir.join("Dockerfile");
@@ -1305,18 +1369,25 @@ pub async fn execute_clone_and_deploy(
             return Err("no Dockerfile found in cloned repository".into());
         }
 
-        // OTel patch (same as upload path — see doc on `patch_otel_into_dockerfile`).
-        patch_otel_into_dockerfile(&tmp_dir, &dockerfile_path);
-
-        // Build Docker image.
-        let tar_bytes = build::tar_directory(&tmp_dir).map_err(|e| format!("tar source: {e}"))?;
+        // Build Docker image. Prefixed so the failure handler below can tell
+        // a real build was attempted here — everything before this point is
+        // a pre-build rejection instead (see the `Err(e)` match below).
+        // tar_directory is synchronous CPU + IO over the whole source tree, so
+        // it goes on the blocking pool: with build_concurrency > 1, running it
+        // inline would block one runtime thread per in-flight build, on the
+        // same runtime serving the HTTP API.
+        let src = tmp_dir.clone();
+        let tar_bytes = tokio::task::spawn_blocking(move || build::tar_directory(&src))
+            .await
+            .map_err(|e| format!("spawn_blocking tar: {e}"))?
+            .map_err(|e| format!("tar source: {e}"))?;
         runtime
             .build(&tar_bytes, &image_tag)
             .await
-            .map_err(|e| format!("docker build: {e}"))?;
+            .map_err(|e| format!("BUILD_FAILED:docker build: {e}"))?;
 
         set_upload_status(
-            &db,
+            db,
             &upload_id,
             &name,
             owner_id,
@@ -1326,6 +1397,33 @@ pub async fn execute_clone_and_deploy(
         )
         .await;
 
+        // Read before the deploy env is built: a failed read must not rotate the running
+        // agent's credentials or reset its state mode for a deploy that never happens.
+        let replica_bounds = scaling
+            .bounds()
+            .await
+            .map_err(|e| format!("BUILD_FAILED:read replica bounds: {e}"))?;
+        // Minted only now that the image exists: this rotates the agent's gateway and state
+        // credentials, and a clone or build that failed must leave the running pods alone.
+        // Nothing below can fail before `scaling.deploy` (spec building and the pull
+        // credential attach are infallible; the latter logs its errors), so the durable state
+        // mode the build above may have reset needs no restoring on an early exit.
+        let mut env = crate::agents::deploy_env::build(
+            state,
+            agent_id,
+            owner_id,
+            job_env,
+            crate::agents::deploy_env::StateModeOnDeploy::Reset,
+        )
+        .await;
+        // Server-level LLM defaults, never persisted in the job payload. Caller env wins.
+        if let Some(key) = state.config.openai_api_key.clone() {
+            env.entry("OPENAI_API_KEY".to_owned()).or_insert(key);
+        }
+        if let Some(url) = state.config.openai_base_url.clone() {
+            env.entry("OPENAI_BASE_URL".to_owned()).or_insert(url);
+        }
+
         // Deploy container keyed on agent UUID.
         let mut spec = crate::agents::build_agent_spec(
             agent_id,
@@ -1333,28 +1431,28 @@ pub async fn execute_clone_and_deploy(
             image_tag.clone(),
             ports,
             env,
-            &default_memory,
-            max_replicas,
+            &state.config.agent_default_memory,
+            replica_bounds,
             // GitHub-clone deploys don't expose a --writable flag yet.
             false,
             None,
             owner_id,
         );
         crate::agents::attach_pull_credential(
-            &db,
-            &agent_runtime,
-            &agent_image_registry,
+            db,
+            &state.config.agent_runtime,
+            agent_image_registry,
             &mut spec,
             agent_id,
         )
         .await;
-        let deploy_status = runtime
+        let deploy_status = scaling
             .deploy(&spec)
             .await
-            .map_err(|e| format!("deploy: {e}"))?;
+            .map_err(|e| format!("BUILD_FAILED:deploy: {e}"))?;
 
         set_upload_status(
-            &db,
+            db,
             &upload_id,
             &name,
             owner_id,
@@ -1375,10 +1473,10 @@ pub async fn execute_clone_and_deploy(
     }
 
     match result {
-        Ok((deploy_status, final_image_tag)) => {
-            set_build_status(&db, build_id, BuildStatus::Success).await;
+        Ok((deploy_status, _final_image_tag)) => {
+            set_build_status(db, build_id, BuildStatus::Success).await;
             set_upload_status(
-                &db,
+                db,
                 &upload_id,
                 &name,
                 owner_id,
@@ -1387,13 +1485,16 @@ pub async fn execute_clone_and_deploy(
                 None,
             )
             .await;
-            // `upload` upserts by (owner_id, name) — a second `upload` against an
-            // already-deployed agent must land here too, which this activates and
-            // archives whatever was previously running for (mirroring `update.rs`'s
-            // redeploy path). A genuinely first upload has nothing to archive yet.
-            record_uploaded_version(&db, agent_id, build_id, &final_image_tag).await;
+            // The version was already atomically claimed by `reserve_version`
+            // before the build started — this just promotes that reservation
+            // into the real active record, archiving whatever was previously
+            // running (mirroring `update.rs`'s redeploy path). A genuinely
+            // first deploy has nothing to archive yet.
+            if let Some(ver) = &claimed_version {
+                super::versions::finalize_reserved_version_with_retry(db, agent_id, ver).await;
+            }
             let agent_url = crate::agents::resolve_agent_url(
-                &runtime,
+                runtime,
                 &deploy_status,
                 &nasiko_runtime::ContainerId::from_uuid(agent_id),
             )
@@ -1403,11 +1504,11 @@ pub async fn execute_clone_and_deploy(
             )
             .bind(agent_id)
             .bind(&agent_url)
-            .execute(&db)
+            .execute(db)
             .await;
             tokio::spawn(super::utils::fetch_agent_card_with_retry(
                 db.clone(),
-                http,
+                state.http_client.clone(),
                 agent_id,
                 agent_url.clone(),
             ));
@@ -1419,24 +1520,92 @@ pub async fn execute_clone_and_deploy(
             .bind(build_id)
             .bind(owner_id)
             .bind(agent_id.to_string())
-            .execute(&db)
+            .execute(db)
             .await;
             tracing::info!(build_id = %build_id, agent_id = %agent_id, "clone-and-deploy succeeded");
         }
         Err(e) => {
-            set_build_status(&db, build_id, BuildStatus::Failed).await;
-            set_upload_status(
-                &db,
-                &upload_id,
-                &name,
-                owner_id,
-                "failed",
-                None,
-                Some("clone and deploy failed"),
-            )
-            .await;
-            super::utils::delete_agent_or_mark_failed(&db, agent_id).await;
-            tracing::error!(build_id = %build_id, %e, "clone-and-deploy failed");
+            set_build_status(db, build_id, BuildStatus::Failed).await;
+            // Free a version this attempt claimed via `reserve_version` but
+            // never finished deploying, so the same version can be retried.
+            // A no-op if nothing was ever claimed (e.g. rejected before a
+            // version was even determined).
+            if let Some(ver) = &claimed_version {
+                super::versions::release_reserved_version(db, agent_id, ver).await;
+            }
+            if let Some(ver) = e.strip_prefix("VERSION_CONFLICT:") {
+                restore_prior_state_or_clean_up(
+                    db,
+                    agent_id,
+                    &prior_version,
+                    &prior_image,
+                    &prior_status,
+                    &state.agent_deletion_hook,
+                )
+                .await;
+                // Prefixed so the client can offer "deploy as vX" instead of
+                // a dead-end error. See `add-agent-github-page.js`.
+                let suggested = suggest_next_version(db, agent_id, ver).await;
+                set_upload_status(
+                    db,
+                    &upload_id,
+                    &name,
+                    owner_id,
+                    "failed",
+                    None,
+                    Some(&format!(
+                        "VERSION_CONFLICT:{ver}:{suggested}:{name} version {ver} already \
+                         exists and versions are immutable"
+                    )),
+                )
+                .await;
+                tracing::warn!(build_id = %build_id, %agent_id, version = %ver, "clone-and-deploy rejected: version already exists");
+            } else if let Some(reason) = e.strip_prefix("BUILD_FAILED:") {
+                // A real build/deploy was attempted and failed. Whether that
+                // means "clean up" or "restore" depends on whether *this
+                // import* created the agent — not on whether it has ever
+                // been built by our own build worker before, which is wrong
+                // for a CLI-deployed agent (never built that way, yet very
+                // much pre-existing). `prior_version`/`prior_status` already
+                // answer the right question: they're `Some` only if this
+                // agent existed before this import touched it.
+                set_upload_status(
+                    db,
+                    &upload_id,
+                    &name,
+                    owner_id,
+                    "failed",
+                    None,
+                    Some("clone and deploy failed"),
+                )
+                .await;
+                restore_prior_state_or_clean_up(
+                    db,
+                    agent_id,
+                    &prior_version,
+                    &prior_image,
+                    &prior_status,
+                    &state.agent_deletion_hook,
+                )
+                .await;
+                tracing::error!(build_id = %build_id, %reason, "clone-and-deploy failed");
+            } else {
+                // Any other pre-build rejection (invalid/missing version, no
+                // Dockerfile, a history-check DB error, ...) — nothing was
+                // ever built or deployed, so restore exactly like a version
+                // conflict instead of wiping an existing agent.
+                restore_prior_state_or_clean_up(
+                    db,
+                    agent_id,
+                    &prior_version,
+                    &prior_image,
+                    &prior_status,
+                    &state.agent_deletion_hook,
+                )
+                .await;
+                set_upload_status(db, &upload_id, &name, owner_id, "failed", None, Some(&e)).await;
+                tracing::warn!(build_id = %build_id, %agent_id, %e, "clone-and-deploy rejected before any build ran");
+            }
         }
     }
 }
@@ -1478,6 +1647,10 @@ pub async fn execute_github_clone_and_deploy(
                 &name,
                 owner_id,
                 "GitHub OAuth not configured",
+                &prior_version,
+                &prior_image,
+                &prior_status,
+                &state.agent_deletion_hook,
             )
             .await;
             return;
@@ -1517,6 +1690,10 @@ pub async fn execute_github_clone_and_deploy(
                 &name,
                 owner_id,
                 "GitHub not connected",
+                &prior_version,
+                &prior_image,
+                &prior_status,
+                &state.agent_deletion_hook,
             )
             .await;
             return;
@@ -1539,6 +1716,10 @@ pub async fn execute_github_clone_and_deploy(
                 &name,
                 owner_id,
                 "git clone failed",
+                &prior_version,
+                &prior_image,
+                &prior_status,
+                &state.agent_deletion_hook,
             )
             .await;
             return;
@@ -1563,46 +1744,43 @@ pub async fn execute_github_clone_and_deploy(
             &name,
             owner_id,
             "internal error saving archive",
+            &prior_version,
+            &prior_image,
+            &prior_status,
+            &state.agent_deletion_hook,
         )
         .await;
         return;
     }
 
-    let version_tag = version_override.as_deref().unwrap_or("latest");
-    let image_tag =
-        crate::agents::build_image_tag(&state.config.agent_image_registry, &name, version_tag);
-
-    // If prior state was captured, restore on failure inside execute_clone_and_deploy
-    // (the prior_* fields are carried for future rollback support but unused today).
-    let _ = (&prior_version, &prior_image, &prior_status);
-
-    let mut platform_env = state.agent_env(agent_id).await;
-    platform_env.extend(env);
+    // The image tag is derived inside `execute_clone_and_deploy` from
+    // `version_override`, not built here and passed down — and the prior_*
+    // values are consumed there to restore the row on a version conflict, so
+    // neither the tag nor a placeholder binding for them belongs in this
+    // function any more.
     execute_clone_and_deploy(
-        state.runtime.clone(),
-        state.db.clone(),
-        state.http_client.clone(),
+        &state,
         build_id,
         agent_id,
         owner_id,
         upload_id,
         name,
         tar_gz_path,
-        image_tag,
         ports,
-        platform_env,
-        state.config.openai_api_key.clone(),
-        state.config.openai_base_url.clone(),
-        state.config.agent_runtime.clone(),
-        state.config.agent_image_registry.clone(),
-        state.config.agent_max_replicas,
-        state.config.agent_default_memory.clone(),
+        env,
+        version_override,
+        prior_version,
+        prior_image,
+        prior_status,
     )
     .await;
 }
 
 /// Drive the agent and build to a terminal failed state when the clone step
-/// fails before `execute_clone_and_deploy` can take over status management.
+/// fails before `execute_clone_and_deploy` can take over status management —
+/// restoring `prior_*` on a pre-existing agent rather than deleting it, same
+/// as every other rejection branch (see `restore_prior_state_or_clean_up`).
+#[allow(clippy::too_many_arguments)]
 async fn fail_github_clone_terminal(
     db: &sqlx::PgPool,
     build_id: Uuid,
@@ -1611,10 +1789,22 @@ async fn fail_github_clone_terminal(
     name: &str,
     owner_id: Uuid,
     reason: &str,
+    prior_version: &Option<String>,
+    prior_image: &Option<String>,
+    prior_status: &Option<String>,
+    deletion_hook: &std::sync::Arc<crate::agent_lifecycle::SwappableAgentDeletionHook>,
 ) {
     set_build_status(db, build_id, BuildStatus::Failed).await;
     set_upload_status(db, upload_id, name, owner_id, "failed", None, Some(reason)).await;
-    super::utils::delete_agent_or_mark_failed(db, agent_id).await;
+    restore_prior_state_or_clean_up(
+        db,
+        agent_id,
+        prior_version,
+        prior_image,
+        prior_status,
+        deletion_hook,
+    )
+    .await;
 }
 
 // ─── GET /deploy-status/{build_id} (SSE) ─────────────────────────────────────
@@ -2099,81 +2289,5 @@ pub(crate) async fn list_upload_agents(
             tracing::error!(%e, "list_upload_agents db error");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
-    }
-}
-
-#[cfg(test)]
-mod otel_patch_tests {
-    use super::*;
-
-    /// Write `dockerfile_contents` into a fresh temp dir, run the patch over it,
-    /// and hand back what the Dockerfile looks like afterwards.
-    fn patch(dockerfile_contents: &str, marker: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("nasiko-otel-patch-test-{marker}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let dockerfile = dir.join("Dockerfile");
-        std::fs::write(&dockerfile, dockerfile_contents).unwrap();
-
-        patch_otel_into_dockerfile(&dir, &dockerfile);
-
-        let patched = std::fs::read_to_string(&dockerfile).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        patched
-    }
-
-    #[test]
-    fn node_slim_image_is_left_untouched() {
-        // `node:20-slim` matches neither "python" nor a Python toolchain, but it
-        // does contain "slim" — the old check patched it and the injected `pip`
-        // layer failed the build outright.
-        let original =
-            "FROM node:20-slim\nRUN apt-get install -y python3\nENTRYPOINT [\"./run.sh\"]\n";
-
-        assert_eq!(
-            patch(original, "node-slim"),
-            original,
-            "a Node base image must not receive the Python OTel patch"
-        );
-    }
-
-    #[test]
-    fn alpine_non_python_image_is_left_untouched() {
-        let original = "FROM ruby:3-alpine\nENTRYPOINT [\"./run.sh\"]\n";
-
-        assert_eq!(patch(original, "ruby-alpine"), original);
-    }
-
-    #[test]
-    fn python_image_is_patched_before_the_entrypoint() {
-        let patched = patch(
-            "FROM python:3.12-slim\nCOPY . /app\nENTRYPOINT [\"python\", \"main.py\"]\n",
-            "python-slim",
-        );
-
-        assert!(patched.contains("pip install"), "expected the pip layer");
-        assert!(patched.contains("ENV PYTHONSTARTUP=/opt/nasiko/_nasiko_otel_boot.py"));
-
-        let pip_at = patched.find("pip install").unwrap();
-        let entrypoint_at = patched.find("ENTRYPOINT").unwrap();
-        assert!(
-            pip_at < entrypoint_at,
-            "the pip layer must be inserted before ENTRYPOINT"
-        );
-    }
-
-    #[test]
-    fn pip_layer_tolerates_a_distro_managed_interpreter() {
-        let patched = patch(
-            "FROM python:3.12-slim\nENTRYPOINT [\"python\", \"main.py\"]\n",
-            "pep668",
-        );
-
-        // Without this, PEP 668 aborts the layer with
-        // `error: externally-managed-environment` on a distro-managed Python.
-        assert!(
-            patched.contains("PIP_BREAK_SYSTEM_PACKAGES=1 pip install"),
-            "pip install must be able to write to a distro-managed interpreter"
-        );
     }
 }

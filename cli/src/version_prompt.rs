@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 
 use anyhow::{Result, bail};
 use dialoguer::Input;
+use nasiko_utils::term;
 use nasiko_utils::version::parse_plain_version;
 
 /// Used when there's no version to start from (first-ever deploy).
@@ -229,7 +230,7 @@ fn prompt_for_version(
     assume_yes: bool,
 ) -> Result<VersionDecision> {
     if assume_yes {
-        eprintln!("  ! {lead_in} — auto-bumping to {suggested} (--yes)");
+        term::print_warning(&format!("{lead_in} — auto-bumping to {suggested} (--yes)"));
         // `suggested` is always unused, so nothing further to check.
         return Ok(VersionDecision {
             version: suggested.to_string(),
@@ -248,8 +249,9 @@ fn prompt_for_version(
             // Versions are immutable — no overwrite option, just tell them
             // and ask again.
             println!(
-                "  ! version {input} already exists in this agent's history and versions are \
-                 immutable — pick a different version."
+                "  {} version {input} already exists in this agent's history and versions are \
+                 immutable — pick a different version.",
+                term::yellow("!")
             );
             continue;
         }

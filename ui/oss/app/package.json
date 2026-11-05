@@ -1,0 +1,19 @@
+{
+  "name": "@nasiko/web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The OSS control plane app.",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@nasiko/app-core": "workspace:*",
+    "@nasiko/app-shell": "workspace:*",
+    "@nasiko/data-access": "workspace:*",
+    "@nasiko/ui": "workspace:*",
+    "@tanstack/react-query": "^5.103.3",
+    "react": "^19.2.8",
+    "vite": "^8.3.0"
+  }
+}

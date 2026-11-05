@@ -1,5 +1,6 @@
 a2a-sdk[http-server]==1.1.1
 uvicorn[standard]>=0.30.0
+httpx>=0.28.1
 opentelemetry-api>=1.25.0
 opentelemetry-sdk>=1.25.0
 opentelemetry-distro>=0.46b0

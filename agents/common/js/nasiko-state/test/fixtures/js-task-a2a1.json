@@ -1,0 +1,46 @@
+{
+  "format": "a2a-1",
+  "task": {
+    "id": "task-js",
+    "contextId": "ctx-js",
+    "status": {
+      "state": "TASK_STATE_INPUT_REQUIRED",
+      "message": {
+        "messageId": "m1",
+        "role": "ROLE_AGENT",
+        "parts": [
+          {
+            "text": "Which city?"
+          }
+        ]
+      },
+      "timestamp": "2026-01-01T00:00:00.500Z"
+    },
+    "artifacts": [
+      {
+        "artifactId": "art-1",
+        "name": "report",
+        "parts": [
+          {
+            "text": "draft"
+          }
+        ]
+      }
+    ],
+    "history": [
+      {
+        "messageId": "m0",
+        "role": "ROLE_USER",
+        "parts": [
+          {
+            "text": "weather"
+          }
+        ]
+      }
+    ],
+    "metadata": {
+      "trace": "abc",
+      "n": 3
+    }
+  }
+}

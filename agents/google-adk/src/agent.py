@@ -4,9 +4,10 @@ from typing import Any
 
 import httpx
 from google.adk.agents import Agent
+from google.adk.errors.already_exists_error import AlreadyExistsError
 from google.adk.runners import Runner
-from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
+from nasiko_adk_sessions import session_service_from_env
 
 
 def search_wikipedia(query: str) -> str:
@@ -37,12 +38,28 @@ class ResearchAgent:
             ),
             tools=[search_wikipedia],
         )
-        self._session_service = InMemorySessionService()
+        self._session_service = session_service_from_env()
         self._runner = Runner(
             agent=self._agent,
             app_name=APP_NAME,
             session_service=self._session_service,
         )
+
+    async def _ensure_session(self, context_id: str) -> None:
+        # A durable session outlives the process and is shared by replicas, so a later turn (or
+        # another replica) finds it already there; creating it again is refused.
+        existing = await self._session_service.get_session(
+            app_name=APP_NAME, user_id="user", session_id=context_id
+        )
+        if existing is not None:
+            return
+        try:
+            await self._session_service.create_session(
+                app_name=APP_NAME, user_id="user", session_id=context_id
+            )
+        except AlreadyExistsError:
+            # Another replica created it between the get and the create; that session is ours too.
+            pass
 
     async def stream(self, query: str, context_id: str) -> AsyncIterable[dict[str, Any]]:
         yield {
@@ -50,11 +67,7 @@ class ResearchAgent:
             "require_user_input": False,
             "content": "Researching...",
         }
-        await self._session_service.create_session(
-            app_name=APP_NAME,
-            user_id="user",
-            session_id=context_id,
-        )
+        await self._ensure_session(context_id)
         final_text = ""
         async for event in self._runner.run_async(
             user_id="user",

@@ -11,11 +11,20 @@ path = "src/lib.rs"
 name = "mock-llm"
 path = "src/bin/mock_llm.rs"
 
+# R14 load test: many users importing large coding-agent histories at once
+# against a separately started server. Driven by scripts/loadtest-coding-agent-import.sh.
+[[bin]]
+name = "coding-agent-import-load"
+path = "src/bin/coding_agent_import_load.rs"
+
 [dependencies]
 nasiko-config = { workspace = true }
 nasiko-auth = { workspace = true }
 nasiko-runtime = { workspace = true, features = ["simulated"] }
 nasiko-server = { workspace = true }
+# For `S3Storage` — the bench harness builds the same object store the OSS
+# composition root does, since `AppState` now receives it.
+nasiko-oci = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }
@@ -23,3 +32,10 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# For the coding-agent import load test (`src/coding_agent_import/`).
+nasiko-types = { workspace = true }
+nasiko-pricing = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }

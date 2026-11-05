@@ -22,6 +22,107 @@ pub fn router() -> Router<AppState> {
         .route("/flows/{flow_id}/steps", post(add_step))
 }
 
+/// Why a request could not open its `flows` row.
+#[derive(Debug)]
+pub enum OpenFlowError {
+    /// The flow already exists and belongs to a different user. The `flow_id` is a trace id, and
+    /// an inbound `traceparent` is caller-supplied, so a request can name any flow it has seen.
+    /// Re-opening or joining it would let the caller act inside that user's flow: whatever the
+    /// platform resolves from the flow — whose memory, whose MCP permissions — would resolve to
+    /// the other user.
+    ForeignFlow,
+    Db(sqlx::Error),
+}
+
+/// The flow a request is about to open.
+pub struct NewFlow<'a> {
+    pub flow_id: &'a str,
+    pub user_id: Uuid,
+    pub root_agent_id: Option<Uuid>,
+    pub root_agent_name: &'a str,
+    pub title: Option<&'a str>,
+    pub metadata: &'a serde_json::Value,
+    /// `flows.session_id` (0058): the conversation this flow belongs to, as a column so
+    /// `session/list` can group by it. Written on insert only, like the rest of the row; `None`
+    /// where the caller has no conversation to name.
+    pub session_id: Option<&'a str>,
+}
+
+/// Whether `flow_id` already exists and belongs to someone other than `user_id`.
+///
+/// Callers run this before touching any per-flow state (the flow guard's Redis counters), so a
+/// request replaying another user's trace id cannot spend that flow's depth or fan-out budget
+/// before [`open_flow`] rejects it.
+pub async fn flow_belongs_to_another(
+    db: &sqlx::PgPool,
+    flow_id: &str,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM flows WHERE flow_id = $1 AND user_id <> $2)")
+        .bind(flow_id)
+        .bind(user_id)
+        .fetch_one(db)
+        .await
+}
+
+/// Open the `flows` row for a request, or re-open the caller's own (a repeat request under one
+/// traceparent must not inherit the `completed` status the previous one left, or strict
+/// attribution denies the agent's LLM calls).
+///
+/// One statement, so ownership cannot change between the check and the write: the conflict
+/// branch only updates a row whose `user_id` matches, and a row that doesn't match returns
+/// nothing. Never succeed for a flow that belongs to another user — see
+/// [`OpenFlowError::ForeignFlow`].
+pub async fn open_flow(db: &sqlx::PgPool, flow: NewFlow<'_>) -> Result<(), OpenFlowError> {
+    let opened: Option<String> = sqlx::query_scalar(
+        r#"INSERT INTO flows (flow_id, user_id, root_agent_id, root_agent_name, title, status, metadata, session_id)
+           VALUES ($1, $2, $3, $4, $5, 'running', $6, $7)
+           ON CONFLICT (flow_id) DO UPDATE
+              SET status = 'running', completed_at = NULL
+              WHERE flows.user_id = EXCLUDED.user_id
+           RETURNING flow_id"#,
+    )
+    .bind(flow.flow_id)
+    .bind(flow.user_id)
+    .bind(flow.root_agent_id)
+    .bind(flow.root_agent_name)
+    .bind(flow.title)
+    .bind(flow.metadata)
+    .bind(flow.session_id)
+    .fetch_optional(db)
+    .await
+    .map_err(OpenFlowError::Db)?;
+    opened.map(|_| ()).ok_or(OpenFlowError::ForeignFlow)
+}
+
+/// Record `agent_id` as a participant of `flow_id` — the durable fact that the
+/// flow was dispatched to this agent. Awaited (not spawned) so the row is
+/// guaranteed present before the agent container can call back into the
+/// platform.
+///
+/// LOAD-BEARING for authorization: the MCP gateway and the LLM router only
+/// serve a `tools/call` / LLM call when the authenticated agent is a recorded
+/// participant of the flow named by the request's `traceparent`
+/// (docs/MCP_GATEWAY_AGENT_AUTH.md §2.4). A missed insert here is a denial for
+/// that agent — never an escalation — but it is still an agent outage, so
+/// every dispatch path must call this alongside its `flows` insert.
+pub async fn record_participant(db: &sqlx::PgPool, flow_id: &str, agent_id: Uuid) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO flow_participants (flow_id, agent_id) VALUES ($1, $2)
+         ON CONFLICT (flow_id, agent_id) DO NOTHING",
+    )
+    .bind(flow_id)
+    .bind(agent_id)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(
+            error = %e, %flow_id, %agent_id,
+            "flow participant record failed — this agent's MCP/LLM calls in this flow will be denied"
+        );
+    }
+}
+
 // ─── Models ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]

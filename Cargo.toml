@@ -3,24 +3,31 @@ resolver = "3"
 members = [
     # ─── OSS crates ─────────────────────────────────────────────────────────
     "auth",
+    "compress",
     "config",
     "secrets",
     "observability",
+    "pricing",
+    "savings",
     "runtime",
     "react-agent",
+    "acp-client",
+    "session-token",
     "orchestrator",
     "types",
     "utils",
     "server",
+    "spa",
+    "coding-policy",
     "oci",
     "flow",
     "hitl",
     "agent-proxy",
     "llm-router",
+    "tool-compact",
     "mcp-gateway",
     "cli",
     "github",
-    "oidc",
     "bench",
     "bench-support",
 ]
@@ -32,22 +39,30 @@ version = "0.1.0"
 [workspace.dependencies]
 # ─── Internal OSS crates ────────────────────────────────────────────────────
 nasiko-auth = { path = "auth" }
+nasiko-compress = { path = "compress" }
 nasiko-config = { path = "config" }
+nasiko-pricing = { path = "pricing" }
+nasiko-savings = { path = "savings" }
 nasiko-flow = { path = "flow" }
+nasiko-hitl = { path = "hitl" }
 nasiko-agent-proxy = { path = "agent-proxy" }
 nasiko-mcp-gateway = { path = "mcp-gateway" }
 nasiko-github = { path = "github" }
-nasiko-oidc = { path = "oidc" }
 nasiko-secrets = { path = "secrets" }
 nasiko-observability = { path = "observability" }
 nasiko-runtime = { path = "runtime", default-features = false }
 nasiko-react-agent = { path = "react-agent" }
+nasiko-acp-client = { path = "acp-client" }
+nasiko-session-token = { path = "session-token" }
 nasiko-orchestrator = { path = "orchestrator" }
 nasiko-types = { path = "types" }
 nasiko-utils = { path = "utils" }
 nasiko-server = { path = "server" }
+nasiko-spa = { path = "spa" }
+nasiko-coding-policy = { path = "coding-policy" }
 nasiko-oci = { path = "oci" }
 nasiko-llm-router = { path = "llm-router" }
+nasiko-tool-compact = { path = "tool-compact" }
 nasiko-bench-support = { path = "bench-support" }
 
 # ─── Testing ────────────────────────────────────────────────────────────────
@@ -57,7 +72,7 @@ serial_test = "3"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["json", "query", "multipart"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "decompression-zstd"] }
 
 # ─── OpenAPI docs ───────────────────────────────────────────────────────────
 utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
@@ -65,14 +80,15 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 # ─── Serialization ──────────────────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value`: the agent state API stores and returns JSON bodies byte for byte, never re-encoded.
+serde_json = { version = "1", features = ["raw_value"] }
 
 # ─── Text / patterns ────────────────────────────────────────────────────────
 regex = "1"
 
 # ─── Database & state ───────────────────────────────────────────────────────
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "rust_decimal", "migrate", "json"] }
-redis = { version = "0.27", features = ["tokio-comp", "aio"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "rust_decimal", "migrate", "json", "tls-rustls"] }
+redis = { version = "0.27", features = ["tokio-comp", "aio", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 rust_decimal = { version = "1.36", features = ["serde", "db-postgres"] }
 
 # ─── Auth ───────────────────────────────────────────────────────────────────
@@ -81,9 +97,25 @@ bcrypt = "0.15"
 
 # ─── HTTP client ────────────────────────────────────────────────────────────
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rustls = { version = "0.23", features = ["ring"] }
+
+# ─── LLM orchestration ──────────────────────────────────────────────────────
+# Exact-pinned, not a "0.11" caret range: the orchestrator's HITL pause detection
+# (oss/react-agent) recovers a tool error through rig's type-erasure boxing, verified
+# against this exact version's `ToolSetError`/`ToolError::ToolCallError` shape
+# (rig-core-0.11.1/src/tool.rs). A `cargo update` under a caret range could silently
+# move that boxing behavior without anything here noticing.
+rig-core = { version = "=0.11.1", default-features = false, features = ["derive"] }
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
-clap = { version = "4", features = ["derive"] }
+toml_edit = "0.25"
+# `string`: lets `nasiko completions` rebuild the command tree without hidden subcommands
+# (clap_complete would otherwise offer internal helpers like `__coding-agent-token` on TAB).
+clap = { version = "4", features = ["derive", "string"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+# Edit distance for the CLI's "did you mean '<agent>'?" hint; already in the build via clap.
+strsim = "0.11"
 ureq = { version = "3", features = ["json"] }
 dialoguer = "0.11"
 indicatif = "0.17"
@@ -94,7 +126,16 @@ which = "7"
 include_dir = "0.7"
 ratatui = "0.29"
 crossterm = "0.29"
-tabled = "0.21"
+tabled = { version = "0.21", features = ["ansi"] }
+# Already pulled in transitively via console (dialoguer's dep) at this exact version; declared
+# directly here only for `oss/cli`'s own scoped SIGINT no-op guard (hitl.rs) — see its doc
+# comment for why dialoguer/console's own Ctrl+C handling can't be used for this instead.
+libc = "0.2"
+# Read-only access to coding agents' local history stores (OpenCode's opencode.db, Cursor's
+# state.vscdb) for `nasiko agents setup/import`. Pinned to 0.32 because it links the same
+# libsqlite3-sys (0.30) that sqlx's optional sqlite driver already puts in the lockfile — two
+# crates may not both link `sqlite3`.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # ─── Observability ──────────────────────────────────────────────────────────
 tracing = "0.1"
@@ -117,6 +158,7 @@ tempfile = "3"
 
 # ─── Archive ────────────────────────────────────────────────────────────────
 zip = { version = "2", default-features = false, features = ["deflate"] }
+zstd = "0.13"
 
 # ─── Versioning ─────────────────────────────────────────────────────────────
 semver = "1"
@@ -131,6 +173,15 @@ async-trait = "0.1"
 # ─── Streaming ──────────────────────────────────────────────────────────────
 futures = "0.3"
 async-stream = "0.3"
+# `compat` bridges tokio AsyncRead/AsyncWrite (what the runtime's StdioHandle
+# exposes) to the futures-io traits the ACP SDK's `ByteStreams` transport wants,
+# so a coding-agent container attach can drive an `AcpConnection`.
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# ─── Agent Client Protocol (coding-agent transport) ─────────────────────────
+# Official Rust SDK for ACP (Agent Client Protocol). Pinned to the v1 schema;
+# `unstable_*` features are deliberately left off (see oss/acp-client).
+agent-client-protocol = "2.2.0"
 
 # ─── Common utilities ───────────────────────────────────────────────────────
 chrono = { version = "0.4", features = ["serde"] }
@@ -141,8 +192,9 @@ base64 = "0.22"
 dotenvy = "0.15"
 
 # ─── Embedding / registry ──────────────────────────────────────────────────
-rust-embed = { version = "8", features = ["mime-guess", "include-exclude"] }
+rust-embed = { version = "8", features = ["mime-guess", "include-exclude", "interpolate-folder-path"] }
 mime_guess = "2"
+percent-encoding = "2"
 
 mockito = "1"
 

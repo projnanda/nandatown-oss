@@ -14,5 +14,6 @@ dependencies = [
     "opentelemetry-instrumentation-openai-v2>=2.0b0",
     "opentelemetry-instrumentation-openai>=0.35.0b0",
     "crewai[tools]>=0.95.0",
+    "httpx>=0.28.1",
     "a2a-sdk>=0.3.0,<1.0.0",
 ]

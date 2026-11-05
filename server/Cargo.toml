@@ -2,9 +2,6 @@
 name = "nasiko-server"
 edition.workspace = true
 version.workspace = true
-# `src/bin/bench_seed.rs` is auto-discovered as a second binary, so
-# `cargo run -p nasiko-server` is ambiguous without naming the default.
-default-run = "nasiko-server"
 
 [lib]
 path = "src/lib.rs"
@@ -13,24 +10,47 @@ path = "src/lib.rs"
 name = "nasiko-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "seed-finops-demo"
+path = "src/bin/seed_finops_demo.rs"
+
+[[bin]]
+name = "seed-fleet-demo"
+path = "src/bin/seed_fleet_demo.rs"
+
 [dependencies]
 dotenvy.workspace = true
+nasiko-coding-policy.workspace = true
 nasiko-agent-proxy.workspace = true
 nasiko-auth.workspace = true
 nasiko-flow.workspace = true
+nasiko-hitl.workspace = true
 nasiko-mcp-gateway.workspace = true
 nasiko-secrets.workspace = true
 nasiko-github = { workspace = true }
-nasiko-oidc = { workspace = true }
 nasiko-oci.workspace = true
+nasiko-pricing.workspace = true
 nasiko-runtime = { workspace = true, features = ["docker", "simulated"] }
 nasiko-react-agent.workspace = true
+# IP-3's turn-level savings row (src/telemetry/tool_result_savings.rs)
+nasiko-savings.workspace = true
+nasiko-compress.workspace = true
 nasiko-orchestrator.workspace = true
 nasiko-types.workspace = true
 nasiko-utils.workspace = true
+# Decodes query-string keys before log redaction (src/mcp/mod.rs).
+percent-encoding = { workspace = true }
 nasiko-config.workspace = true
 nasiko-observability.workspace = true
 nasiko-llm-router.workspace = true
+# Coding-agent (ACP) turn execution: the ACP client speaks JSON-RPC to the
+# agent, `agent-client-protocol` supplies the `ByteStreams` transport + schema
+# types, and `tokio-util`'s compat shim bridges the runtime's tokio stdio halves
+# to the SDK's futures-io transport.
+nasiko-acp-client.workspace = true
+nasiko-session-token.workspace = true
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
 
 tokio = { workspace = true }
 axum = { workspace = true }
@@ -41,6 +61,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 redis = { workspace = true }
+rustls = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
@@ -60,12 +81,12 @@ aes-gcm = "0.10"
 hkdf = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
+nasiko-spa = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 hex = { workspace = true }
 dashmap = { workspace = true }
 async-trait = { workspace = true }
-clap = { workspace = true }
 rand = { workspace = true }
 
 # OpenTelemetry

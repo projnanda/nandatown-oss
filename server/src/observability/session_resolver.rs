@@ -6,6 +6,7 @@
 //! not running the Python auto-instrumentation patch).
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use nasiko_observability::provider::SessionIdResolver;
 use sqlx::PgPool;
 
@@ -30,11 +31,48 @@ impl SessionIdResolver for PgSessionIdResolver {
             .flatten()
     }
 
-    async fn traces_for_session(&self, session_id: &str) -> Vec<String> {
+    /// Bounded by the caller's window and capped. `session_traces` has no TTL,
+    /// so an unbounded read hands back every trace a long-lived session ever
+    /// had — each of which the caller then downloads in full from Tempo before
+    /// discarding the ones outside the window.
+    async fn traces_for_session(
+        &self,
+        session_id: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<String> {
         sqlx::query_scalar(
-            "SELECT trace_id FROM session_traces WHERE session_id = $1 ORDER BY created_at",
+            "SELECT trace_id FROM session_traces \
+             WHERE session_id = $1 AND created_at >= $2 AND created_at <= $3 \
+             ORDER BY created_at \
+             LIMIT 2000",
         )
         .bind(session_id)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.db)
+        .await
+        .unwrap_or_default()
+    }
+
+    async fn traces_for_agent(
+        &self,
+        agent_name: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<String> {
+        // `agent_name` is the denormalised column agent_proxy stamps at forward
+        // time, so this survives agent deletion. Bounded like the Tempo search
+        // it supplements (1000-row cap).
+        sqlx::query_scalar(
+            "SELECT trace_id FROM session_traces \
+             WHERE agent_name = $1 AND created_at >= $2 AND created_at <= $3 \
+             ORDER BY created_at \
+             LIMIT 1000",
+        )
+        .bind(agent_name)
+        .bind(start)
+        .bind(end)
         .fetch_all(&self.db)
         .await
         .unwrap_or_default()

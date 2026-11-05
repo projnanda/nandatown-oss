@@ -1,0 +1,673 @@
+//! Durable, destination-bound queue for coding-agent events.
+
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use nasiko_types::CodingAgentEventV1;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+const MAX_SCAN_RECORDS: usize = 1_000;
+/// Under `rejected/`: records that couldn't be parsed at all, so belong to no destination.
+const MALFORMED_DIR: &str = "malformed";
+/// In a destination's queue folder: until when its server asked to be left alone (`429`/`503` with
+/// `Retry-After`), as RFC 3339. Not a `.json` file, so never taken for a record.
+const PAUSE_FILE: &str = ".paused_until";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueDestination {
+    pub cluster_name: String,
+    pub cluster_url: String,
+    pub principal_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    Pending,
+    Deferred,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueRecord {
+    pub destination: QueueDestination,
+    pub delivery_state: DeliveryState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub event: CodingAgentEventV1,
+}
+
+impl QueueRecord {
+    pub fn new(destination: QueueDestination, event: CodingAgentEventV1) -> Self {
+        let now = Utc::now();
+        Self {
+            destination,
+            delivery_state: DeliveryState::Pending,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+            attempts: 0,
+            next_attempt_at: None,
+            event,
+        }
+    }
+}
+
+pub struct SyncLock {
+    _file: File,
+}
+
+pub fn enqueue(record: &QueueRecord) -> Result<PathBuf> {
+    enqueue_at(&super::state::integrations_dir(), record)
+}
+
+pub fn load(path: &Path) -> Result<QueueRecord> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let record: QueueRecord = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    validate_record(&record)?;
+    Ok(record)
+}
+
+pub fn update(path: &Path, record: &QueueRecord) -> Result<()> {
+    validate_record(record)?;
+    atomic_owner_write(path, &serde_json::to_vec(record)?)
+}
+
+pub fn remove(path: &Path) -> Result<()> {
+    std::fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+pub fn quarantine(path: &Path, record: &QueueRecord) -> Result<PathBuf> {
+    let root = path
+        .ancestors()
+        .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "queue"))
+        .and_then(Path::parent)
+        .unwrap_or_else(|| path.parent().unwrap_or_else(|| Path::new(".")));
+    quarantine_at(root, path, record)
+}
+
+pub fn reject_invalid(record: &QueueRecord, error: &str) -> Result<PathBuf> {
+    reject_invalid_at(&super::state::integrations_dir(), record, error)
+}
+
+pub(super) fn enqueue_at(root: &Path, record: &QueueRecord) -> Result<PathBuf> {
+    validate_record(record)?;
+    let path = record_path(root, &record.destination, &record.event.event_id);
+    create_owner_dirs(&root.join("queue"))?;
+    atomic_owner_write(&path, &serde_json::to_vec(record)?)?;
+    Ok(path)
+}
+
+/// Every queued record file, whatever its retry time — without reading, moving or rewriting any.
+pub fn queued_count() -> Result<usize> {
+    queued_count_at(&super::state::integrations_dir(), None)
+}
+
+fn validate_record(record: &QueueRecord) -> Result<()> {
+    if record.destination.cluster_name.trim().is_empty()
+        || record.destination.cluster_url.trim().is_empty()
+    {
+        bail!("queue destination cluster name and URL must not be empty");
+    }
+    record.event.validate().map_err(anyhow::Error::msg)
+}
+
+fn cluster_hash(destination: &QueueDestination) -> String {
+    let identity = format!(
+        "{}\0{}\0{}",
+        destination.cluster_name,
+        destination.cluster_url.trim_end_matches('/'),
+        destination.principal_id,
+    );
+    hex::encode(Sha256::digest(identity.as_bytes()))[..24].to_string()
+}
+
+fn record_path(root: &Path, destination: &QueueDestination, event_id: &str) -> PathBuf {
+    root.join("queue")
+        .join(cluster_hash(destination))
+        .join(format!("{event_id}.json"))
+}
+
+/// The record files in each destination's folder under `dir` (`queue/` or `rejected/`); folders that
+/// aren't a destination's (`rejected/malformed`) are left out.
+pub(super) fn record_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for cluster in std::fs::read_dir(dir)? {
+        let cluster = cluster?;
+        if !cluster.file_type()?.is_dir() || cluster.file_name() == MALFORMED_DIR {
+            continue;
+        }
+        for entry in std::fs::read_dir(cluster.path())? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                files.push(path);
+            }
+        }
+    }
+    Ok(files)
+}
+
+/// The ids of the events in the queue under `root`, from the file names alone: whether an event has
+/// left the queue (delivered, or set aside) is answered without reading any record.
+pub(super) fn queued_ids_at(root: &Path) -> Result<HashSet<String>> {
+    Ok(record_files(&root.join("queue"))?
+        .iter()
+        .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
+        .collect())
+}
+
+/// Holds back every turn queued in `destination_dir` (one destination's folder under `queue/`) until
+/// `until`: its server asked for no more requests before then.
+pub(super) fn pause(destination_dir: &Path, until: DateTime<Utc>) -> Result<()> {
+    atomic_owner_write(
+        &destination_dir.join(PAUSE_FILE),
+        until.to_rfc3339().as_bytes(),
+    )
+}
+
+/// Until when the turns in `destination_dir` are held back, if they are now.
+pub(super) fn paused_until(destination_dir: &Path, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    std::fs::read_to_string(destination_dir.join(PAUSE_FILE))
+        .ok()?
+        .trim()
+        .parse::<DateTime<Utc>>()
+        .ok()
+        .filter(|until| *until > now)
+}
+
+/// Whether a delivery waits out the retry delay this computer set itself after a failed attempt
+/// (`next_attempt_at`). A server's own pause ([`pause`]) holds either way: the server asked for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Backoff {
+    /// A turn waiting on a retry waits (a hook's delivery, an import's).
+    #[default]
+    Honour,
+    /// A turn waiting on a retry is sent at once (the user asked for it: a `nasiko agents sync` by
+    /// hand, the app's Retry).
+    Ignore,
+}
+
+impl Backoff {
+    /// Whether `record` may be sent at `now`.
+    pub(super) fn lets_through(self, record: &QueueRecord, now: DateTime<Utc>) -> bool {
+        self == Backoff::Ignore || record.next_attempt_at.is_none_or(|at| at <= now)
+    }
+}
+
+/// The records a delivery may send now, oldest file name first: none of a paused destination's, and
+/// none waiting on a retry unless `backoff` says to ignore that.
+pub(super) fn records_at(root: &Path, backoff: Backoff) -> Result<Vec<(PathBuf, QueueRecord)>> {
+    let queue = root.join("queue");
+    if !queue.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    let now = Utc::now();
+    for cluster in std::fs::read_dir(&queue)? {
+        let cluster = cluster?;
+        if !cluster.file_type()?.is_dir() || paused_until(&cluster.path(), now).is_some() {
+            continue;
+        }
+        for entry in std::fs::read_dir(cluster.path())? {
+            let entry = entry?;
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                match load(&path) {
+                    Ok(record) if backoff.lets_through(&record, now) => {
+                        records.push((path, record));
+                        if records.len() >= MAX_SCAN_RECORDS {
+                            records.sort_by(|left, right| left.0.cmp(&right.0));
+                            return Ok(records);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => quarantine_invalid_at(root, &path)?,
+                }
+            }
+        }
+    }
+    records.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(records)
+}
+
+/// Counts queued record files, stopping once `limit` are found (`None` counts them all).
+fn queued_count_at(root: &Path, limit: Option<usize>) -> Result<usize> {
+    let queue = root.join("queue");
+    if !queue.exists() {
+        return Ok(0);
+    }
+    let limit = limit.unwrap_or(usize::MAX);
+    let mut count = 0;
+    for cluster in std::fs::read_dir(queue)? {
+        let cluster = cluster?;
+        if !cluster.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(cluster.path())? {
+            let is_record = entry.is_ok_and(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            });
+            if is_record {
+                count += 1;
+                if count >= limit {
+                    return Ok(count);
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn quarantine_at(root: &Path, path: &Path, record: &QueueRecord) -> Result<PathBuf> {
+    let destination = root
+        .join("rejected")
+        .join(cluster_hash(&record.destination))
+        .join(path.file_name().context("queue record has no filename")?);
+    create_owner_dirs(destination.parent().expect("quarantine has parent"))?;
+    std::fs::rename(path, &destination)
+        .with_context(|| format!("failed to quarantine {}", path.display()))?;
+    Ok(destination)
+}
+
+fn reject_invalid_at(root: &Path, record: &QueueRecord, error: &str) -> Result<PathBuf> {
+    let mut rejected = record.clone();
+    rejected.delivery_state = DeliveryState::Rejected;
+    rejected.last_error = Some(format!("invalid event: {error}"));
+    rejected.updated_at = Utc::now();
+    let destination = root
+        .join("rejected")
+        .join(cluster_hash(&record.destination))
+        .join(format!("{}.json", record.event.event_id));
+    create_owner_dirs(destination.parent().expect("rejected event has parent"))?;
+    atomic_owner_write(&destination, &serde_json::to_vec(&rejected)?)?;
+    Ok(destination)
+}
+
+fn quarantine_invalid_at(root: &Path, path: &Path) -> Result<()> {
+    let cluster = path
+        .parent()
+        .and_then(Path::file_name)
+        .context("invalid queue record has no cluster directory")?;
+    let destination = root
+        .join("rejected")
+        .join(MALFORMED_DIR)
+        .join(cluster)
+        .join(
+            path.file_name()
+                .context("invalid queue record has no filename")?,
+        );
+    create_owner_dirs(destination.parent().expect("invalid quarantine has parent"))?;
+    std::fs::rename(path, &destination)
+        .with_context(|| format!("failed to quarantine malformed record {}", path.display()))?;
+    Ok(())
+}
+
+pub(super) fn acquire_sync_lock_at(root: &Path, timeout: Duration) -> Result<SyncLock> {
+    let path = root.join("queue").join(".sync.lock");
+    create_owner_dirs(path.parent().expect("lock has parent"))?;
+    let file = owner_open(&path, false)?;
+    let deadline = Instant::now() + timeout;
+    while file.try_lock().is_err() {
+        if Instant::now() >= deadline {
+            bail!("timed out locking {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(SyncLock { _file: file })
+}
+
+fn create_owner_dirs(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn owner_open(path: &Path, truncate: bool) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(truncate);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
+pub(super) fn atomic_owner_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().context("queue record has no parent")?;
+    create_owner_dirs(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("record");
+    let temp = parent.join(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.with_context(|| format!("failed to atomically write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use nasiko_types::{
+        CODING_AGENT_EVENT_VERSION, CapturePolicy, CodingAgentSession, CodingAgentSource,
+        CodingAgentTurn, coding_agent_event_id,
+    };
+
+    fn record(cluster_name: &str, cluster_url: &str) -> QueueRecord {
+        let at = Utc.timestamp_opt(1, 0).unwrap();
+        let event_id = coding_agent_event_id("claude", "session", "turn");
+        QueueRecord::new(
+            QueueDestination {
+                cluster_name: cluster_name.into(),
+                cluster_url: cluster_url.into(),
+                principal_id: Uuid::nil(),
+            },
+            CodingAgentEventV1 {
+                version: CODING_AGENT_EVENT_VERSION,
+                event_id,
+                captured_at: at,
+                source: CodingAgentSource {
+                    agent_id: "claude".into(),
+                    agent_name: "claude-code".into(),
+                },
+                session: CodingAgentSession {
+                    id: "claude:session".into(),
+                    source_id: "session".into(),
+                    title: None,
+                    parent: None,
+                },
+                turn: CodingAgentTurn {
+                    id: "turn".into(),
+                    prompt: None,
+                    response: None,
+                    started_at: at,
+                    ended_at: at,
+                    llm_calls: vec![],
+                    tool_calls: vec![],
+                },
+                capture_policy: CapturePolicy::MetadataOnly,
+            },
+        )
+    }
+
+    #[test]
+    fn destination_binding_and_path_survive_an_active_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = record("one", "https://one.example");
+        let path = enqueue_at(dir.path(), &original).unwrap();
+        let _new_active = record("two", "https://two.example");
+
+        assert_eq!(load(&path).unwrap().destination, original.destination);
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        assert!(!encoded.contains("token"));
+        assert!(
+            path.starts_with(
+                dir.path()
+                    .join("queue")
+                    .join(cluster_hash(&original.destination))
+            )
+        );
+    }
+
+    #[test]
+    fn duplicate_events_share_one_atomic_queue_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = record("one", "https://one.example");
+        let first = enqueue_at(dir.path(), &record).unwrap();
+        let second = enqueue_at(dir.path(), &record).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(records_at(dir.path(), Backoff::Honour).unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_dir(first.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert_eq!(load(&first).unwrap().event.event_id, record.event.event_id);
+    }
+
+    #[test]
+    fn atomic_update_survives_and_remove_completes_the_record_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = record("one", "https://one.example");
+        let path = enqueue_at(dir.path(), &record).unwrap();
+        record.delivery_state = DeliveryState::Deferred;
+        record.last_error = Some("offline".into());
+
+        update(&path, &record).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.delivery_state, DeliveryState::Deferred);
+        assert_eq!(loaded.last_error.as_deref(), Some("offline"));
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+
+        remove(&path).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_files_and_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = enqueue_at(dir.path(), &record("one", "https://one.example")).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("queue"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn global_sync_lock_wait_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = acquire_sync_lock_at(dir.path(), Duration::from_secs(1)).unwrap();
+        assert!(acquire_sync_lock_at(dir.path(), Duration::from_millis(20)).is_err());
+    }
+
+    #[test]
+    fn malformed_records_are_quarantined_without_blocking_ready_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = enqueue_at(dir.path(), &record("one", "https://one.example")).unwrap();
+        std::fs::write(&malformed, b"not-json").unwrap();
+
+        let mut ready = record("one", "https://one.example");
+        ready.event.turn.id = "ready".into();
+        ready.event.event_id = coding_agent_event_id("claude", "session", "ready");
+        let ready_path = enqueue_at(dir.path(), &ready).unwrap();
+
+        let records = records_at(dir.path(), Backoff::Honour).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, ready_path);
+        assert!(!malformed.exists());
+        assert!(dir.path().join("rejected").join("malformed").exists());
+    }
+
+    #[test]
+    fn invalid_event_can_be_quarantined_before_it_enters_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut invalid = record("one", "https://one.example");
+        invalid.event.source.agent_name = "bad\0agent".into();
+        let error = invalid.event.validate().unwrap_err();
+
+        let rejected = reject_invalid_at(dir.path(), &invalid, &error).unwrap();
+        assert!(rejected.starts_with(dir.path().join("rejected")));
+        assert!(!dir.path().join("queue").exists());
+        let stored: QueueRecord =
+            serde_json::from_slice(&std::fs::read(rejected).unwrap()).unwrap();
+        assert_eq!(stored.delivery_state, DeliveryState::Rejected);
+        assert!(stored.last_error.unwrap().contains("NUL"));
+    }
+
+    #[test]
+    fn queued_ids_are_the_event_ids_in_the_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let queued = record("one", "https://one.example");
+        enqueue_at(dir.path(), &queued).unwrap();
+
+        assert_eq!(
+            queued_ids_at(dir.path()).unwrap(),
+            HashSet::from([queued.event.event_id])
+        );
+        assert!(
+            queued_ids_at(&dir.path().join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn future_retry_does_not_hide_a_ready_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deferred = record("one", "https://one.example");
+        deferred.next_attempt_at = Some(Utc::now() + chrono::Duration::hours(1));
+        enqueue_at(dir.path(), &deferred).unwrap();
+
+        let mut ready = record("one", "https://one.example");
+        ready.event.turn.id = "ready".into();
+        ready.event.event_id = coding_agent_event_id("claude", "session", "ready");
+        enqueue_at(dir.path(), &ready).unwrap();
+
+        let records = records_at(dir.path(), Backoff::Honour).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].1.event.turn.id, "ready");
+        assert_eq!(queued_count_at(dir.path(), None).unwrap(), 2);
+        assert_eq!(queued_count_at(dir.path(), Some(1)).unwrap(), 1);
+    }
+
+    #[test]
+    fn counting_the_queue_moves_nothing_and_includes_records_waiting_to_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deferred = record("one", "https://one.example");
+        deferred.next_attempt_at = Some(Utc::now() + chrono::Duration::hours(1));
+        enqueue_at(dir.path(), &deferred).unwrap();
+        let mut malformed = record("two", "https://two.example");
+        malformed.event.turn.id = "malformed".into();
+        malformed.event.event_id = coding_agent_event_id("claude", "session", "malformed");
+        let malformed = enqueue_at(dir.path(), &malformed).unwrap();
+        std::fs::write(&malformed, b"not-json").unwrap();
+
+        assert_eq!(queued_count_at(dir.path(), None).unwrap(), 2);
+        assert!(malformed.exists());
+        assert!(!dir.path().join("rejected").exists());
+        assert_eq!(queued_ids_at(dir.path()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ignoring_backoff_sends_a_turn_waiting_on_a_retry_but_not_into_a_server_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deferred = record("one", "https://one.example");
+        deferred.next_attempt_at = Some(Utc::now() + chrono::Duration::hours(1));
+        let path = enqueue_at(dir.path(), &deferred).unwrap();
+
+        assert_eq!(records_at(dir.path(), Backoff::Ignore).unwrap().len(), 1);
+
+        pause(
+            path.parent().unwrap(),
+            Utc::now() + chrono::Duration::minutes(2),
+        )
+        .unwrap();
+        assert!(records_at(dir.path(), Backoff::Ignore).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_paused_destination_holds_back_its_turns_until_the_pause_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = enqueue_at(dir.path(), &record("one", "https://one.example")).unwrap();
+        let destination_dir = path.parent().unwrap();
+        let now = Utc::now();
+
+        pause(destination_dir, now + chrono::Duration::minutes(2)).unwrap();
+        assert!(records_at(dir.path(), Backoff::Honour).unwrap().is_empty());
+        assert!(paused_until(destination_dir, now).is_some());
+        assert_eq!(queued_ids_at(dir.path()).unwrap().len(), 1);
+
+        pause(destination_dir, now - chrono::Duration::seconds(1)).unwrap();
+        assert_eq!(paused_until(destination_dir, now), None);
+        assert_eq!(records_at(dir.path(), Backoff::Honour).unwrap().len(), 1);
+    }
+}

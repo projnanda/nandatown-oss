@@ -4,6 +4,22 @@ use crate::config;
 
 /// Login to the active cluster with username/password.
 pub fn login() -> Result<()> {
+    let (name, username) = authenticate()?;
+    println!("Logged in to {} as {}", name, username);
+    crate::commands::integration::auto_install_if_authenticated();
+    Ok(())
+}
+
+/// Login without the automatic coding-agent setup — for `nasiko connect`, which asks what
+/// to set up itself.
+pub fn login_without_setup() -> Result<()> {
+    let (name, username) = authenticate()?;
+    println!("Logged in to {} as {}", name, username);
+    Ok(())
+}
+
+/// Prompts for credentials and saves the session token. Returns the cluster and username.
+fn authenticate() -> Result<(String, String)> {
     let (name, entry) = config::active_cluster()?;
 
     let username: String = dialoguer::Input::new()
@@ -49,8 +65,7 @@ pub fn login() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no token in login response"))?;
 
     config::save_login(&username, token)?;
-    println!("Logged in to {} as {}", name, username);
-    Ok(())
+    Ok((name, username))
 }
 
 /// Show current auth status.
@@ -60,7 +75,10 @@ pub fn login() -> Result<()> {
 pub fn status() -> Result<()> {
     let (name, entry) = config::active_cluster()?;
     let Some(token) = &entry.token else {
-        println!("Not authenticated. Run: nasiko auth login");
+        println!(
+            "Not authenticated. Run: {}",
+            crate::commands::local_agents::login_hint()
+        );
         return Ok(());
     };
 
@@ -73,8 +91,10 @@ pub fn status() -> Result<()> {
     match config::token_expired(token) {
         Some(true) => {
             println!(
-                "Session expired for {}{} — run: nasiko auth login",
-                name, who
+                "Session expired for {}{} — run: {}",
+                name,
+                who,
+                crate::commands::local_agents::login_hint()
             );
         }
         Some(false) => {
@@ -119,10 +139,16 @@ pub fn logout() -> Result<()> {
 pub fn whoami() -> Result<()> {
     let (cluster_name, entry) = config::active_cluster()?;
     if entry.token.is_none() {
-        bail!("not logged in — run: nasiko auth login");
+        bail!(
+            "not logged in — run: {}",
+            crate::commands::local_agents::login_hint()
+        );
     }
     if config::token_expired(entry.token.as_deref().unwrap_or("")) == Some(true) {
-        bail!("session expired — run: nasiko auth login");
+        bail!(
+            "session expired — run: {}",
+            crate::commands::local_agents::login_hint()
+        );
     }
 
     let client = crate::api::Client::from_active_cluster()?;

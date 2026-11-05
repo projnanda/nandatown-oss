@@ -33,6 +33,21 @@ pub const HEADER_PHASE: &str = "x-nasiko-phase";
 /// Header carrying the conversation flow mode.
 pub const HEADER_MODE: &str = "x-nasiko-mode";
 
+/// Deterministic `conv_id` for one turn of a coding-agent session: a hash of `(agent_id,
+/// turn_ordinal, latest_user_text)`, not the raw prompt text itself, since `conv_id` rides
+/// through logs and the (possibly Redis-backed) decision cache. `DefaultHasher::new()`
+/// starts from fixed keys, so this is stable across router instances and process restarts
+/// running the same binary — unlike `HashMap`'s per-process-randomized `RandomState`.
+/// `turn_ordinal` disambiguates two turns that happen to repeat the same prompt text.
+fn coding_agent_conv_id(agent_id: &str, turn_ordinal: usize, latest_user_text: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    agent_id.hash(&mut hasher);
+    turn_ordinal.hash(&mut hasher);
+    latest_user_text.hash(&mut hasher);
+    format!("coding-agent-{:016x}", hasher.finish())
+}
+
 /// Extract the trace id — our flow id / `conv_id` — from a W3C `traceparent`
 /// (`{version}-{trace_id}-{span_id}-{flags}`). Returns the 32-hex-char trace id, or `None`
 /// if malformed or all-zero (the W3C "invalid" trace id). Mirrors the flow crate's parser
@@ -146,6 +161,50 @@ impl BoundarySignals {
             conv_id: Some(flow_id),
             phase: Phase::Switch,
             mode,
+        }
+    }
+
+    /// Signals for a coding-agent CLI session (Claude Code, Codex, OpenCode, Cursor).
+    ///
+    /// These sessions are never dispatched through the orchestrator, so they never get a
+    /// `traceparent` tied to a real `flows` row — the gateway's flow-lookup derivation is a
+    /// permanent dead end for them, not a transient miss. This is the coding-agent
+    /// equivalent of [`in_flow`], built from the transcript instead of a flow row.
+    ///
+    /// `conv_id` anchors on `(turn_ordinal, latest_user_text)` — the *current* top-level
+    /// prompt, not the whole session. That matters because the decision cache (Level 2)
+    /// checks `conv_id` unconditionally, before phase is even considered: a `conv_id` that
+    /// stayed constant for the whole session would let turn 1's classification decide every
+    /// later turn too, since every later turn would just be a cache hit on that same key.
+    /// Anchoring on the current turn instead means a genuinely new prompt gets a fresh
+    /// `conv_id` (cache miss → re-classify), while every tool-loop turn that follows it
+    /// keeps referring to the same `(turn_ordinal, latest_user_text)` — since no new `user`
+    /// message has appeared yet — so it stays a cache hit on *that* turn's decision.
+    ///
+    /// `is_tool_continuation` marks a transcript whose last turn is a tool result: that
+    /// keeps a mid-tool-loop turn `Phase::Continue` (sticky), mirroring the hard invariant
+    /// that intra-agent tool-loop turns never reclassify. Anything else — including the
+    /// first turn — is `Phase::Switch`, a fireable boundary, so the classifier gets to pick
+    /// a model for this prompt instead of always falling through to the agent's pinned
+    /// `llm_config`.
+    pub fn for_coding_agent(
+        agent_id: &str,
+        turn_ordinal: usize,
+        latest_user_text: Option<&str>,
+        is_tool_continuation: bool,
+    ) -> Self {
+        Self {
+            conv_id: Some(coding_agent_conv_id(
+                agent_id,
+                turn_ordinal,
+                latest_user_text.unwrap_or_default(),
+            )),
+            phase: if is_tool_continuation {
+                Phase::Continue
+            } else {
+                Phase::Switch
+            },
+            mode: Mode::FreeFlowing,
         }
     }
 
@@ -266,5 +325,62 @@ mod tests {
     fn in_flow_pinned_mode_does_not_fire() {
         let f = BoundarySignals::in_flow("flow-1".into(), Mode::PinnedFlow);
         assert!(!f.is_fireable_boundary());
+    }
+
+    #[test]
+    fn coding_agent_new_prompt_is_a_fireable_boundary() {
+        let s = BoundarySignals::for_coding_agent("agent-1", 1, Some("fix the bug"), false);
+        assert!(s.conv_id.is_some());
+        assert_eq!(s.phase, Phase::Switch);
+        assert_eq!(s.mode, Mode::FreeFlowing);
+        assert!(s.is_fireable_boundary());
+    }
+
+    #[test]
+    fn coding_agent_tool_continuation_stays_sticky() {
+        let s = BoundarySignals::for_coding_agent("agent-1", 1, Some("fix the bug"), true);
+        assert_eq!(s.phase, Phase::Continue);
+        assert!(!s.is_fireable_boundary());
+    }
+
+    #[test]
+    fn coding_agent_conv_id_is_stable_across_one_turns_tool_loop() {
+        // Same turn ordinal + same latest user text (unchanged while a tool loop runs)
+        // ⇒ same conv_id, so the Level-2 decision cache stays sticky mid tool-loop.
+        let cold_start =
+            BoundarySignals::for_coding_agent("agent-1", 1, Some("fix the bug"), false);
+        let tool_loop_turn =
+            BoundarySignals::for_coding_agent("agent-1", 1, Some("fix the bug"), true);
+        assert_eq!(cold_start.conv_id, tool_loop_turn.conv_id);
+    }
+
+    #[test]
+    fn coding_agent_conv_id_changes_on_the_next_prompt_in_the_same_session() {
+        // Regression: conv_id must NOT stay constant for the whole session. The decision
+        // cache (Level 2) is checked unconditionally before phase is considered, so a
+        // session-wide conv_id would make turn 1's classification decide every later turn
+        // too — the classifier would never re-fire for a new prompt. Anchoring on the
+        // current turn's ordinal + text instead means the second prompt in the same
+        // session gets a fresh conv_id (cache miss ⇒ the classifier runs again for it).
+        let turn1 = BoundarySignals::for_coding_agent("agent-1", 1, Some("fix the bug"), false);
+        let turn2 = BoundarySignals::for_coding_agent("agent-1", 2, Some("now add a test"), false);
+        assert_ne!(turn1.conv_id, turn2.conv_id);
+    }
+
+    #[test]
+    fn coding_agent_conv_id_differs_across_agents_and_conversations() {
+        let base = BoundarySignals::for_coding_agent("agent-1", 1, Some("fix the bug"), false);
+        let other_agent =
+            BoundarySignals::for_coding_agent("agent-2", 1, Some("fix the bug"), false);
+        let other_conversation =
+            BoundarySignals::for_coding_agent("agent-1", 1, Some("add a feature"), false);
+        assert_ne!(base.conv_id, other_agent.conv_id);
+        assert_ne!(base.conv_id, other_conversation.conv_id);
+    }
+
+    #[test]
+    fn coding_agent_missing_latest_user_text_still_produces_a_conv_id() {
+        let s = BoundarySignals::for_coding_agent("agent-1", 1, None, false);
+        assert!(s.conv_id.is_some());
     }
 }

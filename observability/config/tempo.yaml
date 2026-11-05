@@ -17,13 +17,18 @@ ingester:
 
 compactor:
   compaction:
-    block_retention: 24h
+    block_retention: 744h   # 31 days — covers the 30d TokenOps filter
 
 storage:
   trace:
     backend: local
     wal:
       path: /var/tempo/wal
+      # Allow backfilled traces up to 15 days old. The control plane skips the
+      # Tempo export of any coding-agent turn older than CODING_AGENT_TEMPO_MAX_AGE_SECS
+      # (default 15 days, `nasiko_config::CodingAgentIngestConfig`): the two must
+      # agree, or old turns are exported only to be dropped here.
+      ingestion_time_range_slack: 360h
     local:
       path: /var/tempo/blocks
 

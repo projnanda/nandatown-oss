@@ -4,5 +4,6 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir .
 COPY main.py .
 COPY telemetry.py .
+COPY nasiko_state.py .
 EXPOSE 8000
 CMD ["python", "main.py", "--host", "0.0.0.0", "--port", "8000"]

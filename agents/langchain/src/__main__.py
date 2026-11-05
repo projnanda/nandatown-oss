@@ -21,12 +21,12 @@ import click
 import uvicorn
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCapabilities, AgentCard, AgentSkill
 from starlette.middleware.cors import CORSMiddleware
 
 from agent import ResearchAgent
 from agent_executor import ResearchAgentExecutor
+from nasiko_state import install_shutdown_hooks, make_task_store
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +68,11 @@ def main(host, port):
     )
     request_handler = DefaultRequestHandler(
         agent_executor=ResearchAgentExecutor(),
-        task_store=InMemoryTaskStore(),
+        task_store=make_task_store(),
     )
     server = A2AStarletteApplication(agent_card=agent_card, http_handler=request_handler)
     app = server.build()
+    install_shutdown_hooks(app)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,

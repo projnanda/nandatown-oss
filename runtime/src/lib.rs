@@ -1,5 +1,6 @@
 mod error;
 mod stats;
+mod stdio;
 mod types;
 
 #[cfg(feature = "docker")]
@@ -13,11 +14,15 @@ pub use stats::{
     AgentNameResolver, CachedStatsProvider, ContainerStats, DiskSource, HostStats, PlatformStats,
     ResourceStatsProvider, StatsGroup, UnsupportedStatsProvider,
 };
+pub use stdio::{SessionAttach, StdioHandle};
 pub use types::validate_build_inputs;
-pub use types::validate_writable_path;
 pub use types::{
     ContainerId, DeploymentSpec, DeploymentStatus, InstanceInfo, ResourceLimits, RuntimeState,
-    WorkloadKind,
+    WorkloadKind, WorkspaceEntry, WorkspaceFile, WorkspaceRef,
+};
+pub use types::{
+    WORKSPACE_CAT_SCRIPT, WORKSPACE_LIST_SCRIPT, WORKSPACE_SETUP_SCRIPT, WORKSPACE_STAT_SCRIPT,
+    validate_workspace_relative_path, validate_writable_path,
 };
 
 // ─── Legacy type aliases (used by server during transition from old orchestrator) ─────
@@ -54,6 +59,32 @@ pub use docker::{DockerRuntime, DockerRuntimeConfig, DockerStatsProvider};
 pub use simulated::SimulatedRuntime;
 
 use async_trait::async_trait;
+
+/// Where an outbound forward to an agent should actually go, plus any header the resolving
+/// runtime wants attached to that specific request — e.g. a decorator whose own endpoint sits in
+/// front of the real agent and requires its own credential. `headers` is empty for every plain
+/// [`endpoint`](ContainerRuntime::endpoint)-equivalent target; callers that don't attach it get
+/// exactly today's behavior.
+///
+/// Deliberately a header list carried alongside the URL, not folded into the URL itself: a
+/// credential embedded in a URL travels wherever that URL string travels, including into any
+/// `Display` an HTTP client formats for a network or timeout error — visible to end users,
+/// response payloads, and logs alike. A header a caller attaches explicitly only ever appears on
+/// the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForwardTarget {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl From<String> for ForwardTarget {
+    fn from(url: String) -> Self {
+        Self {
+            url,
+            headers: Vec::new(),
+        }
+    }
+}
 
 /// Core trait for managing the deployment lifecycle of Nasiko agents.
 ///
@@ -136,6 +167,55 @@ pub trait ContainerRuntime: Send + Sync {
     /// Returns `RuntimeError::ContainerNotFound` if no deployment exists for `container_id`.
     async fn endpoint(&self, container_id: &ContainerId) -> Result<String>;
 
+    /// Open a per-session, bidirectional stdio stream to a coding-agent
+    /// container (`WorkloadKind::AcpCodingAgent`).
+    ///
+    /// Unlike [`endpoint`](ContainerRuntime::endpoint) — a cheap lookup of a
+    /// long-lived HTTP address — this **execs a fresh agent process** for the
+    /// session named by `attach` and returns its live stdin/stdout as a
+    /// [`StdioHandle`]. The container is reused across sessions (a single
+    /// coding-agent container serves many sessions, one process each); the
+    /// caller ensures the container is deployed and running first, exactly as
+    /// with `endpoint()`.
+    ///
+    /// The stream is raw and newline-delimited (never a TTY), so the ACP client
+    /// can frame JSON-RPC directly. Each session's process runs in its own
+    /// workspace subdirectory under the agent's writable folder
+    /// (`<writable-mount>/<session_id>`), which the runtime creates if absent.
+    ///
+    /// Default: [`RuntimeError::Unsupported`] — correct for a backend with no
+    /// stdio-attach mechanism, and the signal for a caller to degrade to the
+    /// hook transport. Decorators MUST forward it explicitly (see RUN-1 in
+    /// `InstrumentedRuntime`).
+    ///
+    /// Returns [`RuntimeError::ContainerNotFound`] if no container exists for
+    /// `container_id`.
+    async fn attach_stdio(
+        &self,
+        _container_id: &ContainerId,
+        _attach: SessionAttach,
+    ) -> Result<StdioHandle> {
+        Err(RuntimeError::Unsupported(
+            "this runtime does not support stdio attach for coding agents".to_owned(),
+        ))
+    }
+
+    /// Where a forward *to* this agent should actually be sent — distinct from
+    /// [`endpoint`](ContainerRuntime::endpoint), which is the agent's real address and is also
+    /// what gets persisted into `agents.url` at deploy time. Defaults to `endpoint()` with no
+    /// extra headers, so every implementation and every caller gets identical behavior unless
+    /// something explicitly overrides this method — only an EE decorator that installs an
+    /// injection proxy does.
+    ///
+    /// The two must stay separate methods, not one parameterized call: a decorator overriding
+    /// this to return its own address must never affect what `endpoint()` returns, because
+    /// deploy-time persistence (`resolve_agent_url`) and the injection proxy's own address
+    /// resolution both call `endpoint()` and would corrupt each other if the two purposes were
+    /// conflated behind one method.
+    async fn forwarding_endpoint(&self, container_id: &ContainerId) -> Result<ForwardTarget> {
+        self.endpoint(container_id).await.map(Into::into)
+    }
+
     /// Return the last `tail` lines of stdout+stderr from the agent's container(s).
     ///
     /// `tail` is clamped to 10 000 to prevent OOM. For Kubernetes backends with
@@ -182,13 +262,45 @@ pub trait ContainerRuntime: Send + Sync {
     ///   `KubeRuntimeConfig::build_timeout` (default 30 min).
     async fn build(&self, tar_context: &[u8], image_tag: &str) -> Result<String>;
 
-    /// Best-effort delete of any autoscaler resource (e.g. KEDA ScaledObject) for this agent.
+    /// Whether this runtime can scale an agent between replica bounds on its own.
     ///
-    /// Default no-op — only Kubernetes backends with KEDA installed override this.
-    /// Called by the crash-loop guardian before scaling to 0 so KEDA cannot
-    /// immediately scale the deployment back up.
-    async fn try_delete_autoscaler(&self, _id: &ContainerId) -> Result<()> {
-        Ok(())
+    /// Async because a backend may have to ask its control plane whether the
+    /// autoscaler is present. Default `false`: a runtime that cannot autoscale
+    /// runs every agent at a fixed count. Decorators MUST forward it explicitly
+    /// (see RUN-1 in `InstrumentedRuntime`).
+    async fn supports_autoscaling(&self) -> bool {
+        false
+    }
+
+    /// Re-applies the replica bounds of an already deployed agent without a
+    /// redeploy. `min < max` hands the replica count to the autoscaler within
+    /// those bounds; `min == max` removes the autoscaling and runs exactly `min`
+    /// replicas. A stopped agent stays stopped either way. `target` is the
+    /// per-replica capacity hint for the autoscaler, when the caller has one.
+    ///
+    /// Returns `RuntimeError::ContainerNotFound` if no deployment exists for
+    /// this ID. Default: unsupported. Decorators MUST forward it explicitly (RUN-1).
+    async fn apply_replica_bounds(
+        &self,
+        _id: &ContainerId,
+        _min: u32,
+        _max: u32,
+        _target: Option<u32>,
+    ) -> Result<()> {
+        Err(RuntimeError::Internal(
+            "autoscaling not supported by this runtime".to_owned(),
+        ))
+    }
+
+    /// Whether [`restart`](ContainerRuntime::restart) replaces a running agent in place, one
+    /// instance at a time and without dropping its capacity or its autoscaling settings, with
+    /// the replacements reading the env last given to
+    /// [`refresh_secrets`](ContainerRuntime::refresh_secrets).
+    ///
+    /// Default `false`: `restart` reuses the running container's own env, so a caller that
+    /// changed the env has to redeploy to apply it. Decorators MUST forward it explicitly (RUN-1).
+    async fn restarts_in_place(&self) -> bool {
+        false
     }
 
     /// Re-apply the agent's current secrets before a scale-up restart.
@@ -197,12 +309,51 @@ pub trait ContainerRuntime: Send + Sync {
     /// The Kubernetes runtime overrides this to re-apply the K8s Secret so that
     /// secrets rotated while an agent was stopped are picked up on next restart
     /// without requiring a full redeploy.
+    ///
+    /// `env_vars` is the agent's **complete** desired environment, not a delta:
+    /// the Kubernetes backend server-side-applies it, so any key omitted here is
+    /// removed from the live Secret. `name` is the agent's human-readable name
+    /// (`DeploymentSpec::name`), which instrumentation decorators need to rebuild
+    /// the same injected environment `deploy()` would have produced.
     async fn refresh_secrets(
         &self,
         _id: &ContainerId,
+        _name: &str,
         _env_vars: std::collections::HashMap<String, String>,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// List every file in a `--writable` agent's persistent directory, so a
+    /// caller can offer them for download.
+    ///
+    /// Paths are relative to the agent's writable directory and are exactly
+    /// what [`read_workspace_file`](ContainerRuntime::read_workspace_file)
+    /// expects back. Reads the shared volume directly rather than the agent's
+    /// container, so it works while the agent is stopped, scaled to zero or
+    /// crash-looping — and needs no tooling in the agent image.
+    ///
+    /// Default: empty, correct for a runtime with no persistent storage.
+    /// Decorators MUST forward it explicitly (see RUN-1 in `InstrumentedRuntime`).
+    async fn list_workspace(&self, _workspace: &WorkspaceRef) -> Result<Vec<WorkspaceEntry>> {
+        Ok(vec![])
+    }
+
+    /// Stream one file out of a `--writable` agent's persistent directory.
+    ///
+    /// `rel_path` is caller-supplied and MUST already have passed
+    /// [`validate_workspace_relative_path`] — implementations join it onto the
+    /// agent's own subdirectory and never interpret it through a shell.
+    ///
+    /// Default: unsupported. Decorators MUST forward it explicitly (RUN-1).
+    async fn read_workspace_file(
+        &self,
+        _workspace: &WorkspaceRef,
+        _rel_path: &str,
+    ) -> Result<WorkspaceFile> {
+        Err(RuntimeError::Internal(
+            "this runtime has no persistent agent storage to read from".to_owned(),
+        ))
     }
 
     /// Return one entry per currently-existing container instance (Docker
@@ -233,18 +384,77 @@ pub trait ContainerRuntime: Send + Sync {
     }
 }
 
-/// Ensures an object-storage bucket exists before first use, abstracting over
-/// which concrete backend provisions it.
+/// A [`BlobStore`] operation failure.
 ///
-/// The self-hosted, S3-protocol-compatible default (RustFS) is deployment-agnostic
-/// and works unmodified on any cloud or on-prem. A genuinely cloud-native
-/// implementation (real AWS S3 via IAM, Azure Blob Storage, GCS) can implement
-/// this same interface later - mirroring the [`ContainerRuntime`] OSS/EE split -
-/// without any call site needing to change.
+/// Deliberately two-variant: callers only ever branch on "the object isn't
+/// there" versus "the backend failed" — the OCI registry turns the former into
+/// a spec-required 404 and the latter into a 500 whose detail goes to the log,
+/// never the wire. The `String` payloads carry the backend's full diagnosis
+/// (error code + source chain), because a misconfigured managed store is only
+/// debuggable through that text.
+#[derive(Debug, thiserror::Error)]
+pub enum BlobStoreError {
+    /// The requested object does not exist. Not a fault of the backend.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// Any other backend failure: rejected credentials, unreachable endpoint,
+    /// missing bucket/container, transport errors.
+    #[error("{0}")]
+    Backend(String),
+}
+
+/// Content-addressed object storage for the platform's artifacts: OCI image
+/// blobs, uploaded source archives, chat file attachments.
+///
+/// One implementation per storage protocol, selected once at the composition
+/// root and handed to `AppState` — exactly as [`ContainerRuntime`] is. This
+/// crate and `nasiko-oci` provide the S3-compatible one (RustFS/MinIO/AWS/any
+/// S3 API); an edition that offers more wires its own. Keys are digests; the
+/// store never interprets them beyond a shared prefix, so the same bucket
+/// layout is readable by either backend and a migration is a plain object
+/// copy.
 #[async_trait]
-pub trait BucketProvisioner: Send + Sync {
-    /// Idempotent: creates the bucket if it doesn't already exist, otherwise a no-op.
-    async fn ensure_bucket(&self) -> anyhow::Result<()>;
+pub trait BlobStore: Send + Sync {
+    /// Stores `data` under `digest`, returning the stored size in bytes.
+    async fn put_blob(
+        &self,
+        digest: &str,
+        data: bytes::Bytes,
+    ) -> std::result::Result<i64, BlobStoreError>;
+
+    /// Fetches the full object. Absence is `BlobStoreError::NotFound`, never
+    /// `Backend` — HEAD and GET on the same missing digest must agree.
+    async fn get_blob(&self, digest: &str) -> std::result::Result<bytes::Bytes, BlobStoreError>;
+
+    /// Removes the object. Deleting an absent object is backend-defined; the
+    /// registry's delete path checks existence first.
+    async fn delete_blob(&self, digest: &str) -> std::result::Result<(), BlobStoreError>;
+
+    /// Existence probe. Failures read as `false` — callers treat this as a
+    /// fast-path hint, not a source of truth.
+    async fn blob_exists(&self, digest: &str) -> bool;
+
+    /// Size in bytes of a stored object; absence is `NotFound`.
+    async fn blob_size(&self, digest: &str) -> std::result::Result<i64, BlobStoreError>;
+
+    /// A time-limited URL a client can GET the object from directly, without
+    /// platform credentials (S3 presigned URL / Azure Service SAS). The URL's
+    /// host is the backend's own endpoint — reachability from the *caller's*
+    /// network is the deployment's concern, not this trait's.
+    async fn presigned_get_url(
+        &self,
+        digest: &str,
+        ttl_secs: u64,
+    ) -> std::result::Result<String, BlobStoreError>;
+
+    /// Ensures the backing bucket/container exists before first use.
+    ///
+    /// `skip_create` (and any backend where the platform holds no create
+    /// rights, which is every external managed store) makes this verify-only:
+    /// it must then fail with a message naming the resource and the command
+    /// that creates it, rather than surfacing later as an undiagnosable write
+    /// failure.
+    async fn ensure_bucket(&self, skip_create: bool) -> anyhow::Result<()>;
 }
 
 /// Supplies image bytes for references the local container daemon doesn't have.
@@ -255,7 +465,7 @@ pub trait BucketProvisioner: Send + Sync {
 /// can instead hand the runtime a direct source of image bytes (the embedded
 /// OCI registry in `nasiko-oci` implements it), so a cache miss is satisfied
 /// by a `docker load` with zero registry configuration. Mirrors the
-/// [`BucketProvisioner`] extension pattern.
+/// [`BlobStore`] extension pattern.
 #[async_trait]
 pub trait ImageSource: Send + Sync {
     /// The image as a docker-load–compatible tar archive, tagged exactly

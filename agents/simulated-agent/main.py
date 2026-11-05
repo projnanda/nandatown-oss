@@ -42,7 +42,6 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -51,6 +50,8 @@ from a2a.types import (
     TaskState,
 )
 from starlette.applications import Starlette
+
+from nasiko_state import install_shutdown_hooks, make_task_store
 
 _LOREM_WORDS = (
     "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod "
@@ -101,8 +102,12 @@ async def _sleep_ms(min_ms: float, max_ms: float) -> None:
 
 class SimulatedExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
-        task = context.current_task or new_task_from_user_message(context.message)
-        await event_queue.enqueue_event(task)
+        task = context.current_task
+        if task is None:
+            # Enqueue only a new task. Re-enqueueing a stored input-required task on resume makes
+            # the SDK replay the stale pause as the first event and drop the human's answer.
+            task = new_task_from_user_message(context.message)
+            await event_queue.enqueue_event(task)
 
         await event_queue.enqueue_event(
             new_text_status_update_event(
@@ -174,7 +179,7 @@ def main(host, port):
 
     handler = DefaultRequestHandler(
         agent_executor=SimulatedExecutor(),
-        task_store=InMemoryTaskStore(),
+        task_store=make_task_store(),
         agent_card=agent_card,
     )
 
@@ -183,6 +188,7 @@ def main(host, port):
     routes.extend(create_jsonrpc_routes(handler, rpc_url="/"))
 
     app = Starlette(routes=routes)
+    install_shutdown_hooks(app)
     uvicorn.run(app, host=host, port=port)
 
 

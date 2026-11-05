@@ -1,0 +1,146 @@
+# Nasiko Platform — the local stack the desktop app runs
+#
+# The same services as docker-compose.yml, set up for someone's own computer
+# rather than a development checkout. The desktop app embeds this file and runs
+# it from the images it ships with; nothing here is built from source.
+#
+# It differs from docker-compose.yml on purpose, so both can run at once:
+#   - its own project name, network and volumes (`nasiko-local`);
+#   - only the server is published, and only on loopback: Postgres, Redis and
+#     the rest stay on the compose network instead of taking host ports;
+#   - every service restarts with Docker, so the stack is back after a reboot.
+#
+# By hand (the app does the same):
+#   cp .env.example .env            # then set SECRETS_ENCRYPTION_KEY and ADMIN_PASSWORD
+#   NASIKO_SERVER_IMAGE=<image> docker compose -f docker-compose.desktop.yml up -d
+#
+# Settings (shell environment, or the .env next to this file):
+#   NASIKO_SERVER_IMAGE   the nasiko-server image to run (required)
+#   NASIKO_LOCAL_PORT     host port for the server, default 8080
+#   NASIKO_PLATFORM       the platform seed agent images are pulled for, default linux/amd64
+#                         (the app passes this computer's: linux/arm64 on Apple silicon)
+#   SEED_AGENTS           the agents every install starts with (below); empty for none
+
+name: nasiko-local
+
+services:
+  postgres:
+    image: docker.io/pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: nasiko
+      POSTGRES_PASSWORD: nasiko
+      POSTGRES_DB: nasiko_dev
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-databases.sql:/docker-entrypoint-initdb.d/create-extra-dbs.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nasiko -d nasiko_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - nasiko-local
+
+  redis:
+    image: docker.io/library/redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - nasiko-local
+
+  rustfs:
+    image: docker.io/rustfs/rustfs:latest
+    command: server /data --address :9000
+    environment:
+      RUSTFS_ROOT_USER: nasiko
+      RUSTFS_ROOT_PASSWORD: nasiko123
+    volumes:
+      - rustfs-data:/data
+    restart: unless-stopped
+    networks:
+      - nasiko-local
+
+  otel-collector:
+    image: docker.io/otel/opentelemetry-collector-contrib:0.119.0
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/config/otel-collector.yaml:/etc/otel-collector-config.yaml:ro
+    depends_on:
+      - tempo
+      - loki
+    restart: unless-stopped
+    networks:
+      - nasiko-local
+
+  tempo:
+    image: docker.io/grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/config/tempo.yaml:/etc/tempo.yaml:ro
+    restart: unless-stopped
+    networks:
+      - nasiko-local
+
+  loki:
+    image: docker.io/grafana/loki:3.3.2
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    restart: unless-stopped
+    networks:
+      - nasiko-local
+
+  server:
+    image: ${NASIKO_SERVER_IMAGE:?set NASIKO_SERVER_IMAGE to the nasiko-server image}
+    ports:
+      - "127.0.0.1:${NASIKO_LOCAL_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      # Connection URLs use the compose service names.
+      DATABASE_URL: postgres://nasiko:nasiko@postgres:5432/nasiko_dev
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://rustfs:9000
+      TEMPO_URL: http://tempo:3200
+      LOKI_URL: http://loki:3100
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_COLLECTOR_ENDPOINT: http://otel-collector:4317
+      CODING_AGENT_OTLP_ENDPOINT: http://otel-collector:4318
+      # Agents run as sibling containers on this network and reach the server by name.
+      AGENT_RUNTIME: docker
+      DOCKER_AGENT_NETWORK: nasiko-local
+      # The agents every install starts with (`server/src/seed.rs`): deployed on each start unless
+      # already running. `${SEED_AGENTS-…}`, not `:-`, so `SEED_AGENTS=` in .env means none.
+      SEED_AGENTS: ${SEED_AGENTS-docker.io/karannasiko/crm-agent:1.0.2 docker.io/karannasiko/general-assistant:1.1.1 docker.io/karannasiko/opencode:0.1.0}
+      SEED_IMAGE_PLATFORM: ${NASIKO_PLATFORM:-linux/amd64}
+      MCP_GATEWAY_PUBLIC_URL: http://server:8080/api/mcp
+      LLM_GATEWAY_BASE_URL: http://server:8080
+      # OAuth providers send the browser back here, so it is the host-side address.
+      MCP_OAUTH_REDIRECT_BASE_URL: http://localhost:${NASIKO_LOCAL_PORT:-8080}/api/mcp
+      COMPOSIO_CALLBACK_BASE_URL: http://localhost:${NASIKO_LOCAL_PORT:-8080}/api/mcp
+      # The free-assessment form goes to Nasiko's public intake, which holds the only storage
+      # credential; this stack carries none (`server/src/assessment.rs`).
+      ASSESSMENT_INTAKE_URL: ${ASSESSMENT_INTAKE_URL-https://yelsilh253pidzyo7chd2tb3mu0ngwmf.lambda-url.us-west-2.on.aws/}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - nasiko-local
+
+networks:
+  nasiko-local:
+    name: nasiko-local
+
+volumes:
+  postgres-data:
+  rustfs-data:

@@ -1,0 +1,24 @@
+{
+  "name": "nasiko-state",
+  "version": "0.1.0",
+  "description": "Durable agent state over the Nasiko platform's state API: a state client and an a2a-js TaskStore",
+  "type": "module",
+  "private": true,
+  "license": "Apache-2.0",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@a2a-js/sdk": ">=1.0.0 <2"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}

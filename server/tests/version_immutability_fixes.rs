@@ -148,9 +148,7 @@ async fn clone_pre_build_rejection_restores_existing_agent_instead_of_deleting()
 
     let build_id = Uuid::new_v4();
     execute_clone_and_deploy(
-        server.runtime.clone() as Arc<dyn nasiko_runtime::ContainerRuntime>,
-        server.db.clone(),
-        reqwest::Client::new(),
+        &server.state,
         build_id,
         agent_id,
         uid,
@@ -159,12 +157,8 @@ async fn clone_pre_build_rejection_restores_existing_agent_instead_of_deleting()
         tar_path,
         vec![8000],
         HashMap::new(),
-        None,
-        None,
-        "docker".to_string(),
-        String::new(),
-        1,
-        "512Mi".to_string(),
+        // version_override: None = detect from the source tarball, which is
+        // what each of these tests varies to drive its outcome.
         None,
         Some("1.0.0".to_string()),
         Some("nasiko/existing:1.0.0".to_string()),
@@ -232,9 +226,7 @@ async fn clone_genuine_deploy_failure_on_existing_agent_restores_instead_of_dele
     let build_id = Uuid::new_v4();
     seed_build(&server, build_id, agent_id, "2.0.0").await;
     execute_clone_and_deploy(
-        server.runtime.clone() as Arc<dyn nasiko_runtime::ContainerRuntime>,
-        server.db.clone(),
-        reqwest::Client::new(),
+        &server.state,
         build_id,
         agent_id,
         uid,
@@ -243,12 +235,8 @@ async fn clone_genuine_deploy_failure_on_existing_agent_restores_instead_of_dele
         tar_path,
         vec![8000],
         HashMap::new(),
-        None,
-        None,
-        "docker".to_string(),
-        String::new(),
-        1,
-        "512Mi".to_string(),
+        // version_override: None = detect from the source tarball, which is
+        // what each of these tests varies to drive its outcome.
         None,
         Some("1.0.0".to_string()),
         Some("nasiko/existing:1.0.0".to_string()),
@@ -270,6 +258,19 @@ async fn clone_genuine_deploy_failure_on_existing_agent_restores_instead_of_dele
     assert_eq!(row.2, "running");
 
     server.cleanup().await;
+}
+
+#[derive(Default)]
+struct RecordingDeletionHook(std::sync::Mutex<Vec<Uuid>>);
+
+#[async_trait::async_trait]
+impl nasiko_server::agent_lifecycle::AgentDeletionHook for RecordingDeletionHook {
+    async fn on_agent_deleted(&self, agent_id: Uuid) {
+        self.0
+            .lock()
+            .expect("recording hook lock poisoned")
+            .push(agent_id);
+    }
 }
 
 #[tokio::test]
@@ -299,10 +300,16 @@ async fn clone_pre_build_rejection_on_brand_new_agent_still_cleans_up() {
     std::fs::write(&tar_path, &tar_gz).unwrap();
 
     let build_id = Uuid::new_v4();
+    // Records what it was called with rather than a Noop, so this test actually observes the
+    // hook firing with the right agent id — not just that the agent row disappeared (which the
+    // hook contributes nothing to, and would pass identically if the hook call were deleted).
+    let recorder = Arc::new(RecordingDeletionHook::default());
+    server
+        .state
+        .agent_deletion_hook
+        .install(recorder.clone() as Arc<dyn nasiko_server::agent_lifecycle::AgentDeletionHook>);
     execute_clone_and_deploy(
-        server.runtime.clone() as Arc<dyn nasiko_runtime::ContainerRuntime>,
-        server.db.clone(),
-        reqwest::Client::new(),
+        &server.state,
         build_id,
         agent_id,
         uid,
@@ -311,14 +318,10 @@ async fn clone_pre_build_rejection_on_brand_new_agent_still_cleans_up() {
         tar_path,
         vec![8000],
         HashMap::new(),
+        // version_override: None = detect from the source tarball, which is
+        // what each of these tests varies to drive its outcome.
         None,
         None,
-        "docker".to_string(),
-        String::new(),
-        1,
-        "512Mi".to_string(),
-        None,
-        None, // no prior state — this is a first-ever deploy
         None,
         None,
     )
@@ -332,6 +335,15 @@ async fn clone_pre_build_rejection_on_brand_new_agent_still_cleans_up() {
     assert!(
         !exists,
         "a brand-new agent with nothing to restore should still be cleaned up"
+    );
+    assert_eq!(
+        recorder
+            .0
+            .lock()
+            .expect("recording hook lock poisoned")
+            .as_slice(),
+        &[agent_id],
+        "the deletion hook must fire exactly once, with the deleted agent's id"
     );
 
     server.cleanup().await;

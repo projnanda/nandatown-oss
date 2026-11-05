@@ -5,17 +5,22 @@
 //! distinguishes "agent resolves to no config" from "agent resolves to a config"); a **missing
 //! agent row** is an error and is never cached.
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use super::LLMConfig;
+use super::{LLMConfig, OrgEmbeddingDefault};
 
 /// Concurrency-safe TTL cache keyed by agent UUID.
 pub struct ConfigCache {
     ttl: Duration,
     entries: DashMap<Uuid, Entry>,
+    /// The organization embedding default — one global row, so one slot rather than a
+    /// map. Shares the config TTL, so an operator's change takes effect on the same
+    /// schedule as a config edit.
+    org_embedding_default: Mutex<Option<OrgDefaultEntry>>,
 }
 
 struct Entry {
@@ -23,11 +28,36 @@ struct Entry {
     config: Option<LLMConfig>,
 }
 
+struct OrgDefaultEntry {
+    expires_at: Instant,
+    value: Option<OrgEmbeddingDefault>,
+}
+
 impl ConfigCache {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
             entries: DashMap::new(),
+            org_embedding_default: Mutex::new(None),
+        }
+    }
+
+    /// `Some(state)` on a fresh hit (where `state` is the cached `Option<OrgEmbeddingDefault>`,
+    /// so "no default is configured" caches too); `None` on a miss or an expired entry.
+    pub fn get_org_embedding_default(&self) -> Option<Option<OrgEmbeddingDefault>> {
+        let slot = self.org_embedding_default.lock().ok()?;
+        slot.as_ref()
+            .filter(|e| e.expires_at > Instant::now())
+            .map(|e| e.value.clone())
+    }
+
+    /// Cache the result of a successful org-default read.
+    pub fn put_org_embedding_default(&self, value: Option<OrgEmbeddingDefault>) {
+        if let Ok(mut slot) = self.org_embedding_default.lock() {
+            *slot = Some(OrgDefaultEntry {
+                expires_at: Instant::now() + self.ttl,
+                value,
+            });
         }
     }
 
@@ -58,6 +88,9 @@ impl ConfigCache {
     /// Drop all cached entries (test/ops hook; also used after an `llm_config` edit).
     pub fn clear(&self) {
         self.entries.clear();
+        if let Ok(mut slot) = self.org_embedding_default.lock() {
+            *slot = None;
+        }
     }
 }
 

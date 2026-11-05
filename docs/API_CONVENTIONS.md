@@ -61,6 +61,7 @@ specs, not this document; where a protocol dictates a shape, the protocol wins.
 | 409 | conflict with current state (duplicate name, last admin) |
 | 413 | payload too large (every upload route states its limit) |
 | 422 | body unparseable as the expected type |
+| 428 | the change is destructive and needs an explicit acknowledgement — the client re-sends the identical request with the confirmation flag the `code` slug names. Distinct from 409, which is not resolvable by re-sending |
 | 429 | rate or flow limit hit — the `code` slug names which limit |
 
 - Resource-existence probing is a real attack surface: where hiding existence matters (agent

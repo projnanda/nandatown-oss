@@ -1,9 +1,11 @@
 pub mod acl;
 pub mod build_worker;
+pub mod deploy_env;
 pub mod deployments;
 pub mod grants;
 pub mod hours_meter;
 pub mod llm_config;
+pub mod reconcile;
 pub mod update;
 pub mod upload;
 pub(crate) mod utils;
@@ -18,6 +20,7 @@ use nasiko_runtime::{
 };
 use uuid::Uuid;
 
+use crate::agent_scaling::ReplicaBounds;
 use crate::state::AppState;
 
 pub use upload::UploadAndDeployResponse;
@@ -60,7 +63,12 @@ pub(crate) const DEFAULT_AGENT_PORT: u16 = 8000;
 /// after the host and 404s at the Axum router level before any auth/handler
 /// logic runs (found live: BuildKit push to `.../v2/translator/blobs/uploads/`
 /// failed with a plain 404, not a 401/403).
+///
+/// The name segment goes through [`image_name_slug`]: an agent name is a
+/// display string that may legally carry uppercase or spaces, neither of which
+/// an OCI repository name admits.
 pub(crate) fn build_image_tag(registry: &str, name: &str, tag: &str) -> String {
+    let name = image_name_slug(name);
     if registry.is_empty() {
         format!("nasiko/{name}:{tag}")
     } else {
@@ -68,8 +76,36 @@ pub(crate) fn build_image_tag(registry: &str, name: &str, tag: &str) -> String {
     }
 }
 
+/// Lowercase a display name into an OCI-safe repository component.
+///
+/// An OCI repository name is `[a-z0-9]+([._-][a-z0-9]+)*` — no uppercase, no
+/// spaces — but an agent name is validated against the *tag* charset
+/// (`build::routes::validate_version_tag`), which permits both. An agent named
+/// "General-Assistant" therefore reached the builder as
+/// `nasiko/General-Assistant:1.0.0`, and docker rejected it ("repository name
+/// must be lowercase") *after* the agent/build/job rows had already committed —
+/// leaving the agent behind with nothing but a failed build.
+///
+/// Idempotent, and registry publishers apply the same rule before pushing, so a
+/// name survives publish → import unchanged and a re-import updates the existing
+/// agent instead of registering a second one under a differently-cased name.
+pub(crate) fn image_name_slug(name: &str) -> String {
+    let slug: String = name
+        .to_lowercase()
+        .replace(' ', "-")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "agent".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
 /// Mints (or reuses) a per-agent OCI pull credential and attaches it to
-/// `spec` — deterministic secret name always set so `ee/k8s-runtime` can
+/// `spec` — deterministic secret name always set so the Kubernetes runtime can
 /// wire `imagePullSecrets` on every deploy, with the one-time plaintext seed
 /// set only when a NEW credential was just minted (see `nasiko-oci`'s
 /// `pull_credentials::get_or_create`). No-op outside the K8s runtime — these
@@ -107,7 +143,7 @@ pub(crate) async fn attach_pull_credential(
 ///
 /// `DeploymentStatus::endpoint` (as returned by both `deploy()` and `status()`)
 /// is only populated once the workload is observed actually `Running` at that
-/// exact instant — see `ee/k8s-runtime`'s `status()`. For Kubernetes, a fresh
+/// exact instant — see the Kubernetes runtime's `status()`. For Kubernetes, a fresh
 /// Deployment/Service apply is essentially never Ready yet by the time
 /// `deploy()` returns (scheduling, image pull, and readiness probes all take
 /// real time), so every caller that persisted `deploy_status.endpoint`
@@ -153,31 +189,47 @@ pub(crate) fn qualify_deploy_image(registry: &str, image: &str) -> String {
     }
 }
 
+/// Tells the agent which port to listen on (the Service targets the first port, and every
+/// in-tree agent honors `PORT`). An explicit `PORT` in `env` wins.
+pub(crate) fn set_port_env(env: &mut HashMap<String, String>, port: u16) {
+    env.entry("PORT".to_string())
+        .or_insert_with(|| port.to_string());
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_agent_spec(
     agent_id: Uuid,
     name: &str,
     image: impl Into<String>,
     ports: Vec<u16>,
-    env: HashMap<String, String>,
+    mut env: HashMap<String, String>,
     default_memory: &str,
-    max_replicas: u32,
+    bounds: ReplicaBounds,
     writable: bool,
     writable_path: Option<String>,
     owner_id: Uuid,
 ) -> DeploymentSpec {
+    let ports = if ports.is_empty() {
+        vec![DEFAULT_AGENT_PORT]
+    } else {
+        ports
+    };
+    set_port_env(&mut env, ports[0]);
+    // A writable agent's files sit on one volume, whatever bounds the caller computed.
+    let bounds = if writable {
+        ReplicaBounds::SINGLE
+    } else {
+        bounds
+    };
     DeploymentSpec {
         container_id: ContainerId::from_uuid(agent_id),
         name: name.to_string(),
         image: image.into(),
-        ports: if ports.is_empty() {
-            vec![DEFAULT_AGENT_PORT]
-        } else {
-            ports
-        },
+        ports,
         env_vars: env,
-        min_replicas: 1,
-        max_replicas,
+        min_replicas: bounds.min,
+        max_replicas: bounds.max,
+        replica_target: bounds.target,
         // No per-agent override exists yet — every caller wants the
         // platform's configured default (AGENT_DEFAULT_MEMORY, see
         // Config::agent_default_memory's doc comment). cpu_milli is
@@ -195,6 +247,7 @@ pub(crate) fn build_agent_spec(
         writable,
         writable_path,
         owner_id,
+        force_pull: false,
     }
 }
 
@@ -202,11 +255,10 @@ pub fn router() -> Router<AppState> {
     upload::router()
         .merge(deployments::router())
         .merge(update::router())
-        .merge(llm_config::router())
     // `grants::router()` is deliberately NOT merged here: EE's `build_ee_app`
     // builds on top of this router and mounts its own richer grants router
     // (team/department grants + the live, CLI-consumed request shapes in
-    // ee/cli/src/access.rs) at the same paths. Merging both panics on route
+    // the enterprise CLI) at the same paths. Merging both panics on route
     // registration conflicts. The OSS-tier grants module IS live — the agent
     // card's "Access & security" tab consumes it — but it is mounted only in
     // the OSS-only composition root (`crate::build_app`), which EE never
@@ -222,7 +274,7 @@ pub fn degradable_router() -> Router<AppState> {
 }
 
 pub fn user_routes() -> Router<AppState> {
-    upload::user_routes()
+    upload::user_routes().merge(llm_config::router())
 }
 
 #[cfg(test)]
@@ -241,7 +293,7 @@ mod spec_tests {
             vec![],
             HashMap::new(),
             "512Mi",
-            1,
+            ReplicaBounds::SINGLE,
             false,
             None,
             Uuid::nil(),
@@ -253,7 +305,7 @@ mod spec_tests {
             vec![],
             HashMap::new(),
             "512Mi",
-            1,
+            ReplicaBounds::SINGLE,
             false,
             None,
             Uuid::nil(),
@@ -262,6 +314,71 @@ mod spec_tests {
         assert_eq!(a.container_id, b.container_id);
         // Empty ports → canonical 8000 (not 5000).
         assert_eq!(a.ports, vec![DEFAULT_AGENT_PORT]);
+    }
+
+    #[test]
+    fn sets_the_port_env_var_to_match_the_default_exposed_port() {
+        // Regression: this used to be every CALLER's job to remember. Only
+        // seed_agents_if_configured did; restart/upload/update/reconcile/
+        // import didn't — confirmed live, a seed-deployed agent restarted
+        // via the admin restart endpoint lost $PORT, fell back to its own
+        // image's internal default, and the platform's Docker port mapping
+        // (still pointed at DEFAULT_AGENT_PORT) reached nothing.
+        let id = Uuid::new_v4();
+        let s = build_agent_spec(
+            id,
+            "a",
+            "img:1",
+            vec![],
+            HashMap::new(),
+            "512Mi",
+            ReplicaBounds::SINGLE,
+            false,
+            None,
+            Uuid::nil(),
+        );
+        assert_eq!(
+            s.env_vars.get("PORT"),
+            Some(&DEFAULT_AGENT_PORT.to_string())
+        );
+    }
+
+    #[test]
+    fn sets_the_port_env_var_to_match_an_explicit_port() {
+        let id = Uuid::new_v4();
+        let s = build_agent_spec(
+            id,
+            "a",
+            "img:1",
+            vec![9091],
+            HashMap::new(),
+            "512Mi",
+            ReplicaBounds::SINGLE,
+            false,
+            None,
+            Uuid::nil(),
+        );
+        assert_eq!(s.env_vars.get("PORT"), Some(&"9091".to_string()));
+    }
+
+    #[test]
+    fn a_caller_supplied_port_env_var_is_never_overwritten() {
+        let id = Uuid::new_v4();
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "1234".to_string());
+        let s = build_agent_spec(
+            id,
+            "a",
+            "img:1",
+            vec![],
+            env,
+            "512Mi",
+            ReplicaBounds::SINGLE,
+            false,
+            None,
+            Uuid::nil(),
+        );
+        assert_eq!(s.env_vars.get("PORT"), Some(&"1234".to_string()));
     }
 
     #[test]
@@ -274,7 +391,7 @@ mod spec_tests {
             vec![9091],
             HashMap::new(),
             "512Mi",
-            1,
+            ReplicaBounds::SINGLE,
             false,
             None,
             Uuid::nil(),
@@ -283,25 +400,67 @@ mod spec_tests {
     }
 
     #[test]
-    fn spec_max_replicas_comes_from_parameter() {
+    fn port_env_tracks_the_first_of_several_ports() {
         let id = Uuid::new_v4();
         let s = build_agent_spec(
             id,
             "a",
             "img:1",
-            vec![],
+            vec![9091, 9092],
             HashMap::new(),
             "512Mi",
-            5,
+            ReplicaBounds::SINGLE,
             false,
             None,
             Uuid::nil(),
         );
-        assert_eq!(
-            s.max_replicas, 5,
-            "max_replicas must match the parameter, not be hardcoded"
+        assert_eq!(s.ports, vec![9091, 9092]);
+        assert_eq!(s.env_vars.get("PORT"), Some(&"9091".to_string()));
+    }
+
+    #[test]
+    fn spec_replicas_come_from_the_bounds() {
+        let bounds = ReplicaBounds {
+            min: 2,
+            max: 5,
+            target: Some(6),
+        };
+        let s = build_agent_spec(
+            Uuid::new_v4(),
+            "a",
+            "img:1",
+            vec![],
+            HashMap::new(),
+            "512Mi",
+            bounds,
+            false,
+            None,
+            Uuid::nil(),
         );
-        assert_eq!(s.min_replicas, 1);
+        assert_eq!((s.min_replicas, s.max_replicas), (2, 5));
+        assert_eq!(s.replica_target, Some(6));
+    }
+
+    #[test]
+    fn a_writable_spec_runs_one_replica_whatever_the_bounds() {
+        let bounds = ReplicaBounds {
+            min: 2,
+            max: 5,
+            target: None,
+        };
+        let s = build_agent_spec(
+            Uuid::new_v4(),
+            "a",
+            "img:1",
+            vec![],
+            HashMap::new(),
+            "512Mi",
+            bounds,
+            true,
+            None,
+            Uuid::nil(),
+        );
+        assert_eq!((s.min_replicas, s.max_replicas), (1, 1));
     }
 
     #[test]
@@ -314,7 +473,7 @@ mod spec_tests {
             vec![],
             HashMap::new(),
             "2Gi",
-            1,
+            ReplicaBounds::SINGLE,
             false,
             None,
             Uuid::nil(),
@@ -367,5 +526,51 @@ mod spec_tests {
             build_image_tag("", "my-agent", "1.0.0"),
             "nasiko/my-agent:1.0.0"
         );
+    }
+
+    #[test]
+    fn build_image_tag_slugifies_the_name_segment() {
+        // Found live on POST /api/agents/upload: an agent named
+        // "General-Assistant" produced `nasiko/General-Assistant:<ver>`, and the
+        // docker build failed with "repository name must be lowercase" only
+        // after the agent/build/job rows had committed.
+        assert_eq!(
+            build_image_tag("", "General-Assistant", "1.0.0"),
+            "nasiko/general-assistant:1.0.0"
+        );
+        assert_eq!(
+            build_image_tag("registry.example.com", "Infrastructure Manager", "1.0.0"),
+            "registry.example.com/nasiko/infrastructure-manager:1.0.0"
+        );
+    }
+
+    #[test]
+    fn image_name_slug_yields_oci_safe_repository_components() {
+        assert_eq!(
+            image_name_slug("Infrastructure Manager"),
+            "infrastructure-manager"
+        );
+        assert_eq!(
+            image_name_slug("infrastructure_manager"),
+            "infrastructure_manager"
+        );
+        assert_eq!(image_name_slug("Code Reviewer 2.0"), "code-reviewer-20");
+    }
+
+    #[test]
+    fn image_name_slug_never_yields_an_empty_name() {
+        // An empty repo component is as invalid a reference as a spaced one.
+        assert_eq!(image_name_slug("---"), "agent");
+        assert_eq!(image_name_slug(""), "agent");
+    }
+
+    #[test]
+    fn image_name_slug_is_idempotent() {
+        // Publish slugifies before pushing, and update/rollback re-derive the
+        // tag from the stored name — every re-application must land on the same
+        // repository, or a second build pushes a second image.
+        let published = "infrastructure-manager";
+        assert_eq!(image_name_slug("Infrastructure Manager"), published);
+        assert_eq!(image_name_slug(published), published);
     }
 }

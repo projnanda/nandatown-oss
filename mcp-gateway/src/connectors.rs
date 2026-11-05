@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::{McpError, Result};
+use crate::oauth::ClientOnboarding;
 use crate::permissions;
 use crate::provider::first_str;
 use crate::provider::generic::MCP_PROTOCOL_VERSION;
@@ -35,6 +36,8 @@ pub fn connector_dto(c: &McpConnector) -> Value {
         "logo_url": c.logo_url,
         "is_active": c.active(),
         "oauth_configured": c.oauth_configured(),
+        "oauth_scopes": c.oauth_scopes,
+        "oauth_send_resource": c.oauth_send_resource,
         "source_kind": c.source_kind,
         "build_status": c.build_status,
         "setup_status": c.setup_status,
@@ -77,11 +80,69 @@ fn classify_response(status: StatusCode, www_authenticate: &str) -> DetectedAuth
     DetectedAuthType::Bearer
 }
 
+/// What a bare `initialize` probe found in a successful response body, kept
+/// as two separate signals rather than one merged value: `instructions` is
+/// the server's own top-level self-description (MCP spec), stored verbatim
+/// in `mcp_connectors.instructions` and later forwarded by the gateway's own
+/// `initialize` — it must never be contaminated by `serverInfo.description`,
+/// a different field some servers set instead (confirmed live: Apify sets
+/// both, with different content). `server_description` is used only as a
+/// registration-time description *fallback*, never stored or forwarded on
+/// its own. Both `None` for an unsuccessful or unparsable response — this is
+/// enrichment, never something a caller should fail over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ProbedMetadata {
+    pub instructions: Option<String>,
+    pub server_description: Option<String>,
+}
+
+impl ProbedMetadata {
+    /// The pre-split combined value (`instructions` preferred, else
+    /// `server_description`) — what `probe_initialize` used to return as a
+    /// single field, and what the probe endpoint's response still reports
+    /// under `"instructions"` for the caller's benefit (a preview, not
+    /// something stored).
+    fn description_fallback(&self) -> Option<String> {
+        self.instructions
+            .clone()
+            .or_else(|| self.server_description.clone())
+    }
+}
+
+/// Harvested-instructions cap: this text is forwarded verbatim into every
+/// agent's `initialize` response and, from there, straight into the agent's
+/// own system prompt (`protocol.rs::connector_instructions`) — a third-party
+/// server is otherwise free to inject an unbounded amount of untrusted text
+/// there. 8 KiB is generous for a real `instructions` field (a sentence or
+/// two, per the MCP spec's intent) while bounding the worst case.
+const MAX_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+
+/// Truncate `instructions` to [`MAX_INSTRUCTIONS_BYTES`] at a char boundary,
+/// warning when it actually cuts something — called once, at harvest time
+/// (`probe_initialize`), so every caller of `ProbedMetadata` downstream
+/// (registration, re-probe) gets an already-bounded value without having to
+/// remember to cap it themselves.
+fn cap_instructions(instructions: String) -> String {
+    if instructions.len() <= MAX_INSTRUCTIONS_BYTES {
+        return instructions;
+    }
+    let mut end = MAX_INSTRUCTIONS_BYTES;
+    while !instructions.is_char_boundary(end) {
+        end -= 1;
+    }
+    tracing::warn!(
+        original_bytes = instructions.len(),
+        capped_bytes = end,
+        "harvested MCP `instructions` exceeded the cap — truncating before it reaches any agent's system prompt"
+    );
+    instructions[..end].to_string()
+}
+
 /// POST a bare `initialize` and classify the response into an auth type + status.
-pub async fn probe_initialize(
+pub(crate) async fn probe_initialize(
     http_client: &reqwest::Client,
     url: &str,
-) -> std::result::Result<(DetectedAuthType, u16, Option<String>), reqwest::Error> {
+) -> std::result::Result<(DetectedAuthType, u16, ProbedMetadata), reqwest::Error> {
     let resp = http_client
         .post(url)
         .timeout(std::time::Duration::from_secs(10))
@@ -116,117 +177,156 @@ pub async fn probe_initialize(
     // server's own self-description, per the MCP spec (confirmed live:
     // Firecrawl and Apify both populate this, over an SSE-formatted response —
     // hence reusing `parse_jsonrpc` rather than a bare `serde_json::from_str`,
-    // which would silently fail to find it in that shape). Falls back to
-    // `serverInfo.description` when `instructions` is absent — a second,
-    // similar self-description field some servers set instead (confirmed
-    // live: Apify sets both). Only present on a successful response body;
-    // absent/unparsable bodies just yield `None`, never an error — this is
-    // enrichment, not something registration should ever fail over.
-    let instructions = if status.is_success() {
+    // which would silently fail to find it in that shape) — and separately,
+    // `serverInfo.description`, a second self-description field some servers
+    // set instead (confirmed live: Apify sets both, with different content —
+    // these must stay two distinct values, not merged here; see
+    // `ProbedMetadata`'s own doc comment for why). Only present on a
+    // successful response body; absent/unparsable bodies just yield
+    // `ProbedMetadata::default()`, never an error — this is enrichment, not
+    // something registration should ever fail over.
+    let metadata = if status.is_success() {
         let content_type = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        resp.text().await.ok().and_then(|body| {
-            crate::provider::generic::parse_jsonrpc(&content_type, &body, "probe")
-                .ok()
-                .and_then(|v| {
-                    let result = v.get("result")?;
-                    first_str(result, &["instructions"]).or_else(|| {
-                        result
-                            .get("serverInfo")
-                            .and_then(|si| first_str(si, &["description"]))
-                    })
-                })
-        })
+        resp.text()
+            .await
+            .ok()
+            .and_then(|body| {
+                crate::provider::generic::parse_jsonrpc(&content_type, &body, "probe").ok()
+            })
+            .and_then(|v| v.get("result").cloned())
+            .map(|result| ProbedMetadata {
+                instructions: first_str(&result, &["instructions"]).map(cap_instructions),
+                server_description: result
+                    .get("serverInfo")
+                    .and_then(|si| first_str(si, &["description"])),
+            })
+            .unwrap_or_default()
     } else {
-        None
+        ProbedMetadata::default()
     };
 
-    Ok((auth_type, status.as_u16(), instructions))
+    Ok((auth_type, status.as_u16(), metadata))
 }
 
 /// `POST /connectors/probe` — detect a server's auth type without storing anything.
 pub async fn probe_connector_view(state: &McpState, url: &str) -> Result<Value> {
     let url = url.trim_end_matches('/').to_string();
     crate::net::validate_public_url(&url).await?;
+    // Guarded client: `validate_public_url` is a one-shot pre-check; the probe
+    // itself must go through the SSRF/DNS-rebinding-guarded client so a rebinding
+    // DNS can't point it at an internal address between the two resolutions.
+    probe_server(&state.guarded_http_client, &url).await
+}
 
+/// How the probe tells the user to onboard an OAuth client, from what the
+/// authorization server's metadata says (`None`: none could be found).
+fn oauth_hint(onboarding: Option<ClientOnboarding>) -> &'static str {
+    match onboarding {
+        Some(o) if o.supports_dcr => {
+            "This server supports OAuth 2.1 with automatic client registration - \
+             no client credentials needed."
+        }
+        Some(ClientOnboarding {
+            public_client: Some(true),
+            ..
+        }) => {
+            "This server uses OAuth 2.1 without automatic registration: supply the client ID \
+             of an app registered with its identity provider. It accepts public clients, so no \
+             client secret is needed."
+        }
+        Some(_) => {
+            "This server uses OAuth 2.1 without automatic registration: supply your own OAuth \
+             client ID, and the client secret if the app is registered as a confidential client."
+        }
+        None => {
+            "This server uses OAuth 2.1 but does not publish discovery metadata: supply your own \
+             OAuth client ID, and the client secret if the app is registered as a confidential \
+             client."
+        }
+    }
+}
+
+fn oauth_probe_view(url: &str, onboarding: Option<ClientOnboarding>) -> Value {
+    json!({
+        "url": url,
+        "auth_type": "oauth2",
+        "requires": "oauth_flow",
+        "supports_dcr": onboarding.is_some_and(|o| o.supports_dcr),
+        "public_client": onboarding.and_then(|o| o.public_client),
+        "hint": oauth_hint(onboarding),
+    })
+}
+
+async fn probe_server(http: &reqwest::Client, url: &str) -> Result<Value> {
     // Primary: RFC 9728 direct discovery — the MCP spec's own recommended
     // method, and deterministic when a server implements it (unlike guessing
     // from a bare unauthenticated response, which is a real, verified source
     // of false classifications — see classify_response's doc comment).
-    if let Some(rm) =
-        crate::oauth::fetch_protected_resource_metadata(&state.guarded_http_client, &url).await
-    {
-        // One extra hop: check the authorization-server metadata for a
-        // registration_endpoint so the frontend knows whether client
-        // credentials are required or can be obtained via DCR (RFC 7591).
-        let supports_dcr = crate::oauth::as_supports_dcr(&state.guarded_http_client, &rm).await;
-
-        let hint = if supports_dcr {
-            "This server supports OAuth 2.1 with automatic client registration — \
-             no client credentials needed."
-        } else {
-            "This server uses OAuth 2.1 but does not support automatic registration — \
-             you must provide your own OAuth client ID and secret."
-        };
-
-        return Ok(json!({
-            "url": url,
-            "auth_type": "oauth2",
-            "requires": "oauth_flow",
-            "supports_dcr": supports_dcr,
-            "hint": hint,
-        }));
+    if let Some(rm) = crate::oauth::fetch_protected_resource_metadata(http, url).await {
+        // One extra hop: check the authorization-server metadata so the
+        // frontend knows whether client credentials are required or can be
+        // obtained via DCR (RFC 7591), and whether a secret is needed.
+        let onboarding = crate::oauth::as_client_onboarding(http, &rm).await;
+        return Ok(oauth_probe_view(url, onboarding));
     }
 
     // Fallback: no well-known metadata found (either the server doesn't
     // support OAuth, or — confirmed live for at least one real server,
     // Atlassian — it does but doesn't publish RFC 9728 metadata at all).
-    // Guarded client: `validate_public_url` is a one-shot pre-check; the probe
-    // itself must go through the SSRF/DNS-rebinding-guarded client so a rebinding
-    // DNS can't point it at an internal address between the two resolutions.
-    let (detected, status, instructions) = probe_initialize(&state.guarded_http_client, &url)
+    let (detected, status, metadata) = probe_initialize(http, url)
         .await
         .map_err(|e| McpError::Backend(format!("could not reach MCP server: {e}")))?;
 
-    let (requires, hint, supports_dcr) = match detected {
+    if detected == DetectedAuthType::OAuth2 {
+        // Some servers (Entra ID behind API Management) publish authorization
+        // server metadata at their own origin instead of RFC 9728 documents.
+        let onboarding = crate::oauth::origin_client_onboarding(http, url).await;
+        let mut resp = oauth_probe_view(url, onboarding);
+        resp["instructions"] = json!(metadata.description_fallback());
+        return Ok(resp);
+    }
+
+    if detected == DetectedAuthType::Bearer && status == StatusCode::UNAUTHORIZED.as_u16() {
+        // A plain Bearer challenge can still front a server that is its own
+        // authorization server (MCP 2025-03-26 style, e.g. Atlassian); agree
+        // with discovery, which would authorize it through the origin.
+        if let Some(onboarding) = crate::oauth::origin_client_onboarding(http, url).await {
+            let mut resp = oauth_probe_view(url, Some(onboarding));
+            resp["instructions"] = json!(metadata.description_fallback());
+            return Ok(resp);
+        }
+    }
+
+    let (requires, hint) = match detected {
         DetectedAuthType::None => (
             "nothing",
             "This server requires no authentication.".to_string(),
-            None,
-        ),
-        DetectedAuthType::OAuth2 => (
-            "oauth_flow",
-            "This server uses OAuth 2.1 but does not publish discovery metadata — \
-             you must provide your own OAuth client ID and secret."
-                .to_string(),
-            Some(false),
         ),
         DetectedAuthType::Bearer if status == StatusCode::UNAUTHORIZED.as_u16() => (
             "api_key_input",
             "This server requires a Bearer token or API key.".to_string(),
-            None,
         ),
-        DetectedAuthType::Bearer => (
+        // `OAuth2` was returned above; it is grouped here only for exhaustiveness.
+        DetectedAuthType::Bearer | DetectedAuthType::OAuth2 => (
             "api_key_input",
             format!("Server returned HTTP {status}. It may require an API key."),
-            None,
         ),
     };
-    let mut resp = json!({
+    // Reports the same combined value the probe endpoint always has — this is
+    // a caller-facing preview, not what gets stored (see
+    // `ProbedMetadata::description_fallback`'s own doc comment).
+    Ok(json!({
         "url": url,
         "auth_type": detected.as_str(),
         "requires": requires,
         "hint": hint,
-        "instructions": instructions,
-    });
-    if let Some(dcr) = supports_dcr {
-        resp["supports_dcr"] = json!(dcr);
-    }
-    Ok(resp)
+        "instructions": metadata.description_fallback(),
+    }))
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -247,6 +347,8 @@ pub struct NewConnectorInput {
     pub logo_url: Option<String>,
     pub oauth_client_id: Option<String>,
     pub oauth_client_secret: Option<String>,
+    pub oauth_scopes: Option<String>,
+    pub oauth_send_resource: Option<bool>,
 }
 
 /// Register a custom MCP connector owned by `owner_id` (private until shared).
@@ -266,6 +368,13 @@ pub async fn register_connector(
         ));
     }
     crate::net::validate_public_url(&input.url).await?;
+    // Same normalisation the SQL applies, so the returned row matches storage.
+    let oauth_scopes = input
+        .oauth_scopes
+        .as_deref()
+        .map(str::trim)
+        .filter(|scopes| !scopes.is_empty())
+        .map(str::to_string);
 
     if repo::get_owned_connector_by_name(&state.db, owner_id, &input.name)
         .await?
@@ -305,19 +414,23 @@ pub async fn register_connector(
         Some(serde_json::to_value(&headers).unwrap_or(Value::Null))
     };
 
-    // Best-effort auto-description: if the caller didn't supply one, probe the
-    // server's own `initialize` response for a self-published `instructions`
-    // field (confirmed live: Firecrawl populates this). Never blocks or fails
-    // registration — a server requiring auth even for `initialize` (e.g.
-    // Notion) or one that simply doesn't set `instructions` just leaves this
-    // `None`, same as before this existed.
-    let mut description = match input.description {
-        Some(d) => Some(d),
-        None => probe_initialize(&state.guarded_http_client, &input.url)
-            .await
-            .ok()
-            .and_then(|(_, _, instructions)| instructions),
-    };
+    // Always probe the server's own `initialize` response — `instructions` is
+    // stored verbatim as its own column (0054_workspace.sql) regardless of
+    // whether the caller supplied a description, since it's a distinct value
+    // the gateway's own `initialize` forwards later, not a description
+    // substitute. The description itself keeps its original precedence:
+    // the caller's own description always wins; only a missing one falls
+    // back to the probed value (preferring `instructions`, else
+    // `serverInfo.description` — see `ProbedMetadata::description_fallback`).
+    // Never blocks or fails registration — a server requiring auth even for
+    // `initialize` (e.g. Notion) or one that simply doesn't set `instructions`
+    // just leaves both `None`, same as before this existed.
+    let probed = probe_initialize(&state.guarded_http_client, &input.url)
+        .await
+        .map(|(_, _, metadata)| metadata)
+        .unwrap_or_default();
+    let instructions = probed.instructions.clone();
+    let mut description = input.description.or_else(|| probed.description_fallback());
 
     // LLM fallback — only reached when the server's own `initialize` response
     // (just above) didn't publish a description either. No tool list is
@@ -346,6 +459,7 @@ pub async fn register_connector(
             display_name: input.display_name,
             logo_url: input.logo_url,
             description,
+            instructions,
             url: Some(input.url),
             transport: Some(input.transport),
             auth_type: Some(input.auth_type),
@@ -355,6 +469,8 @@ pub async fn register_connector(
             is_active: Some(true),
             source_kind: repo::SourceKind::ExternalUrl,
             build_status: None,
+            oauth_scopes: oauth_scopes.clone(),
+            oauth_send_resource: input.oauth_send_resource,
             ..Default::default()
         },
     )
@@ -402,6 +518,8 @@ pub async fn register_connector(
     Ok(McpConnector {
         setup_status: Some(final_status),
         setup_error: final_error,
+        oauth_scopes,
+        oauth_send_resource: input.oauth_send_resource,
         ..connector
     })
 }
@@ -420,6 +538,10 @@ pub struct UpdateConnectorInput {
     pub display_name: Option<String>,
     pub logo_url: Option<String>,
     pub is_active: Option<bool>,
+    /// An empty string clears the override.
+    pub oauth_scopes: Option<String>,
+    /// `None` leaves it unchanged; `Some(None)` returns to automatic.
+    pub oauth_send_resource: Option<Option<bool>>,
 }
 
 /// Update an owned custom connector (owner or admin). Avoids the destructive
@@ -501,6 +623,8 @@ pub async fn update_connector(
             display_name: input.display_name,
             logo_url: input.logo_url,
             is_active: input.is_active,
+            oauth_scopes: input.oauth_scopes,
+            oauth_send_resource: input.oauth_send_resource,
         },
     )
     .await?;
@@ -1300,6 +1424,112 @@ async fn connectors_reachable_in_order(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn probe_reads_public_client_support_from_origin_metadata() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/mcp")
+            .with_status(401)
+            .with_header(
+                "www-authenticate",
+                r#"Bearer error="invalid_token", resource_metadata="https://nowhere.invalid/x""#,
+            )
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/.well-known/oauth-authorization-server")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "authorization_endpoint": "https://host.example/authorize",
+                    "token_endpoint": "https://idp.example/token",
+                    "token_endpoint_auth_methods_supported": ["none"],
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let view = probe_server(&reqwest::Client::new(), &format!("{}/mcp", server.url()))
+            .await
+            .expect("probe succeeds");
+
+        assert_eq!(view["auth_type"], "oauth2");
+        assert_eq!(view["supports_dcr"], false);
+        assert_eq!(view["public_client"], true);
+        assert!(
+            view["hint"]
+                .as_str()
+                .unwrap()
+                .contains("no client secret is needed")
+        );
+    }
+
+    async fn mount_plain_bearer_server(server: &mut mockito::ServerGuard) {
+        server
+            .mock("POST", "/mcp")
+            .with_status(401)
+            .with_header(
+                "www-authenticate",
+                r#"Bearer realm="OAuth", error="invalid_token""#,
+            )
+            .create_async()
+            .await;
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-protected-resource",
+        ] {
+            server
+                .mock("GET", path)
+                .with_status(404)
+                .create_async()
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_reports_oauth_for_a_plain_bearer_401_with_origin_metadata() {
+        let mut server = mockito::Server::new_async().await;
+        mount_plain_bearer_server(&mut server).await;
+        server
+            .mock("GET", "/.well-known/oauth-authorization-server")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "issuer": server.url(),
+                    "authorization_endpoint": "https://host.example/authorize",
+                    "token_endpoint": "https://host.example/token",
+                    "registration_endpoint": "https://host.example/register",
+                    "token_endpoint_auth_methods_supported": ["none"],
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let view = probe_server(&reqwest::Client::new(), &format!("{}/mcp", server.url()))
+            .await
+            .expect("probe succeeds");
+
+        assert_eq!(view["auth_type"], "oauth2");
+        assert_eq!(view["supports_dcr"], true);
+    }
+
+    #[tokio::test]
+    async fn probe_keeps_the_api_key_answer_for_a_plain_bearer_401_without_origin_metadata() {
+        let mut server = mockito::Server::new_async().await;
+        mount_plain_bearer_server(&mut server).await;
+
+        let view = probe_server(&reqwest::Client::new(), &format!("{}/mcp", server.url()))
+            .await
+            .expect("probe succeeds");
+
+        assert_eq!(view["auth_type"], "bearer");
+        assert_eq!(view["requires"], "api_key_input");
+    }
+
     #[test]
     fn classify_response_cases() {
         assert_eq!(
@@ -1360,7 +1590,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (detected, status, instructions) =
+        let (detected, status, metadata) =
             probe_initialize(&client, &format!("{}/mcp", server.url()))
                 .await
                 .unwrap();
@@ -1368,7 +1598,7 @@ mod tests {
         mock.assert_async().await;
         assert_eq!(detected, DetectedAuthType::None);
         assert_eq!(status, 200);
-        assert_eq!(instructions, None);
+        assert_eq!(metadata, ProbedMetadata::default());
     }
 
     #[tokio::test]
@@ -1385,11 +1615,79 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
-        assert_eq!(instructions.as_deref(), Some("Use tool X for Y."));
+        assert_eq!(metadata.instructions.as_deref(), Some("Use tool X for Y."));
+        // `serverInfo` here carries no `description` field at all — must not
+        // be conflated with `instructions`.
+        assert_eq!(metadata.server_description, None);
+    }
+
+    /// `cap_instructions`'s char-boundary back-off, exercised directly (not
+    /// through `probe_initialize`/mockito): a multi-byte character (a 4-byte
+    /// emoji) straddles the `MAX_INSTRUCTIONS_BYTES` cut point — a naive
+    /// byte-oriented truncation would slice through the middle of it and
+    /// produce invalid UTF-8 (a panic on the `String` indexing, in fact,
+    /// since `str` slicing at a non-boundary index panics). Proves the
+    /// back-off walks the cut point back to the nearest boundary and the
+    /// result is always valid UTF-8, at or under the cap.
+    #[test]
+    fn cap_instructions_backs_off_to_a_char_boundary_when_a_multi_byte_char_straddles_the_cap() {
+        // `MAX_INSTRUCTIONS_BYTES - 1` ASCII bytes, then a 4-byte emoji whose
+        // first byte lands exactly one byte before the cap — its remaining
+        // three bytes straddle `MAX_INSTRUCTIONS_BYTES`, so a bare
+        // `s[..MAX_INSTRUCTIONS_BYTES]` would panic (not just misbehave).
+        let prefix = "a".repeat(MAX_INSTRUCTIONS_BYTES - 1);
+        let oversized = format!("{prefix}😀 more text after it");
+
+        let capped = cap_instructions(oversized);
+
+        assert!(
+            capped.len() <= MAX_INSTRUCTIONS_BYTES,
+            "must never exceed the cap: {}",
+            capped.len()
+        );
+        assert!(
+            std::str::from_utf8(capped.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
+        // The whole multi-byte char must have been dropped, not sliced —
+        // the back-off must land exactly where the prefix ends.
+        assert_eq!(capped, prefix);
+    }
+
+    /// A third-party server's `instructions` is forwarded verbatim into every
+    /// agent's system prompt — an oversized value must be capped at harvest
+    /// time (`cap_instructions`), not left for every downstream consumer to
+    /// remember to bound.
+    #[tokio::test]
+    async fn probe_initialize_truncates_oversized_instructions() {
+        let oversized = "a".repeat(MAX_INSTRUCTIONS_BYTES + 1024);
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"instructions": oversized},
+        })
+        .to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/mcp")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+            .await
+            .unwrap();
+
+        let instructions = metadata.instructions.expect("instructions must be present");
+        assert_eq!(instructions.len(), MAX_INSTRUCTIONS_BYTES);
+        assert!(instructions.chars().all(|c| c == 'a'));
     }
 
     #[tokio::test]
@@ -1409,11 +1707,14 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
-        assert_eq!(instructions.as_deref(), Some("SSE-delivered description."));
+        assert_eq!(
+            metadata.instructions.as_deref(),
+            Some("SSE-delivered description.")
+        );
     }
 
     #[tokio::test]
@@ -1431,18 +1732,21 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
-        assert_eq!(instructions, None);
+        assert_eq!(metadata, ProbedMetadata::default());
     }
 
     #[tokio::test]
     async fn probe_initialize_falls_back_to_server_info_description() {
         // Confirmed live: Apify sets `serverInfo.description` instead of (well,
         // actually alongside) `instructions`. A server that sets ONLY this
-        // field must still be captured.
+        // field must still be captured — as `server_description`, not
+        // `instructions` (they are two distinct signals since the
+        // instructions/description split; only `description_fallback()`
+        // merges them back for the description-fallback/probe-preview use).
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/mcp")
@@ -1455,20 +1759,28 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
+        assert_eq!(metadata.instructions, None);
         assert_eq!(
-            instructions.as_deref(),
+            metadata.server_description.as_deref(),
+            Some("Extract data from any website.")
+        );
+        assert_eq!(
+            metadata.description_fallback().as_deref(),
             Some("Extract data from any website.")
         );
     }
 
     #[tokio::test]
     async fn probe_initialize_prefers_instructions_over_server_info_description() {
-        // When both are present (confirmed live: Apify sets both), `instructions`
-        // is the richer, more authoritative field — it must win.
+        // When both are present (confirmed live: Apify sets both), each is
+        // captured separately — `instructions` is not discarded in favor of
+        // `server_description`, nor vice versa — but the combined
+        // `description_fallback()` value still prefers `instructions` as the
+        // richer, more authoritative field.
         let mut server = mockito::Server::new_async().await;
         server
             .mock("POST", "/mcp")
@@ -1481,10 +1793,18 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let (_, _, instructions) = probe_initialize(&client, &format!("{}/mcp", server.url()))
+        let (_, _, metadata) = probe_initialize(&client, &format!("{}/mcp", server.url()))
             .await
             .unwrap();
 
-        assert_eq!(instructions.as_deref(), Some("Full guide."));
+        assert_eq!(metadata.instructions.as_deref(), Some("Full guide."));
+        assert_eq!(
+            metadata.server_description.as_deref(),
+            Some("Short tagline.")
+        );
+        assert_eq!(
+            metadata.description_fallback().as_deref(),
+            Some("Full guide.")
+        );
     }
 }

@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
-use serde_json::Map;
+use serde_json::{Map, Value};
 
 use crate::config::GatewayConfig;
 use crate::error::GatewayError;
@@ -17,20 +17,30 @@ use crate::ir::{
     ChatChunk, ChatRequest, ChatResponse, ChunkChoice, Delta, EmbeddingsRequest,
     EmbeddingsResponse, Usage,
 };
-use crate::resolver::ResolvedConfig;
+use crate::resolver::{CustomEndpoint, ResolvedConfig, ResolvedEmbeddingConfig};
 
-/// Construct the provider client for a provider id. Used by the handler and the
-/// fallback executor. Unknown providers are a server-side gap (500).
+/// Construct the provider client for a destination. Used by the handlers and the
+/// fallback executor. Built-in providers use their base URL from [`GatewayConfig`];
+/// a custom (DB-registered) provider is OpenAI-shaped and uses `custom_endpoint` — its
+/// base URL plus the [`ProviderDialect`] describing how that endpoint wants to be
+/// addressed (plain OpenAI, Azure OpenAI, …). A non-built-in provider with no endpoint
+/// is a server-side gap (500) — the resolver populates it for every registered custom
+/// provider, so a missing one means the row was dropped mid-flight.
+///
+/// Takes the destination as two plain arguments rather than a `&ResolvedConfig`, because
+/// the embedding path resolves to [`ResolvedEmbeddingConfig`] and must be able to build a
+/// client without holding a chat-shaped struct.
 pub fn provider_for(
     provider: &str,
+    custom_endpoint: Option<&CustomEndpoint>,
     http: &reqwest::Client,
     cfg: &GatewayConfig,
 ) -> Result<Box<dyn ProviderClient>, GatewayError> {
     match provider {
-        "openai" => Ok(Box::new(OpenAiProvider::new(
-            http.clone(),
-            cfg.openai_api_base.clone(),
-        ))),
+        "openai" => Ok(Box::new(
+            OpenAiProvider::new(http.clone(), cfg.openai_api_base.clone())
+                .with_max_tools(cfg.openai_max_tools),
+        )),
         "anthropic" => Ok(Box::new(AnthropicProvider::new(
             http.clone(),
             cfg.anthropic_api_base.clone(),
@@ -39,21 +49,107 @@ pub fn provider_for(
             http.clone(),
             cfg.gemini_api_base.clone(),
         ))),
-        other => Err(GatewayError::Internal(format!(
-            "provider '{other}' is not supported yet"
+        "openrouter" => Ok(Box::new(OpenRouterProvider::new(
+            http.clone(),
+            cfg.openrouter_api_base.clone(),
+            cfg.openrouter_http_referer.clone(),
+            cfg.openrouter_x_title.clone(),
         ))),
+        other => match custom_endpoint {
+            Some(endpoint) => match &endpoint.dialect {
+                // Bedrock Converse has its own wire format; use the dedicated provider.
+                ProviderDialect::BedrockConverse => Ok(Box::new(BedrockConverseProvider::new(
+                    http.clone(),
+                    endpoint.base_url.clone(),
+                ))),
+                // Other custom providers carry OpenAI-shaped bodies; the dialect
+                // supplies the envelope (URL layout + credential header).
+                _ => Ok(Box::new(OpenAiProvider::with_dialect(
+                    http.clone(),
+                    endpoint.base_url.clone(),
+                    endpoint.dialect.clone(),
+                ))),
+            },
+            None => Err(GatewayError::Internal(format!(
+                "provider '{other}' has no endpoint (unregistered custom provider?)"
+            ))),
+        },
+    }
+}
+
+/// Run **one** embeddings call against the resolved destination and return the response.
+///
+/// Deliberately not in [`fallback`] and deliberately not a loop. Falling back to a
+/// different embedding model is not the same kind of move as falling back on chat: chat
+/// models differ in quality, embedding models differ in dimensionality and vector space.
+/// An agent that indexed at 3072 dimensions and then silently searched at 1536 gets no
+/// error — it gets a corpus split across two incomparable spaces. So the resolver picks
+/// one model by presence, this makes one attempt, and a failure is surfaced as-is: no
+/// fallback list, no provider switch, no `try_drop_param` retry.
+///
+/// It lives here rather than next to the chat fallback logic so nobody reintroduces
+/// chaining later just because the code sat beside a loop that does it.
+pub async fn execute_embeddings_once(
+    http: &reqwest::Client,
+    cfg: &GatewayConfig,
+    resolved: &ResolvedEmbeddingConfig,
+    req: &EmbeddingsRequest,
+) -> Result<EmbeddingsResponse, GatewayError> {
+    tracing::info!(
+        target: "nasiko::llm_router::provider",
+        op = "embeddings",
+        provider = %resolved.provider,
+        model = %resolved.model,
+        "provider request → dispatching embeddings to upstream LLM (single attempt, no fallback)"
+    );
+    let provider = provider_for(
+        &resolved.provider,
+        resolved.custom_endpoint.as_ref(),
+        http,
+        cfg,
+    )?;
+    match provider.embeddings(req, resolved).await {
+        Ok(resp) => {
+            tracing::info!(
+                target: "nasiko::llm_router::provider",
+                op = "embeddings",
+                provider = %resolved.provider,
+                model = %resolved.model,
+                response_body = %serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!("<serialize error: {e}>")),
+                "provider response ← embeddings body"
+            );
+            Ok(resp)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "nasiko::llm_router::provider",
+                provider = %resolved.provider,
+                model = %resolved.model,
+                error = %e,
+                "embedding attempt failed; surfacing it (no fallback by design — a different \
+                 embedding model would return vectors in a different space)"
+            );
+            Err(e.into())
+        }
     }
 }
 
 pub mod anthropic;
+pub mod bedrock_converse;
+pub mod dialect;
 pub mod fallback;
 pub mod gemini;
 pub mod openai;
+pub mod openrouter;
 pub(crate) mod sse;
 
 pub use anthropic::AnthropicProvider;
+pub use bedrock_converse::BedrockConverseProvider;
+pub use dialect::{KIND_AZURE_OPENAI, KIND_BEDROCK_CONVERSE, KIND_OPENAI, ProviderDialect};
 pub use gemini::GeminiProvider;
 pub use openai::OpenAiProvider;
+pub use openrouter::OpenRouterProvider;
 
 /// Current unix time (seconds) for synthesized response `created` fields. Providers
 /// that don't return a creation timestamp (Anthropic, Gemini) stamp one here.
@@ -163,10 +259,13 @@ pub trait ProviderClient: Send + Sync {
         cfg: &ResolvedConfig,
     ) -> Result<BoxStream<'static, Result<ChatChunk, ProviderError>>, ProviderError>;
 
+    /// One embeddings call. Takes [`ResolvedEmbeddingConfig`] rather than
+    /// [`ResolvedConfig`]: the embedding path never has a chat model, a fallback list or
+    /// a tier, and giving it a type that cannot carry them keeps it that way.
     async fn embeddings(
         &self,
         req: &EmbeddingsRequest,
-        cfg: &ResolvedConfig,
+        cfg: &ResolvedEmbeddingConfig,
     ) -> Result<EmbeddingsResponse, ProviderError>;
 
     /// If `err` is a "this model doesn't accept parameter X" rejection, return the IR
@@ -178,6 +277,18 @@ pub trait ProviderClient: Send + Sync {
     /// the offending field from its own error body. Default: never droppable — providers
     /// that can recognize their param-rejection shape override this.
     fn droppable_param(&self, _err: &ProviderError) -> Option<String> {
+        None
+    }
+
+    /// If `err` is a "this model needs parameter X set to value V" rejection, return the
+    /// IR parameter and the value so the executor can retry the *same* model with it set.
+    ///
+    /// The mirror of [`droppable_param`](ProviderClient::droppable_param), for the
+    /// rejections a drop cannot fix: the offending value is the model's own *default*,
+    /// not something we sent, so there is nothing to strip — the request has to name the
+    /// param explicitly. Same seam rule: the provider recognizes its own error shape
+    /// rather than us keeping a per-model capability table. Default: never repairable.
+    fn repairable_param(&self, _err: &ProviderError) -> Option<(String, Value)> {
         None
     }
 }
@@ -213,5 +324,69 @@ mod tests {
         let g: GatewayError = ProviderError::Transport("boom".into()).into();
         assert!(matches!(g, GatewayError::Upstream(_)));
         assert_eq!(g.status(), axum::http::StatusCode::BAD_GATEWAY);
+    }
+
+    fn resolved(provider: &str, base_url: Option<&str>) -> ResolvedConfig {
+        resolved_with(provider, base_url, ProviderDialect::OpenAi)
+    }
+
+    fn resolved_with(
+        provider: &str,
+        base_url: Option<&str>,
+        dialect: ProviderDialect,
+    ) -> ResolvedConfig {
+        ResolvedConfig {
+            compress_enabled: false,
+            provider: provider.into(),
+            model: "m".into(),
+            litellm_model: format!("{provider}/m"),
+            api_key: "k".into(),
+            fallback_models: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            has_llm_config: false,
+            pinned_model: None,
+            tier1_model: None,
+            tier2_model: None,
+            tier3_model: None,
+            platform_paid: true,
+            custom_endpoint: base_url.map(|base_url| crate::resolver::CustomEndpoint {
+                base_url: base_url.to_string(),
+                dialect,
+            }),
+            is_coding_agent: false,
+        }
+    }
+
+    #[test]
+    fn provider_for_custom_builds_against_overridden_base_url() {
+        let http = reqwest::Client::new();
+        let cfg = GatewayConfig::default();
+        // A custom (non-built-in) provider with an endpoint builds an OpenAI-shaped
+        // client against that URL — in either dialect.
+        let gateway = resolved("my-gateway", Some("https://gw/v1"));
+        assert!(
+            provider_for(
+                &gateway.provider,
+                gateway.custom_endpoint.as_ref(),
+                &http,
+                &cfg
+            )
+            .is_ok()
+        );
+        let azure = resolved_with(
+            "azure-prod",
+            Some("https://acme.openai.azure.com"),
+            ProviderDialect::AzureOpenAi {
+                api_version: "2024-10-21".into(),
+            },
+        );
+        assert!(provider_for(&azure.provider, azure.custom_endpoint.as_ref(), &http, &cfg).is_ok());
+        // ...but with no endpoint it is a server-side gap (the resolver should have
+        // populated it), surfaced as an Internal error rather than a mis-target.
+        assert!(matches!(
+            provider_for("my-gateway", None, &http, &cfg),
+            Err(GatewayError::Internal(_))
+        ));
     }
 }

@@ -45,8 +45,20 @@ fn make_zip_dockerfile_no_from() -> Vec<u8> {
     ])
 }
 
-/// Create an agent zip with a Dockerfile but no Python entrypoint.
+/// Create an agent zip with no way to start: a Dockerfile with FROM but no
+/// CMD/ENTRYPOINT, and no recognized entrypoint file. This is the genuinely
+/// invalid case after validation became language-agnostic.
 fn make_zip_no_entrypoint() -> Vec<u8> {
+    common::make_zip(&[
+        ("Dockerfile", b"FROM alpine:3.20\nRUN echo build-only\n"),
+        ("server.js", b"console.log('hi')"),
+    ])
+}
+
+/// Create a valid non-Python agent zip: a Node Dockerfile that declares its own
+/// CMD. Must be accepted — the pipeline builds from the Dockerfile, so an agent
+/// is not required to ship a Python entrypoint file.
+fn make_zip_node_with_cmd() -> Vec<u8> {
     common::make_zip(&[
         ("Dockerfile", b"FROM node:20\nCMD [\"node\", \"server.js\"]"),
         ("server.js", b"console.log('hi')"),
@@ -579,6 +591,32 @@ async fn upload_path_traversal_returns_400() {
     let res = do_upload(&server, uid, "traversal-400", vec![], make_zip_traversal()).await;
 
     assert_eq!(res.status(), 400);
+    server.cleanup().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn upload_node_cmd_entrypoint_accepted() {
+    // A non-Python agent whose Dockerfile declares its own CMD is valid — the
+    // build runs from the Dockerfile, so no Python entrypoint file is required.
+    let server = common::TestServer::start().await;
+    let admin = init_admin(&server).await;
+    let uid = admin["user_id"].as_str().unwrap();
+
+    let res = do_upload(
+        &server,
+        uid,
+        "node-cmd-agent",
+        vec![],
+        make_zip_node_with_cmd(),
+    )
+    .await;
+
+    assert_eq!(
+        res.status(),
+        202,
+        "a Node Dockerfile with CMD should be accepted"
+    );
     server.cleanup().await;
 }
 
