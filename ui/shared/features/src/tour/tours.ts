@@ -307,7 +307,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
       target: 'deploy-cli',
       side: 'left',
       title: 'Prefer the terminal?',
-      body: 'Copy the nandatown upload command and deploy from your shell instead.',
+      body: 'Copy the nasiko upload command and deploy from your shell instead.',
     },
     {
       target: 'deploy-github',
@@ -621,7 +621,7 @@ export const TOURS: Record<TourId, readonly TourStep[]> = {
       target: 'harnesses-connect',
       side: 'top',
       title: 'Connect a harness',
-      body: 'Run these in the Nandatown CLI on the machine where the harness runs. Its sessions show up here after that.',
+      body: 'Run these in the Nasiko CLI on the machine where the harness runs. Its sessions show up here after that.',
     },
   ],
 

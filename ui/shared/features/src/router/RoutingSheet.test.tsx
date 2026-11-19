@@ -153,13 +153,13 @@ describe('choices', () => {
     expect(within(sheet).getByText(copy.cliDetachLabel)).toBeInTheDocument()
     // The agent's own name (the harness seed's, not its display name), as the CLI resolves it.
     expect(within(sheet).getByRole('button', { name: copy.copyCliDetach })).toBeInTheDocument()
-    const detach = within(sheet).getByText(/^nandatown llm-config detach /)
-    const raw = /^nandatown llm-config detach (\S+)$/.exec(detach.textContent ?? '')?.[1]
+    const detach = within(sheet).getByText(/^nasiko llm-config detach /)
+    const raw = /^nasiko llm-config detach (\S+)$/.exec(detach.textContent ?? '')?.[1]
     expect(raw).toMatch(/claude/)
     await choose(within(sheet).getByRole('combobox', { name: copy.chooseConfig }), 'research-tiers')
     expect(within(sheet).getByRole('button', { name: copy.copyCliAttach })).toBeInTheDocument()
     expect(
-      within(sheet).getByText(`nandatown llm-config attach ${raw} research-tiers`),
+      within(sheet).getByText(`nasiko llm-config attach ${raw} research-tiers`),
     ).toBeInTheDocument()
     expect(within(sheet).getByText(copy.cliAppliesTo(30))).toBeInTheDocument()
   })

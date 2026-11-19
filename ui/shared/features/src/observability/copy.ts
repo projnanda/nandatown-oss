@@ -73,7 +73,7 @@ export const copy = {
   noMatchBody: 'Clear the agent, lane and status filters to see every session in this view.',
   clearFilters: 'Clear filters',
   sparseLive:
-    'Sessions come from chat traffic: run `nandatown chat <agent>` against a deployed agent, or use mock data with `npm run dev`.',
+    'Sessions come from chat traffic: run `nasiko chat <agent>` against a deployed agent, or use mock data with `npm run dev`.',
   noTraceData:
     'No trace data found for these sessions: their agents may not export traces yet, or the sessions were moved here from another workspace, which brings their history but not their trace spans.',
   noTraceDataFix:

@@ -301,10 +301,10 @@ describe('first run (design 7A)', () => {
     const user = userEvent.setup()
     renderApp('/')
     const guideCard = await screen.findByTestId('overview-setup-guide')
-    // The deploy command alone fails before `nandatown connect` and `nandatown new`, so the CLI shows all three.
+    // The deploy command alone fails before `nasiko connect` and `nasiko new`, so the CLI shows all three.
     await user.click(screen.getByRole('button', { name: copy.firstRun.cli(3) }))
-    expect(await screen.findByText(/^nandatown connect /)).toBeInTheDocument()
-    expect(screen.getByText('nandatown deploy ./my-agent')).toBeInTheDocument()
+    expect(await screen.findByText(/^nasiko connect /)).toBeInTheDocument()
+    expect(screen.getByText('nasiko deploy ./my-agent')).toBeInTheDocument()
     await user.click(within(guideCard).getByRole('button', { name: /^Add your model key/ }))
     expect(await screen.findByRole('heading', { name: '2. Your model key' })).toBeInTheDocument()
   })
@@ -777,7 +777,7 @@ describe('the coding harness preview, in place (2026-11-06)', () => {
     const bar = screen.getByRole('region', { name: p.bar })
     expect(bar).toHaveFocus()
     expect(screen.getByRole('heading', { level: 1, name: copy.title })).toBeInTheDocument()
-    expect(card('quiet-harnesses')).toHaveTextContent(`nandatown connect ${window.location.origin}`)
+    expect(card('quiet-harnesses')).toHaveTextContent(`nasiko connect ${window.location.origin}`)
     await userEvent.click(within(bar).getByRole('button', { name: p.jump('Month 1') }))
     expect(within(bar).getByRole('button', { name: p.jump('Month 1') })).toHaveAttribute(
       'aria-current',
@@ -853,7 +853,7 @@ describe('the coding harness preview, in place (2026-11-06)', () => {
     const bar = screen.getByRole('region', { name: p.bar })
     await user.click(within(bar).getByRole('button', { name: p.copyCommands }))
     expect(writeText).toHaveBeenCalledWith(
-      expect.stringContaining(`| bash\nnandatown connect ${window.location.origin}`),
+      expect.stringContaining(`| bash\nnasiko connect ${window.location.origin}`),
     )
     act(() => {
       vi.advanceTimersByTime(2 * PREVIEW_HOLD_MS)

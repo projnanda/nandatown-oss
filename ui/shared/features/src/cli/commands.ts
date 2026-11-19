@@ -30,4 +30,4 @@ export const serverUrl = (): string =>
  * SSO, else with a password). Signed in, the CLI asks which of this computer's coding agents to connect, and offers to
  * move any that report to another server. One command: no guide needs a sign-in step of its own.
  */
-export const connectCommand = (): string => `nandatown connect ${serverUrl()}`
+export const connectCommand = (): string => `nasiko connect ${serverUrl()}`

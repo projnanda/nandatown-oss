@@ -408,8 +408,8 @@ describe('Individual pieces', () => {
     const viewer = render(
       inRouter(<ConnectHelp self name="Ada" harness="cursor" server="https://or.example" />),
     )
-    expect(await screen.findByText(/nandatown connect https:\/\/or\.example/)).toBeInTheDocument()
-    expect(screen.getByText(/nandatown agents install cursor/)).toBeInTheDocument()
+    expect(await screen.findByText(/nasiko connect https:\/\/or\.example/)).toBeInTheDocument()
+    expect(screen.getByText(/nasiko agents install cursor/)).toBeInTheDocument()
     // FR-11: a local coding agent needs the CLI, so the steps link its install guide.
     expect(screen.getByRole('link', { name: 'Install the CLI' })).toHaveAttribute('href', '/cli')
     viewer.unmount()
@@ -428,7 +428,7 @@ describe('Individual pieces', () => {
     render(inRouter(<ConnectHelp self name="Ada" harness="codex" server="https://or.example" />))
     await user.click(await screen.findByRole('button', { name: 'Copy' }))
     expect(writeText).toHaveBeenCalledWith(
-      'nandatown connect https://or.example\nnandatown auth login\nnandatown agents install codex',
+      'nasiko connect https://or.example\nnasiko auth login\nnasiko agents install codex',
     )
   })
 
