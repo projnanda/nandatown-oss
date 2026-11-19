@@ -40,6 +40,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # lance-encoding (lance, used by the server) runs prost-build, which needs protoc.
+      # server/Dockerfile installs the same package for the deployed image.
+      - name: Install protoc
+        run: sudo apt-get update -q && sudo apt-get install -y -q protobuf-compiler
+
       - name: cargo build --workspace --locked
         run: cargo build --workspace --locked
 
