@@ -27,7 +27,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Which optimization layer saved this. The string forms are `CHECK`-constrained by migration
-/// 0052; changing one changes a queryable value, so they are spelled out rather than derived.
+/// 0052 (widened by 0099); changing one changes a queryable value, so they are spelled out rather
+/// than derived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
     /// IP-1 — structural compression of tool results at the llm-router egress seam.
@@ -46,6 +47,16 @@ pub enum Layer {
     MinimalCode,
     /// Instruction-file comment stripping in the coding agent.
     PromptComments,
+    /// Native tool schemas replaced by one-line signatures at the llm-router egress seam
+    /// (`TOKEN_COMPACT_TOOLS`).
+    CompactTools,
+    /// The MCP gateway listing the tools a flow's query matched instead of every granted tool
+    /// (`MCP_TOOL_SEARCH_MODE`).
+    ToolSearch,
+    /// Context an edition injects into an agent's prompt, packed under a token budget instead of
+    /// injected whole. Nothing in OSS writes it; it is here so the label and the `CHECK` constraint
+    /// exist before a writer does.
+    ContextBudget,
 }
 
 /// How a layer is named to users. Several layers roll up to one program — the dashboard says
@@ -60,6 +71,9 @@ pub enum Program {
     Pacms,
     Ponytail,
     PromptComments,
+    /// Both tool layers: each shrinks the tool definitions the model reads, by a different route.
+    ToolLists,
+    ContextBudget,
 }
 
 /// How the saving was arrived at. The distinction is the whole basis on which a figure can be
@@ -82,6 +96,9 @@ impl Layer {
             Self::Brevity => "brevity",
             Self::MinimalCode => "minimal_code",
             Self::PromptComments => "prompt_comments",
+            Self::CompactTools => "compact_tools",
+            Self::ToolSearch => "tool_search",
+            Self::ContextBudget => "context_budget",
         }
     }
 
@@ -96,6 +113,8 @@ impl Layer {
             Self::ContextSelection => Program::Pacms,
             Self::MinimalCode => Program::Ponytail,
             Self::PromptComments => Program::PromptComments,
+            Self::CompactTools | Self::ToolSearch => Program::ToolLists,
+            Self::ContextBudget => Program::ContextBudget,
         }
     }
 }
@@ -107,6 +126,8 @@ impl Program {
             Self::Pacms => "pacms",
             Self::Ponytail => "ponytail",
             Self::PromptComments => "prompt_comments",
+            Self::ToolLists => "tool_lists",
+            Self::ContextBudget => "context_budget",
         }
     }
 }
@@ -198,7 +219,7 @@ pub async fn insert(db: &PgPool, row: &SavingsRow) {
 mod tests {
     use super::*;
 
-    const ALL_LAYERS: [Layer; 7] = [
+    const ALL_LAYERS: [Layer; 10] = [
         Layer::CompressPayload,
         Layer::CompressToolResult,
         Layer::CompressHistory,
@@ -206,11 +227,14 @@ mod tests {
         Layer::Brevity,
         Layer::MinimalCode,
         Layer::PromptComments,
+        Layer::CompactTools,
+        Layer::ToolSearch,
+        Layer::ContextBudget,
     ];
 
-    /// The labels are `CHECK`-constrained by migration 0052, so a drifting one is a runtime insert
-    /// failure rather than a compile error. This is the guard that turns it back into a test
-    /// failure.
+    /// The labels are `CHECK`-constrained by migration 0052 (widened by 0099), so a drifting one is
+    /// a runtime insert failure rather than a compile error. This is the guard that turns it back
+    /// into a test failure.
     #[test]
     fn layer_labels_match_the_migrations_check_constraint() {
         let expected = [
@@ -221,6 +245,9 @@ mod tests {
             "brevity",
             "minimal_code",
             "prompt_comments",
+            "compact_tools",
+            "tool_search",
+            "context_budget",
         ];
         let actual: Vec<&str> = ALL_LAYERS.iter().map(|l| l.as_label()).collect();
         assert_eq!(actual, expected);
@@ -233,6 +260,8 @@ mod tests {
             (Program::Pacms, "pacms"),
             (Program::Ponytail, "ponytail"),
             (Program::PromptComments, "prompt_comments"),
+            (Program::ToolLists, "tool_lists"),
+            (Program::ContextBudget, "context_budget"),
         ] {
             assert_eq!(program.as_label(), label);
         }
@@ -265,6 +294,13 @@ mod tests {
         assert_eq!(Layer::ContextSelection.program(), Program::Pacms);
         assert_eq!(Layer::MinimalCode.program(), Program::Ponytail);
         assert_eq!(Layer::PromptComments.program(), Program::PromptComments);
+        // They shrink tool definitions, not tool output: crediting Caveman would name the wrong
+        // feature.
+        assert_eq!(Layer::CompactTools.program(), Program::ToolLists);
+        assert_eq!(Layer::ToolSearch.program(), Program::ToolLists);
+        // A budget on injected context, not on chat history: under Pacms the page would name the
+        // wrong feature.
+        assert_eq!(Layer::ContextBudget.program(), Program::ContextBudget);
     }
 
     #[test]

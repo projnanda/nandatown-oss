@@ -10,7 +10,9 @@ import { PageLoader } from '@nasiko/ui/composites/page-loader'
 import { Button } from '@nasiko/ui/primitives/button'
 import { cn } from '@nasiko/ui/lib/utils'
 import { useAgentsDirectory } from '@nasiko/features/agents/api'
+import type { Skill } from '@nasiko/features/agents/types'
 import { chatKeys, removeSessionRow, sessionRows, upsertSessionRow, useChatSessions } from './api'
+import { AgentApps } from './components/AgentApps'
 import { Composer, type ComposerHandle, type ComposerMode } from './components/Composer'
 import {
   AgentChooser,
@@ -47,14 +49,21 @@ import {
   orchestratorExamples,
   preselectTarget,
   resolveAgentParam,
+  stoppedByOwner,
 } from './target'
 import type { DisplayTurn } from './turnModel'
 import { isLivePhase, type LiveTurn, type SendInput } from './turnRegistry'
 import type { ChatSessionRow } from './types'
-import { useDraft } from './hooks'
+import { useAttachments, useDraft } from './hooks'
 import { directoryOf } from './target'
 import { sendErrorText } from './errors'
-import { ConfirmDialog, NotRunningBanner, SendError, type ViewProps } from './components/PageParts'
+import {
+  AttachNotes,
+  ConfirmDialog,
+  NotRunningBanner,
+  SendError,
+  type ViewProps,
+} from './components/PageParts'
 import { DebugFrames, UnknownScenarioBanner } from './components/DebugPanels'
 
 function NewChatView({ userId, registry, search, railButton, username }: ViewProps) {
@@ -65,6 +74,8 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
   const list = useChatSessions()
   const target = resolveAgentParam(search.agent, directoryOf(dir), isAuto(search))
   const agent = target.kind === 'direct' ? target.agent : undefined
+  // A stopped agent someone else owns: this user can't start it, so say its owner stopped it.
+  const byOwner = !!agent && stoppedByOwner(agent, userId)
   const routed = target.kind === 'routed'
   const noTarget = target.kind === 'choose'
   const draftKeyOf = (a: { id: string } | undefined) =>
@@ -93,6 +104,10 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
     setDraftRaw(v)
   }
   const composer = useRef<ComposerHandle>(null)
+  const attachments = useAttachments()
+  // The files the pending turn was sent with. Try again (a failed create) re-sends the same
+  // message, so it must re-send the same attachments: `take()` has already cleared the strip.
+  const inFlight = useRef<readonly File[]>([])
   const carry = { mock: search.mock, debug: search.debug }
   const mounted = useRef(true)
   useEffect(() => {
@@ -158,7 +173,7 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
   }, [failedCreate]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /** Resolves true once the turn started; false when it was refused before anything was sent. */
-  const send = async (text: string, retryId?: string): Promise<boolean> => {
+  const send = async (text: string, files: readonly File[], retryId?: string): Promise<boolean> => {
     if (!agent && !routed) return false
     setSendError(null)
     const draftKey = draftKeyOf(agent)
@@ -177,12 +192,18 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
       void client.invalidateQueries({ queryKey: chatKeys.history(row.session_id) })
       // Only move to the chat if this view is still the one the user sent from (EN8). The URL
       // alone isn't enough: leaving and coming back to the same URL makes a new view.
-      if (mounted.current && router.state.location.href === sentFrom)
-        void navigate({
-          to: '/chat/$sessionId',
-          params: { sessionId: row.session_id },
-          search: carry,
-          replace: true,
+      const stillHere = () => mounted.current && router.state.location.href === sentFrom
+      const to = {
+        to: '/chat/$sessionId',
+        params: { sessionId: row.session_id },
+        search: carry,
+      } as const
+      // Load the chat route's code (and start its history read) before moving: a first move to code that isn't
+      // loaded yet shows the router's pending loader over the whole page (past 150 ms, for at least 500 ms), which on
+      // a real network reads as a reload. This view keeps showing the turn meanwhile. preloadRoute never rejects.
+      if (stillHere())
+        void router.preloadRoute(to).then(() => {
+          if (stillHere()) void navigate({ ...to, replace: true })
         })
     }
     // Runs from the registry, so it works even if this view is gone by then.
@@ -208,6 +229,7 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
       sessionId: retryId,
       create: !!retryId,
       text,
+      files,
       onCreated,
       onCreateFailed,
       onStart,
@@ -221,16 +243,20 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
     } catch (err) {
       // Give the text back, unless the user has typed something newer since (Try again).
       if (!readDraft(userId, draftKey).trim()) setDraftRaw(text)
+      // The attachments come back either way: they belong to the message, not to the box.
+      attachments.restore(files)
       setSendError(err)
       return false
     }
   }
   const onSend = () => {
     const text = draft.trim()
+    const files = attachments.take()
+    inFlight.current = files
     dropUndo(userId)
     setUndo(null)
     setDraftRaw('')
-    void send(text)
+    void send(text, files)
   }
   const onExample = (text: string) => {
     if (draft.trim() && draft !== text) setReplaceWith(text)
@@ -284,7 +310,7 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
     // Clear the box only if it still holds the retried text; anything newer is the user's.
     tryAgain: () =>
       live &&
-      void send(live.userText, live.sessionId).then((ok) => {
+      void send(live.userText, inFlight.current, live.sessionId).then((ok) => {
         if (ok && readDraft(userId, draftKeyOf(agent)).trim() === live.userText) setDraftRaw('')
       }),
     requests: {
@@ -294,13 +320,17 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
     },
   }
 
+  // A parked agent takes messages: the message wakes it (`acceptsMessages` in ./target). Inline, not that
+  // call: a call here makes the React Compiler re-render every turn on each tick (ChatPage.tick.test).
+  const takesMessages = agent?.status === 'running' || agent?.status === 'parked'
   // The composer's lock: no target opens the picker (DS3); a stopped agent says why (E16); a turn in flight locks.
   let mode: ComposerMode = { kind: 'ready' }
   if (noTarget)
     mode = { kind: 'locked', reason: copy.needTarget, blocked: () => setPickerOpen(true) }
   else if (target.kind === 'loading' || target.kind === 'invalid') mode = { kind: 'locked' }
-  else if (agent && agent.status !== 'running') {
-    const reason = copy.stoppedTarget(agentLabel(agent))
+  else if (agent && !takesMessages) {
+    const name = agentLabel(agent)
+    const reason = byOwner ? copy.stoppedByOwner(name) : copy.stoppedTarget(name)
     mode = { kind: 'locked', reason, blocked: () => announce(reason) }
   }
   if (live && isLivePhase(live.phase)) mode = { kind: 'locked' }
@@ -334,6 +364,7 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
         ) : undefined
       }
       value={draft}
+      attachments={attachments}
       onChange={setDraft}
       onSend={onSend}
       onStop={() => undefined}
@@ -403,16 +434,21 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
         ) : (
           <NewChatHero target={identity} description={agent?.description} />
         )}
-        {agent && agent.status !== 'running' ? (
+        {agent && takesMessages ? (
+          <AgentApps agentId={agent.id} skills={(agent.skills ?? []) as Skill[]} />
+        ) : null}
+        {agent && !takesMessages ? (
           <NotRunningBanner
             agentId={agent.id}
             name={agentLabel(agent)}
+            byOwner={byOwner}
             refetch={() => void dir.refetch()}
           />
         ) : null}
         <div>
           {composerEl(true)}
           <SendError error={sendError} inline />
+          <AttachNotes notes={attachments.rejected} inline />
           {undo ? (
             <p className="mt-1.5 px-1 text-xs text-muted-foreground" data-testid="undo-draft">
               {copy.replacedDraft} ·{' '}
@@ -486,6 +522,7 @@ function NewChatView({ userId, registry, search, railButton, username }: ViewPro
       <div className="min-h-0 flex-1 overflow-y-auto">{body}</div>
       {search.debug ? <DebugFrames live={live} /> : null}
       {centred ? null : <SendError error={sendError} />}
+      {centred ? null : <AttachNotes notes={attachments.rejected} />}
       {!centred && (turn || target.kind === 'invalid') ? composerEl(false) : null}
       <StatusAnnouncer
         live={live}

@@ -47,8 +47,10 @@ pub struct Agent {
     /// real read-back route, which is what lets the Settings-tab switch show
     /// its actual current state instead of a per-browser guess.
     pub minimal_code_enabled: bool,
-    /// Per-agent opt-in for structural payload compression on this agent's LLM calls
-    /// (`nasiko-compress`, applied in the LLM router). Off unless explicitly enabled.
+    /// Per-agent opt-in for compression on this agent's traffic: structural payload compression
+    /// on its LLM calls (`nasiko-compress`, applied in the LLM router), brevity
+    /// (`llm-router/src/brevity.rs`) and session-history compression on a direct chat with it
+    /// (`router/a2a_dispatch.rs`). Off unless explicitly enabled.
     #[serde(default)]
     pub compress_enabled: bool,
     /// Whether this coding agent gates its tool use behind human approval
@@ -177,6 +179,11 @@ pub struct UpdateAgent {
     /// Toggle human-in-the-loop approval for this coding agent (NAS-842).
     /// Omitted = leave as-is, so an ordinary metadata edit never flips it.
     pub hitl_enabled: Option<bool>,
+    /// `auto` (the platform may park the agent when idle) or `resident` (always running).
+    /// Omitted = leave as-is. A `parked` agent flipped to `resident` is woken by its next call and
+    /// then stays up. A running `resident` agent flipped to `auto` is parked once idle; its workload
+    /// becomes one that can be parked at its next deploy.
+    pub parking_policy: Option<String>,
 }
 
 fn default_activate_version() -> bool {

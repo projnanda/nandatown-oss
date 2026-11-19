@@ -40,10 +40,17 @@ rand_distr = { workspace = true }
 
 # Storage & outbound HTTP (the crate owns these via LlmRouterCtx — no nasiko-server dep)
 sqlx = { workspace = true }
-reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest = { workspace = true, features = ["json", "stream", "multipart"] }
 futures = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+
+# Word and Excel attachments read as text (src/providers/media/office.rs)
+zip = { workspace = true }
+quick-xml = { workspace = true }
 
 # Auth (agent-identity JWT verify)
 jsonwebtoken = { workspace = true }
@@ -54,6 +61,7 @@ uuid = { workspace = true }
 
 # Router decision cache (S3) — sticky (conv_id, agent_id) → model across turns/scale
 redis = { workspace = true }
+nasiko-redis = { workspace = true }
 
 # Errors / time / logging
 thiserror = { workspace = true }
@@ -66,7 +74,6 @@ tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 serial_test = { workspace = true }
-base64 = { workspace = true }
 mockito = { workspace = true }
 tower = { workspace = true }
 zstd.workspace = true

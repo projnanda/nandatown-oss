@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, State, multipart::MultipartError},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{post, put},
 };
 use serde::{Deserialize, Serialize};
@@ -11,13 +11,14 @@ use uuid::Uuid;
 
 use nasiko_runtime::DeploymentStatus;
 
+use crate::agent_scaling::{ParkingPolicy, save_parking_policy};
 use crate::agents::upload::BuildJobPayload;
 use crate::auth::Claims;
 use crate::build::{self, BuildStatus, download_repo_tarball, routes::extract_zip_to_dir};
 use crate::github::load_github_token;
 use crate::state::AppState;
 
-use super::utils::{set_build_status, set_upload_status};
+use super::utils::{set_build_status, set_upload_status, store_build_logs};
 
 /// Max multipart body for an agent update (mirrors the upload router). Without
 /// this the update route inherited axum's 2 MiB default, and `field.bytes()`
@@ -64,7 +65,8 @@ pub struct AgentVersionRow {
 
 /// Multipart form for `PUT /{id}/update` — a `.zip` `source` file plus optional
 /// `version` (a strategy keyword `auto`/`patch`/`minor`/`major`, or an explicit
-/// semver string greater than the current version) and `changelog` fields.
+/// semver string greater than the current version), `changelog` and `parking_policy`
+/// fields.
 #[derive(ToSchema)]
 #[allow(dead_code)]
 pub(crate) struct UpdateAgentForm {
@@ -72,6 +74,8 @@ pub(crate) struct UpdateAgentForm {
     source: Vec<u8>,
     version: Option<String>,
     changelog: Option<String>,
+    /// `auto` | `resident`. Omit to keep the agent's stored policy.
+    parking_policy: Option<String>,
 }
 
 // ─── PUT /{id}/update ─────────────────────────────────────────────────────────
@@ -89,10 +93,11 @@ pub(crate) struct UpdateAgentForm {
     request_body(content = UpdateAgentForm, content_type = "multipart/form-data"),
     responses(
         (status = 202, description = "Build queued", body = UpdateAgentResponse),
-        (status = 400, description = "Invalid version/strategy or non-.zip source"),
+        (status = 400, description = "Invalid version/strategy or parking_policy, non-.zip or empty source, or an unreadable upload"),
         (status = 403, description = "Caller cannot manage this agent"),
         (status = 404, description = "No such agent"),
         (status = 409, description = "Version already exists or is not greater than current"),
+        (status = 413, description = "Upload larger than 100 MiB"),
     ),
 )]
 pub(crate) async fn update_agent(
@@ -156,8 +161,14 @@ pub(crate) async fn update_agent(
     let mut source_data: Option<Vec<u8>> = None;
     let mut requested_version: Option<String> = None;
     let mut changelog: Option<String> = None;
+    let mut parking_policy: Option<String> = None;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => return unreadable_upload(&e, agent_id),
+        };
         match field.name().unwrap_or("") {
             "source" => {
                 // Validate file extension before buffering the entire payload.
@@ -165,20 +176,34 @@ pub(crate) async fn update_agent(
                 if !fname.is_empty() && !fname.ends_with(".zip") {
                     return (StatusCode::BAD_REQUEST, "source must be a .zip file").into_response();
                 }
-                let data = field.bytes().await.unwrap_or_default();
-                if !data.is_empty() {
-                    source_data = Some(data.to_vec());
+                let data = match field.bytes().await {
+                    Ok(data) => data,
+                    Err(e) => return unreadable_upload(&e, agent_id),
+                };
+                if data.is_empty() {
+                    return (StatusCode::BAD_REQUEST, "source zip is empty").into_response();
                 }
+                source_data = Some(data.to_vec());
             }
-            "version" => {
-                requested_version = field.text().await.ok().filter(|s| !s.is_empty());
-            }
-            "changelog" => {
-                changelog = field.text().await.ok().filter(|s| !s.is_empty());
-            }
+            "version" => match field.text().await {
+                Ok(text) => requested_version = Some(text).filter(|s| !s.is_empty()),
+                Err(e) => return unreadable_upload(&e, agent_id),
+            },
+            "changelog" => match field.text().await {
+                Ok(text) => changelog = Some(text).filter(|s| !s.is_empty()),
+                Err(e) => return unreadable_upload(&e, agent_id),
+            },
+            "parking_policy" => match field.text().await {
+                Ok(text) => parking_policy = Some(text),
+                Err(e) => return unreadable_upload(&e, agent_id),
+            },
             _ => {}
         }
     }
+    let parking_policy = match ParkingPolicy::from_request_field(parking_policy.as_deref()) {
+        Ok(policy) => policy,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
     // Determine new version.
     // Accepts strategy keywords (auto, patch, minor, major) or an explicit semver string (e.g. "1.2.3").
@@ -271,9 +296,35 @@ pub(crate) async fn update_agent(
 
     let image_tag = crate::agents::build_image_tag(
         &state.config.agent_image_registry,
+        agent_owner_id,
         &agent_name,
         &new_version,
     );
+
+    // Validate image namespace
+    if let Err((code, msg)) = crate::agents::validate_image_ref(
+        &state.db,
+        &state.config.agent_image_registry,
+        &state.config.agent_image_registry_aliases,
+        &image_tag,
+        agent_owner_id,
+        claims.is_superuser,
+    )
+    .await
+    {
+        return (code, msg).into_response();
+    }
+
+    // Stored before the build is queued, so the worker's deploy reads it from the row. Not in
+    // one transaction with the queueing below (this handler writes each row on its own): an
+    // update whose job then fails to queue keeps the new policy, which takes effect at the
+    // agent's next deploy, as one saved through `PUT /api/agents/{id}` would.
+    if let Some(policy) = parking_policy
+        && let Err(e) = save_parking_policy(&state.db, agent_id, policy).await
+    {
+        tracing::error!(%e, %agent_id, "update_agent: save parking policy");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
 
     // Optimistic write — lets the UI show "deploying to <image_tag>".
     // On failure the background task rolls both version and image back.
@@ -362,6 +413,24 @@ pub(crate) async fn update_agent(
         }),
     )
         .into_response()
+}
+
+/// The answer to an update body that could not be read: `413` when it is over
+/// [`MAX_UPDATE_BYTES`], `400` for anything else (malformed, or the client hung
+/// up mid-upload). Never treated as "no source": that queues a rebuild from
+/// GitHub, so the caller would get a `202` and a build without their upload.
+fn unreadable_upload(e: &MultipartError, agent_id: Uuid) -> Response {
+    tracing::warn!(error = %e, %agent_id, "update: could not read the multipart body");
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let limit_mib = MAX_UPDATE_BYTES / (1024 * 1024);
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("upload is larger than {limit_mib} MiB"),
+        )
+            .into_response()
+    } else {
+        (StatusCode::BAD_REQUEST, "could not read the upload").into_response()
+    }
 }
 
 fn bump_patch_version(current: &str) -> String {
@@ -459,6 +528,9 @@ pub async fn execute_agent_update(
 
     let tmp_dir = std::env::temp_dir().join(format!("nasiko-update-{build_id}"));
 
+    // The image build's captured output, filled once the build runs so the Builds tab can show it.
+    let mut build_logs = String::new();
+
     let result: Result<(DeploymentStatus, Vec<i32>), String> = async {
         // Resolve the source directory — either from a zip or a GitHub re-deploy.
         let agent_source_dir = if let Some(zip_data) = source_data {
@@ -507,11 +579,12 @@ pub async fn execute_agent_update(
         let tar_bytes = tokio::task::spawn_blocking(move || build::tar_directory(&src))
             .await
             .map_err(|e| format!("tar task failed: {e}"))??;
-        state
+        build_logs = state
             .runtime
             .build(&tar_bytes, &image_tag)
             .await
-            .map_err(|e| format!("build: {e}"))?;
+            .map_err(|e| format!("build: {e}"))?
+            .logs;
 
         set_upload_status(
             db,
@@ -526,10 +599,10 @@ pub async fn execute_agent_update(
 
         // Read before the deploy env is built: a failed read must not rotate the running
         // agent's credentials or reset its state mode for a deploy that never happens.
-        let replica_bounds = scaling
-            .bounds()
+        let plan = scaling
+            .plan()
             .await
-            .map_err(|e| format!("read replica bounds: {e}"))?;
+            .map_err(|e| format!("read the deploy plan: {e}"))?;
         // Built with agent_owner_id (the agent's real owner), NOT owner_id (the caller) -
         // a superuser/ACL-grantee updating someone else's agent must not cause that
         // agent to resolve the caller's secrets/llm_config instead of its own owner's.
@@ -553,7 +626,7 @@ pub async fn execute_agent_update(
             vec![],
             env,
             &state.config.agent_default_memory,
-            replica_bounds,
+            plan,
             writable,
             writable_path.clone(),
             agent_owner_id,
@@ -623,6 +696,8 @@ pub async fn execute_agent_update(
             tokio::spawn(super::utils::fetch_agent_card_with_retry(
                 state.db.clone(),
                 state.http_client.clone(),
+                state.runtime.clone(),
+                state.llm_backend.clone(),
                 agent_id,
                 agent_url.clone(),
             ));
@@ -649,6 +724,7 @@ pub async fn execute_agent_update(
             .await;
 
             set_build_status(db, build_id, BuildStatus::Success).await;
+            store_build_logs(db, state.oci_storage.as_ref(), build_id, &build_logs).await;
             set_upload_status(
                 db,
                 &upload_id,
@@ -676,10 +752,21 @@ pub async fn execute_agent_update(
             .await;
 
             set_build_status(db, build_id, BuildStatus::Failed).await;
-            // `e` is a detailed internal string (may contain raw docker/tar/IO error
-            // text) — log it, but the `upload_status.error_message` column is read
-            // back by clients via GET /agents/uploads, so store a generic reason there
-            // instead of leaking internals through the status-polling API.
+            // Persist what explains the failure on the build row: the build output when the image
+            // built, otherwise the error text, which carries the builder's own log for a build
+            // failure. The `upload_status.error_message` column stays a generic reason because
+            // clients read it via GET /agents/uploads; the detail lives in the build logs.
+            store_build_logs(
+                db,
+                state.oci_storage.as_ref(),
+                build_id,
+                if build_logs.trim().is_empty() {
+                    &e
+                } else {
+                    &build_logs
+                },
+            )
+            .await;
             set_upload_status(
                 db,
                 &upload_id,
@@ -925,16 +1012,22 @@ pub async fn execute_agent_rollback(
         .execute(db)
         .await;
 
+    // `agent_versions.image_tag` for OCI-push deploys stores the registry-relative
+    // `nasiko/{name}:{tag}` as-is, which pulls from docker.io if applied unqualified
+    // — qualify exactly as the ad-hoc deploy and restart paths do (no-op for refs
+    // outside the `nasiko/` convention, e.g. upload/reupload's already-qualified tags).
+    let image =
+        crate::agents::qualify_deploy_image(&state.config.agent_image_registry, &target.image_tag);
     // Read before the deploy env is built: a failed read must not rotate the running
     // agent's credentials or reset its state mode for a deploy that never happens.
-    let replica_bounds = match scaling.bounds().await {
-        Ok(bounds) => bounds,
+    let plan = match scaling.plan().await {
+        Ok(plan) => plan,
         Err(e) => {
             fail_rollback(
                 db,
                 rollback_build_id,
                 agent_id,
-                &format!("read replica bounds: {e}"),
+                &format!("read the deploy plan: {e}"),
             )
             .await;
             return;
@@ -954,12 +1047,6 @@ pub async fn execute_agent_rollback(
         crate::agents::deploy_env::StateModeOnDeploy::Reset,
     )
     .await;
-    // `agent_versions.image_tag` for OCI-push deploys stores the registry-relative
-    // `nasiko/{name}:{tag}` as-is, which pulls from docker.io if applied unqualified
-    // — qualify exactly as the ad-hoc deploy and restart paths do (no-op for refs
-    // outside the `nasiko/` convention, e.g. upload/reupload's already-qualified tags).
-    let image =
-        crate::agents::qualify_deploy_image(&state.config.agent_image_registry, &target.image_tag);
     // UUID-keyed (see build_agent_spec) so rollback re-targets the live workload.
     let mut spec = crate::agents::build_agent_spec(
         agent_id,
@@ -968,7 +1055,7 @@ pub async fn execute_agent_rollback(
         vec![],
         env,
         &state.config.agent_default_memory,
-        replica_bounds,
+        plan,
         writable,
         writable_path.clone(),
         agent_owner_id,
@@ -986,23 +1073,7 @@ pub async fn execute_agent_rollback(
 
     match scaling.deploy(&spec).await {
         Ok(deploy_status) => {
-            // Deactivate current version, activate rollback target.
-            let _ = sqlx::query(
-                "UPDATE agent_versions SET is_active = false, status = 'archived' \
-                 WHERE agent_id = $1 AND is_active = true",
-            )
-            .bind(agent_id)
-            .execute(db)
-            .await;
-
-            let _ = sqlx::query(
-                "UPDATE agent_versions SET is_active = true, status = 'active' \
-                 WHERE agent_id = $1 AND version = $2",
-            )
-            .bind(agent_id)
-            .bind(&target.version)
-            .execute(db)
-            .await;
+            activate_rollback_target(db, agent_id, &target.version).await;
 
             let agent_url = crate::agents::resolve_agent_url(
                 &state.runtime,
@@ -1025,6 +1096,8 @@ pub async fn execute_agent_rollback(
             tokio::spawn(super::utils::fetch_agent_card_with_retry(
                 state.db.clone(),
                 state.http_client.clone(),
+                state.runtime.clone(),
+                state.llm_backend.clone(),
                 agent_id,
                 agent_url.clone(),
             ));
@@ -1050,6 +1123,26 @@ pub async fn execute_agent_rollback(
         }
         Err(e) => fail_rollback(db, rollback_build_id, agent_id, &e.to_string()).await,
     }
+}
+
+/// Deactivates the current version and activates the rollback target.
+async fn activate_rollback_target(db: &sqlx::PgPool, agent_id: Uuid, version: &str) {
+    let _ = sqlx::query(
+        "UPDATE agent_versions SET is_active = false, status = 'archived' \
+         WHERE agent_id = $1 AND is_active = true",
+    )
+    .bind(agent_id)
+    .execute(db)
+    .await;
+
+    let _ = sqlx::query(
+        "UPDATE agent_versions SET is_active = true, status = 'active' \
+         WHERE agent_id = $1 AND version = $2",
+    )
+    .bind(agent_id)
+    .bind(version)
+    .execute(db)
+    .await;
 }
 
 /// Marks a rollback that could not deploy, and its agent, failed.

@@ -252,18 +252,29 @@ pub(crate) async fn register_coding_agent(
 /// resolves them per edition and hands back plain ids instead, which is what
 /// closes the gap this comment used to describe. OSS returns an empty list, so
 /// the extra disjunct never matches there.
+///
+/// A soft-deleted agent matches for nobody, the superuser included: `DELETE /api/agents/{id}`
+/// leaves the row in place for history, so a listing that relied on each call site to add its
+/// own `deleted_at IS NULL` (`search` and `by_skill` did not) kept offering a removed agent.
+///
+/// Neither grant disjunct reaches a harness agent (`nasiko_auth::sharing`): a
+/// non-superuser sees one only as its owner, or when it is public (the platform's
+/// catalog rows).
 pub(crate) fn agent_access_predicate(user_bind: &str, org_bind: &str, table_ref: &str) -> String {
+    let grants_reach = nasiko_auth::sharing::grants_reach_sql(table_ref);
     format!(
-        r#"({user_bind}::uuid IS NULL
+        r#"({table_ref}.deleted_at IS NULL
+           AND ({user_bind}::uuid IS NULL
              OR {table_ref}.owner_id = {user_bind}
              OR {table_ref}.is_public = TRUE
-             OR {table_ref}.id::text = ANY({org_bind})
-             OR EXISTS (
-                 SELECT 1 FROM agent_grants ag
-                 WHERE ag.agent_id = {table_ref}.id
-                   AND ((ag.grant_type = 'public' AND ag.grantee_id = '*')
-                     OR (ag.grant_type = 'user'   AND ag.grantee_id = {user_bind}::text))
-             ))"#
+             OR ({grants_reach} AND (
+                 {table_ref}.id::text = ANY({org_bind})
+                 OR EXISTS (
+                     SELECT 1 FROM agent_grants ag
+                     WHERE ag.agent_id = {table_ref}.id
+                       AND ((ag.grant_type = 'public' AND ag.grantee_id = '*')
+                         OR (ag.grant_type = 'user'   AND ag.grantee_id = {user_bind}::text))
+                 )))))"#
     )
 }
 
@@ -455,6 +466,31 @@ pub(crate) async fn create(
         },
     };
 
+    // Canonicalize and validate the image reference before storing - fixes R-123
+    let validated_image = if let Some(ref image) = body.image {
+        match crate::agents::canonicalize_and_validate_image_ref(
+            &state.db,
+            &state.config.agent_image_registry,
+            &state.config.agent_image_registry_aliases,
+            image,
+            owner_id,
+            claims.is_superuser,
+        )
+        .await
+        {
+            Ok(img) => Some(img),
+            Err((code, msg)) => return (code, msg).into_response(),
+        }
+    } else {
+        None
+    };
+
+    let platform_deployed = body.image.as_deref().is_some_and(|i| !i.is_empty());
+    let url = match agent_url_to_store(&state, body.url.as_deref(), platform_deployed).await {
+        Ok(url) => url,
+        Err(refused) => return refused,
+    };
+
     let mut tx = match state.db.begin().await {
         Ok(t) => t,
         Err(e) => {
@@ -462,6 +498,14 @@ pub(crate) async fn create(
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
         }
     };
+
+    if let Err(refusal) = state
+        .agent_admission
+        .admit(&mut tx, owner_id, &body.name)
+        .await
+    {
+        return refusal.into_response();
+    }
 
     let result = sqlx
         ::query_as::<_, Agent>(
@@ -473,7 +517,7 @@ pub(crate) async fn create(
         .bind(&body.display_name)
         .bind(&body.description)
         .bind(owner_id)
-        .bind(&body.url)
+        .bind(&url)
         .bind(&body.icon_url)
         .bind(&body.version)
         .bind(&body.documentation_url)
@@ -481,7 +525,7 @@ pub(crate) async fn create(
         .bind(skills)
         .bind(&tags)
         .bind(meta)
-        .bind(&body.image)
+        .bind(&validated_image)
         .bind(minimal_code_enabled)
         .bind(workload_kind.as_db_str())
         .bind(body.hitl_enabled)
@@ -626,7 +670,10 @@ pub(crate) async fn list(
 /// per agent. Read-only override on the response, not persisted — avoids
 /// racing the crash guardian's own DB writes on K8s, and a stale read here is
 /// harmless where a stale write would linger.
-async fn reconcile_running_status(state: &AppState, agents: &mut [Agent]) {
+///
+/// Public so a build that serves this listing with its own handler applies the
+/// same override; otherwise its list shows a stopped agent as running.
+pub async fn reconcile_running_status(state: &AppState, agents: &mut [Agent]) {
     for agent in agents.iter_mut() {
         if let Some(live) = live_status(state, agent.id, &agent.status).await {
             agent.status = live;
@@ -641,11 +688,14 @@ pub(crate) async fn live_status(state: &AppState, agent_id: Uuid, status: &str) 
     if status != "running" {
         return None;
     }
-    let live = state
-        .runtime
-        .status(&ContainerId::from_uuid(agent_id))
-        .await
-        .ok()?;
+    let container = ContainerId::from_uuid(agent_id);
+    // A serving agent is running: `is_serving` is answered from the runtime's own view (the
+    // Kubernetes pod watch) where `status` asks the cluster's API, once per agent per listing.
+    // Only an agent that isn't serving pays for the full `status`.
+    if state.runtime.is_serving(&container).await.unwrap_or(false) {
+        return None;
+    }
+    let live = state.runtime.status(&container).await.ok()?;
     use nasiko_runtime::RuntimeState;
     matches!(
         live.state,
@@ -687,6 +737,16 @@ pub(crate) struct AgentDetailResponse {
     /// (NAS-842). Served so a client can show and toggle the current state.
     #[serde(rename = "hitl_enabled")]
     hitl_enabled: bool,
+    /// The owner's parking choice: `auto` (parked when idle, woken by the next call) or
+    /// `resident` (always on). The Settings choice renders from this, for the reason
+    /// compress_enabled gives above.
+    #[serde(rename = "parking_policy")]
+    parking_policy: String,
+    /// Whether this server keeps a `resident` agent always on. `false` where every framework
+    /// agent is parked when idle whatever its owner chose (`AgentScaling::honours_resident_policy`),
+    /// so the UI shows the choice unavailable instead of offering one that has no effect.
+    #[serde(rename = "resident_available")]
+    resident_available: bool,
     /// Whether this agent's card reads as code work, and so should be offered minimal-code
     /// mode at all. Served rather than re-derived in the browser: the settings page used to
     /// run its own `/code/i` over the skills, mirroring a Postgres `ILIKE '%code%'` in the
@@ -796,19 +856,21 @@ pub(crate) async fn get_one(
     }
 
     let can_manage = crate::acl::can_manage_agent(&state, &claims, agent.id).await;
-    let coding_agent_integration_id = match sqlx::query_scalar::<_, Option<String>>(
-        "SELECT coding_agent_integration_id FROM agents WHERE id = $1",
-    )
-    .bind(agent.id)
-    .fetch_one(&state.db)
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(%error, agent_id = %agent.id, "coding-agent identity lookup failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    // Columns the shared `Agent` row does not carry, so every query mapping into it keeps working.
+    let (coding_agent_integration_id, parking_policy) =
+        match sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT coding_agent_integration_id, parking_policy FROM agents WHERE id = $1",
+        )
+        .bind(agent.id)
+        .fetch_one(&state.db)
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(%error, agent_id = %agent.id, "agent detail columns lookup failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
 
     let skills: Vec<serde_json::Value> = agent
         .skills
@@ -828,6 +890,8 @@ pub(crate) async fn get_one(
         compress_enabled: agent.compress_enabled,
         minimal_code_enabled: agent.minimal_code_enabled,
         hitl_enabled: agent.hitl_enabled,
+        parking_policy,
+        resident_available: state.agent_scaling.honours_resident_policy(),
         has_coding_skills: super::models::has_coding_skills(&agent.skills),
         metadata: agent.metadata.0.clone(),
         status: agent.status.clone(),
@@ -962,6 +1026,59 @@ async fn record_version_change_if_needed(
     }
 }
 
+/// The `agents.url` to store for a create or update (NAS-1113).
+///
+/// The agent proxy, A2A dispatch and MAF forward to this address when the
+/// runtime does not know the agent, and relay the reply. A user-chosen
+/// address is therefore a way to make the server call anything it can reach,
+/// so:
+/// - an agent this platform deploys (it has an `image`) gets its address from
+///   the deploy, never from the caller: the requested `url` is dropped. The
+///   CLI sends its card's `url` (usually `http://localhost:8000/`) on create;
+///   it was never the address the agent is reached at.
+/// - an agent registered by URL must use `http(s)` and a host that resolves
+///   only to public addresses, unless the operator set
+///   `AGENT_ALLOW_PRIVATE_URLS`.
+///
+/// Not covered: a public hostname whose DNS later moves to a private address.
+/// That needs a connect-time check on the forwarding clients.
+async fn agent_url_to_store(
+    state: &AppState,
+    requested: Option<&str>,
+    platform_deployed: bool,
+) -> Result<Option<String>, Response> {
+    let Some(requested) = requested.filter(|u| !u.is_empty()) else {
+        return Ok(requested.map(str::to_owned));
+    };
+    if platform_deployed {
+        tracing::debug!(%requested, "ignoring url for a platform-deployed agent");
+        return Ok(None);
+    }
+    if state.config.agent_allow_private_urls {
+        return Ok(Some(requested.to_owned()));
+    }
+    match nasiko_mcp_gateway::net::check_public_url(requested).await {
+        Ok(()) => Ok(Some(requested.to_owned())),
+        Err(reason) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "agent url refused: {reason}. An agent on a private address needs \
+                 AGENT_ALLOW_PRIVATE_URLS=true on the server."
+            ),
+        )
+            .into_response()),
+    }
+}
+
+/// Whether the agent has an image, i.e. this platform deploys it.
+async fn has_image(state: &AppState, id: Uuid) -> sqlx::Result<bool> {
+    sqlx::query_scalar("SELECT COALESCE(image, '') <> '' FROM agents WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map(|has| has.unwrap_or(false))
+}
+
 /// Update an agent's catalog metadata. Owner-or-superuser only.
 #[utoipa::path(
     put,
@@ -999,6 +1116,44 @@ pub(crate) async fn update(
                 return (
                     StatusCode::BAD_REQUEST,
                     "workload_kind must be one of: agent, mcp_connector, acp_coding_agent",
+                )
+                    .into_response();
+            }
+        },
+    };
+
+    let url = match body.url.as_deref() {
+        None | Some("") => body.url.clone(),
+        Some(requested) => {
+            let deploys_image =
+                body.activate_version && body.image.as_deref().is_some_and(|i| !i.is_empty());
+            let platform_deployed = if deploys_image {
+                true
+            } else {
+                match has_image(&state, id).await {
+                    Ok(has) => has,
+                    Err(e) => {
+                        tracing::error!(%e, %id, "update agent: image lookup");
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+                            .into_response();
+                    }
+                }
+            };
+            match agent_url_to_store(&state, Some(requested), platform_deployed).await {
+                Ok(url) => url,
+                Err(refused) => return refused,
+            }
+        }
+    };
+
+    let parking_policy = match body.parking_policy.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<crate::agent_scaling::ParkingPolicy>() {
+            Ok(policy) => Some(policy.as_str()),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "parking_policy must be one of: auto, resident",
                 )
                     .into_response();
             }
@@ -1056,6 +1211,43 @@ pub(crate) async fn update(
         (None, None)
     };
 
+    // Canonicalize and validate image namespace when activating a version - fixes R-123
+    let validated_image = if let Some(image) = agent_image {
+        // Query owner_id inside the transaction - fixes R-123.reply-2 fail-open
+        let owner_id: Uuid = match sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                // Agent not found - should not happen since can_manage_agent passed
+                return (StatusCode::NOT_FOUND, "agent not found").into_response();
+            }
+            Err(e) => {
+                tracing::error!(%e, %id, "update agent: owner lookup failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
+                    .into_response();
+            }
+        };
+
+        match crate::agents::canonicalize_and_validate_image_ref(
+            &state.db,
+            &state.config.agent_image_registry,
+            &state.config.agent_image_registry_aliases,
+            &image,
+            owner_id,
+            claims.is_superuser,
+        )
+        .await
+        {
+            Ok(qualified) => Some(qualified),
+            Err((code, msg)) => return (code, msg).into_response(),
+        }
+    } else {
+        None
+    };
+
     let result = sqlx::query_as::<_, Agent>(
         r#"UPDATE agents SET
              display_name = COALESCE($2, display_name),
@@ -1074,6 +1266,7 @@ pub(crate) async fn update(
              compress_enabled = COALESCE($15, compress_enabled),
              workload_kind = COALESCE($16, workload_kind),
              hitl_enabled = COALESCE($17, hitl_enabled),
+             parking_policy = COALESCE($18, parking_policy),
              updated_at = now()
            WHERE id = $1
            RETURNING *"#,
@@ -1081,7 +1274,7 @@ pub(crate) async fn update(
     .bind(id)
     .bind(&body.display_name)
     .bind(&body.description)
-    .bind(&body.url)
+    .bind(&url)
     .bind(&body.icon_url)
     .bind(&agent_version)
     .bind(&body.documentation_url)
@@ -1094,11 +1287,12 @@ pub(crate) async fn update(
     .bind(&merged_tags)
     .bind(&body.metadata)
     .bind(&body.status)
-    .bind(&agent_image)
+    .bind(&validated_image)
     .bind(body.minimal_code_enabled)
     .bind(body.compress_enabled)
     .bind(workload_kind)
     .bind(body.hitl_enabled)
+    .bind(parking_policy)
     .fetch_optional(&mut *tx)
     .await;
 
@@ -1121,7 +1315,12 @@ pub(crate) async fn update(
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
     }
     match tx.commit().await {
-        Ok(()) => Json(agent).into_response(),
+        Ok(()) => {
+            if parking_policy.is_some() {
+                state.agent_scaling.parking_policy_changed(agent.id);
+            }
+            Json(agent).into_response()
+        }
         Err(e) => {
             tracing::error!(%e, "update agent: commit failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
@@ -1176,8 +1375,13 @@ pub(crate) async fn delete(
     // still leaves the agent deleted, which is the pre-existing behavior: the
     // errors are reported in `runtime_errors` rather than rolling the delete
     // back.
+    //
+    // The status goes to `stopped` in the same statement. Left at `running` or `parked`, the
+    // row still read as live to every query that selects agents by status, so the orchestrator
+    // kept offering a deleted agent as a routing candidate (and, once its name was reused,
+    // dropped both agents as indistinguishable).
     let name: String = match sqlx::query_scalar(
-        "UPDATE agents SET deleted_at = NOW() \
+        "UPDATE agents SET deleted_at = NOW(), status = 'stopped' \
          WHERE id = $1 AND deleted_at IS NULL \
          RETURNING name",
     )
@@ -1263,6 +1467,23 @@ pub(crate) async fn delete(
                 runtime_errors.push(format!("{container_name}: {e}"));
             }
         }
+    }
+
+    // Converge the deployment history on reality, the same agent-wide sweep a stop
+    // does (`admin::routes::record_lifecycle_status`). Not gated on `runtime_errors`:
+    // the name-keyed fallback above is absent for every UUID-keyed agent, so that list
+    // is almost never empty, and nothing of a deleted agent should still claim to run.
+    // Left alone, these rows list as `running` forever and EE's crash guardian keeps
+    // probing workloads that no longer exist.
+    if let Err(e) = sqlx::query(
+        "UPDATE agent_deployments SET status = 'stopped', updated_at = now()
+         WHERE agent_id = $1 AND status != 'stopped'",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await
+    {
+        tracing::error!(%e, %id, "delete agent: mark deployments stopped");
     }
 
     // The row was already marked by the claiming UPDATE above, so reaching here
@@ -1598,9 +1819,21 @@ pub(crate) struct UserSearchQuery {
 /// User search. Field boosts: username×3.0, display_name×2.5, email×1.5.
 /// Scoring: exact (100×boost) > prefix (90×boost) > contains (70×boost).
 /// Minimum query length: 2 chars. Sort: score DESC, username ASC.
-/// Returns all matching users (no limit).
-#[derive(Serialize, ToSchema, sqlx::FromRow)]
+/// Email is returned only for the caller themself (to prevent enumeration).
+#[derive(Serialize, ToSchema)]
 pub(crate) struct UserSearchResult {
+    id: Uuid,
+    username: String,
+    display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    role: Option<String>,
+    score: f64,
+}
+
+/// Internal row from the search query, before filtering email.
+#[derive(sqlx::FromRow)]
+struct UserSearchRow {
     id: Uuid,
     username: String,
     display_name: String,
@@ -1680,7 +1913,7 @@ pub(crate) async fn search_users(
            LIMIT 50"#
     );
 
-    let result = sqlx::query_as::<_, UserSearchResult>(&sql)
+    let result = sqlx::query_as::<_, UserSearchRow>(&sql)
         .bind(escape_like(&q))
         .bind(&visible_ids)
         .bind(&q)
@@ -1688,7 +1921,25 @@ pub(crate) async fn search_users(
         .await;
 
     match result {
-        Ok(users) => {
+        Ok(rows) => {
+            // Filter email: only return it for the caller themself.
+            let caller_id = claims.user_uuid().ok();
+            let users: Vec<UserSearchResult> = rows
+                .into_iter()
+                .map(|row| UserSearchResult {
+                    id: row.id,
+                    username: row.username,
+                    display_name: row.display_name,
+                    email: if Some(row.id) == caller_id {
+                        Some(row.email)
+                    } else {
+                        None
+                    },
+                    role: row.role,
+                    score: row.score,
+                })
+                .collect();
+
             let total = users.len();
             Json(serde_json::json!({
                 "data": users,
@@ -1760,26 +2011,28 @@ pub(crate) async fn registry_user_agents(
     let limit = q.limit.clamp(1, 100);
     let offset = q.offset.max(0);
 
-    // All users (including admins) see: owned + public + explicitly granted agents.
+    // All users (including admins) see: owned + public + explicitly granted agents. No grant
+    // reaches a harness agent (`nasiko_auth::sharing`).
     let pattern = q.q.as_deref().map(|s| format!("%{}%", s));
-    let agents = sqlx::query_as::<_, Agent>(
+    let agents = sqlx::query_as::<_, Agent>(&format!(
         r#"SELECT * FROM agents
            WHERE deleted_at IS NULL
              AND (
                owner_id = $1
                OR is_public = true
-               OR EXISTS (
+               OR ({grants_reach} AND EXISTS (
                    SELECT 1 FROM agent_grants ag
                    WHERE ag.agent_id = agents.id
                      AND ((ag.grant_type = 'public' AND ag.grantee_id = '*')
                        OR (ag.grant_type = 'user'   AND ag.grantee_id = $1::text))
-               )
+               ))
            )
              AND ($2::text IS NULL OR (name ILIKE $2 OR description ILIKE $2))
              AND ($3::text IS NULL OR status = $3)
            ORDER BY created_at DESC
            LIMIT $4 OFFSET $5"#,
-    )
+        grants_reach = nasiko_auth::sharing::grants_reach_sql("agents"),
+    ))
     .bind(user_id)
     .bind(&pattern)
     .bind(&q.status)

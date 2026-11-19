@@ -2,8 +2,10 @@
  * Sending (plan §6.1, EN1-EN4, EN7-EN8): create the chat, save the user row, stream a direct reply and save it
  * (a routed stream goes to `turnRouted`); Run again and Save again. A direct reply is the client's to save.
  */
+import { productEvent } from '@nasiko/app-core/analytics'
 import { emptyTurn, reduceSseEvent } from './a2aReducer'
 import { readSse, SseOverflowError } from '@nasiko/data-access/sse'
+import { asFileParts } from './attachments'
 import { ChatError, dispatchError, failedTurnError, restError } from './errors'
 import { clientWrites, dispatchBody, outcomeOf, resumeBody } from './send'
 import { tuning } from './tuning'
@@ -11,6 +13,7 @@ import type { SaveMessageBody } from './types'
 import type { Core } from './turnCore'
 import {
   attemptKeyOf,
+  fileIdsOf,
   isLivePhase,
   type LiveTurn,
   type RerunFrom,
@@ -166,6 +169,7 @@ export function createSend(core: Core, routed: ReturnType<typeof createRouted>) 
               chatMode: 'direct',
               agentId: t.agentId ?? '',
               text: t.userText,
+              fileIds: fileIdsOf(t),
             })
       res = await deps.dispatch(body, ctrl.signal)
       if (!isCurrent(sessionId, tid)) {
@@ -277,6 +281,7 @@ export function createSend(core: Core, routed: ReturnType<typeof createRouted>) 
       return Promise.reject(
         new ChatError({ phase: 'save-user', key: 'saveUserFailed', certainty: 'not-dispatched' }),
       )
+    productEvent('chat_message_sent', { mode: input.chatMode ?? 'direct' })
     if (text.length > tuning.MESSAGE_MAX_CHARS)
       return Promise.reject(
         new ChatError({ phase: 'save-user', key: 'tooLong', certainty: 'not-dispatched' }),
@@ -311,6 +316,10 @@ export function createSend(core: Core, routed: ReturnType<typeof createRouted>) 
           sessionId,
           agentId,
           userText: text,
+          // Shown straight away, as local parts: the bubble names what is being sent while it
+          // uploads. `userFilesPending` is what keeps those ids out of a download link.
+          userFiles: input.files?.length ? asFileParts(input.files) : undefined,
+          userFilesPending: !!input.files?.length,
           phase: isNew ? 'creating' : 'saving_user',
           state: emptyTurn(),
           startedAt: deps.now(),
@@ -363,10 +372,38 @@ export function createSend(core: Core, routed: ReturnType<typeof createRouted>) 
             }
             update(sessionId, { phase: 'saving_user' })
           }
+          // Attachments, now that the chat exists: the upload route is scoped to a session, and
+          // a new chat has none until create returns. Before the user row, because that row
+          // claims the files by id — and before the dispatch, which names the same ids (§7.7).
+          let fileIds: string[] = []
+          if (input.files?.length) {
+            const ctrl = new AbortController()
+            controllers.set(sessionId, ctrl)
+            try {
+              const parts = await deps.uploadFiles(sessionId, input.files, ctrl.signal)
+              if (!isCurrent(sessionId, tid)) return
+              fileIds = parts.map((p) => p.id)
+              // Swap the local placeholders for the saved parts: same chips, now downloadable.
+              update(sessionId, { userFiles: parts, userFilesPending: false })
+            } catch (err) {
+              expired(err)
+              if (!isCurrent(sessionId, tid)) return
+              // Nothing was dispatched, so this is the same shape of failure as a failed user-row
+              // save: the view puts the text back and the user can retry or drop the attachment.
+              const error = restError('upload', err)
+              if (routed) routedStep(sessionId, { type: 'create_failed' }, { error })
+              else update(sessionId, { phase: 'error', finalized: true, error })
+              return
+            }
+          }
           // The client always owns a routed chat's user row (§2.3).
           if (routed || clientWrites(transcripts.get(sessionId), 'user')) {
             try {
-              const saved = await deps.saveMessage(sessionId, { role: 'user', content: text })
+              const saved = await deps.saveMessage(sessionId, {
+                role: 'user',
+                content: text,
+                ...(fileIds.length ? { file_ids: fileIds } : {}),
+              })
               if (!isCurrent(sessionId, tid)) return
               update(sessionId, { userMessageId: saved.id })
             } catch (err) {
@@ -386,6 +423,9 @@ export function createSend(core: Core, routed: ReturnType<typeof createRouted>) 
                 })
               return
             }
+            // A server-owned user row (the proposed `transcript` contract, §10.2) is written
+            // without these ids, so its attachments reach the agent but not the transcript.
+            // No server sends that field today; revisit with whichever one first does.
           } else update(sessionId, { userRowServer: true })
           if (!isCurrent(sessionId, tid)) return
           await stream(sessionId)

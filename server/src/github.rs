@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use std::collections::HashMap;
 
+use crate::agent_scaling::{ParkingPolicy, save_parking_policy};
 use crate::agents::upload::BuildJobPayload;
 use crate::agents::utils::set_upload_status;
 use nasiko_secrets::SecretsCrypto;
@@ -96,7 +97,10 @@ const OAUTH_STATE_TTL_SECS: i64 = 600;
 ///
 /// Returns `Ok(true)` on first use (proceed), `Ok(false)` if already consumed
 /// (reject as a replay).
-async fn consume_oauth_state(redis: &redis::Client, raw_state: &str) -> redis::RedisResult<bool> {
+async fn consume_oauth_state(
+    redis: &nasiko_redis::SharedRedis,
+    raw_state: &str,
+) -> redis::RedisResult<bool> {
     let mut hasher = Sha256::new();
     hasher.update(raw_state.as_bytes());
     let key = format!(
@@ -104,7 +108,7 @@ async fn consume_oauth_state(redis: &redis::Client, raw_state: &str) -> redis::R
         URL_SAFE_NO_PAD.encode(hasher.finalize())
     );
 
-    let mut conn = redis.get_multiplexed_async_connection().await?;
+    let mut conn = redis.connection().await?;
     let set: Option<String> = redis::cmd("SET")
         .arg(&key)
         .arg("1")
@@ -121,13 +125,21 @@ async fn consume_oauth_state(redis: &redis::Client, raw_state: &str) -> redis::R
 
 /// `GET /api/github/login`
 ///
+/// What a caller is told when this server has no GitHub OAuth app configured.
+const GITHUB_NOT_CONFIGURED: &str =
+    "GitHub OAuth is not configured on this server (set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET)";
+
+/// What a caller is told when GitHub refuses this server's OAuth app credentials.
+const GITHUB_CREDENTIALS_REJECTED: &str = "GitHub rejected this server's OAuth client credentials. \
+     Ask your admin to check GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET.";
+
 /// Returns the GitHub OAuth authorization URL as JSON so the client can open
 /// it in a new tab/popup for the connect flow.
 async fn github_login(State(state): State<AppState>, claims: Claims) -> impl IntoResponse {
     let Some(svc) = state.github_svc.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "GitHub OAuth not configured"})),
+            Json(serde_json::json!({"error": GITHUB_NOT_CONFIGURED})),
         )
             .into_response();
     };
@@ -166,7 +178,7 @@ async fn github_login_user(State(state): State<AppState>) -> impl IntoResponse {
     let Some(svc) = state.github_svc.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "GitHub OAuth not configured"})),
+            Json(serde_json::json!({"error": GITHUB_NOT_CONFIGURED})),
         )
             .into_response();
     };
@@ -199,7 +211,7 @@ async fn github_token(State(state): State<AppState>, claims: Claims) -> impl Int
     let Some(svc) = state.github_svc.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"success": false, "message": "GitHub OAuth not configured", "status": "disconnected"})),
+            Json(serde_json::json!({"success": false, "message": GITHUB_NOT_CONFIGURED, "status": "disconnected"})),
         ).into_response();
     };
 
@@ -253,11 +265,7 @@ async fn github_callback(
     Query(params): Query<CallbackQuery>,
 ) -> impl IntoResponse {
     let Some(svc) = state.github_svc.as_ref() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "GitHub OAuth not configured",
-        )
-            .into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, GITHUB_NOT_CONFIGURED).into_response();
     };
 
     // Verify the HMAC-signed state — gives us the user_id without auth headers.
@@ -307,6 +315,10 @@ async fn github_callback(
     // Exchange the authorization code for an access token + user profile.
     let (token, github_user) = match svc.exchange_code(&params.code).await {
         Ok(t) => t,
+        Err(nasiko_github::Error::ClientCredentialsRejected) => {
+            warn!("GitHub code exchange: GitHub rejected this server's OAuth client credentials");
+            return (StatusCode::BAD_GATEWAY, GITHUB_CREDENTIALS_REJECTED).into_response();
+        }
         Err(e) => {
             warn!(%e, "GitHub code exchange failed");
             return (StatusCode::BAD_GATEWAY, "GitHub OAuth failed").into_response();
@@ -439,6 +451,18 @@ async fn github_callback_login(
         .await
     {
         Ok(r) => r,
+        // A capacity gate declined to provision a new user. `reason` is a
+        // caller-facing code, not raw internal detail, so it's safe to carry
+        // straight into the redirect the same way OIDC's own preflight does
+        // for the identical condition.
+        Err(nasiko_auth::AuthError::Forbidden(reason)) => {
+            tracing::info!(
+                github_login = %github_user.login,
+                reason,
+                "GitHub SSO login refused by a capacity gate"
+            );
+            return login_error_redirect(&state, &reason);
+        }
         // Deactivated or deprovisioned: an expected rejection, so 403 and a
         // message the person can act on — not the 500 that every other failure
         // here gets. Matches the password path, which answers `AuthError::Disabled`
@@ -446,6 +470,11 @@ async fn github_callback_login(
         Err(nasiko_auth::AuthError::Disabled) => {
             tracing::warn!(github_login = %github_user.login, "GitHub SSO login rejected: account deactivated");
             return (StatusCode::FORBIDDEN, "account deactivated").into_response();
+        }
+        // Members-only workspace: only pre-existing users may sign in.
+        Err(nasiko_auth::AuthError::NotInvited) => {
+            tracing::info!(github_login = %github_user.login, "GitHub SSO login rejected: account not invited");
+            return login_error_redirect(&state, "not_invited");
         }
         Err(e) => {
             tracing::error!(%e, github_login = %github_user.login, "GitHub SSO login: upsert_oauth_user failed");
@@ -488,7 +517,7 @@ async fn github_callback_login(
     }
 
     // Multi-tenant: the dashboard authenticates to this control plane by its
-    // host-only session cookie — `nasiko.dev` and `<sub>.nasiko.dev` are
+    // host-only session cookie — `app.nasiko.com` and `<sub>.app.nasiko.com` are
     // same-site, so the `SameSite=Strict` host-only cookie rides the dashboard's
     // credentialed cross-origin fetch — NOT a URL token. Set the cookie on this
     // CP-origin response (the browser is on `<sub>` here, having been 302'd by
@@ -593,7 +622,7 @@ async fn github_status(State(state): State<AppState>, claims: Claims) -> impl In
 
 async fn github_repos(State(state): State<AppState>, claims: Claims) -> impl IntoResponse {
     let Some(svc) = state.github_svc.as_ref() else {
-        return (StatusCode::NOT_FOUND, "GitHub OAuth not configured").into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, GITHUB_NOT_CONFIGURED).into_response();
     };
 
     let user_id = match claims.user_uuid() {
@@ -675,6 +704,10 @@ struct CloneBody {
     /// (e.g. the UI's auto-suggested patch bump after a conflict).
     #[serde(default)]
     version_override: Option<String>,
+    /// `auto` (the platform parks the agent when idle) or `resident` (always running).
+    /// Omitted keeps an existing agent's stored policy; a new agent gets `auto`.
+    #[serde(default)]
+    parking_policy: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -692,11 +725,7 @@ async fn github_clone(
 ) -> impl IntoResponse {
     // GitHub service must be configured (needed by the build worker later).
     if state.github_svc.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "GitHub OAuth not configured",
-        )
-            .into_response();
+        return (StatusCode::SERVICE_UNAVAILABLE, GITHUB_NOT_CONFIGURED).into_response();
     };
 
     let user_id = match claims.user_uuid() {
@@ -736,6 +765,10 @@ async fn github_clone(
         )
             .into_response();
     }
+    let parking_policy = match ParkingPolicy::from_request_field(body.parking_policy.as_deref()) {
+        Ok(policy) => policy,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
     // Determine agent name: explicit override → repo name.
     let agent_name = body.agent_name.clone().unwrap_or_else(|| {
@@ -753,9 +786,24 @@ async fn github_clone(
     let version_tag = "latest".to_string();
     let image_tag = crate::agents::build_image_tag(
         &state.config.agent_image_registry,
+        user_id,
         &agent_name,
         &version_tag,
     );
+
+    // Validate image namespace
+    if let Err((code, msg)) = crate::agents::validate_image_ref(
+        &state.db,
+        &state.config.agent_image_registry,
+        &state.config.agent_image_registry_aliases,
+        &image_tag,
+        user_id,
+        false,
+    )
+    .await
+    {
+        return (code, msg).into_response();
+    }
 
     // ── DB transaction: upsert agent + build record + job ────────────────────
     let mut tx = match state.db.begin().await {
@@ -786,27 +834,47 @@ async fn github_clone(
         None => (None, None, None),
     };
 
+    if let Err(refusal) = state
+        .agent_admission
+        .admit(&mut tx, user_id, &agent_name)
+        .await
+    {
+        return refusal.into_response();
+    }
+
     let agent_id = match sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO agents (name, owner_id, version, image, status) \
          VALUES ($1, $2, $3, $4, 'deploying') \
          ON CONFLICT (owner_id, name) WHERE deleted_at IS NULL \
          DO UPDATE SET version = EXCLUDED.version, image = EXCLUDED.image, \
                        status = 'deploying', updated_at = now() \
+         WHERE agents.workload_kind <> 'harness' \
          RETURNING id",
     )
     .bind(&agent_name)
     .bind(user_id)
     .bind(&version_tag)
     .bind(&image_tag)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     {
-        Ok(id) => id,
+        Ok(Some(id)) => id,
+        // The name is the caller's harness agent, which only the platform deploys.
+        Ok(None) => {
+            return (StatusCode::CONFLICT, crate::agents::HARNESS_AGENT_MANAGED).into_response();
+        }
         Err(e) => {
             tracing::error!(%e, agent_name = %agent_name, "github_clone: register agent db error");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
+    // Stored before the build is queued: the worker's deploy reads it from the row.
+    if let Some(policy) = parking_policy
+        && let Err(e) = save_parking_policy(&mut *tx, agent_id, policy).await
+    {
+        tracing::error!(%e, %agent_id, "github_clone: save parking policy db error");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
 
     let build_id = match sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO agent_builds (agent_id, version_tag, image_reference) \
@@ -835,7 +903,7 @@ async fn github_clone(
         repo_full_name: body.repository_full_name.clone(),
         branch: branch.to_string(),
         image_tag,
-        ports: vec![8000u16],
+        ports: vec![crate::agents::DEFAULT_AGENT_PORT],
         env: HashMap::new(),
         version_override: body.version_override.clone(),
         prior_version,
@@ -915,7 +983,8 @@ mod tests {
     async fn oauth_state_is_single_use() {
         let redis_url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-        let client = redis::Client::open(redis_url).expect("redis client");
+        let client =
+            nasiko_redis::SharedRedis::new(redis::Client::open(redis_url).expect("redis client"));
         let state_value = format!("test-replay-{}", Uuid::new_v4());
 
         let first = consume_oauth_state(&client, &state_value)

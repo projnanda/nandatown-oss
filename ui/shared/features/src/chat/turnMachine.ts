@@ -5,7 +5,13 @@
  */
 import type { Step, TurnState } from './a2aReducer'
 import type { ChatError } from './errors'
-import type { ChatMessage, ChatSessionRow, SaveMessageBody, TranscriptOwnership } from './types'
+import type {
+  ChatMessage,
+  ChatSessionRow,
+  FilePart,
+  SaveMessageBody,
+  TranscriptOwnership,
+} from './types'
 
 export type Phase =
   | 'creating'
@@ -46,6 +52,14 @@ export interface LiveTurn {
   /** The direct chat's agent; null on routed turns. */
   agentId: string | null
   userText: string
+  /**
+   * Files chosen for this turn, as the bubble shows them. Local parts until the upload returns,
+   * then the saved ones — so an attachment is visible from the moment it is sent, not from the
+   * moment history catches up.
+   */
+  userFiles?: FilePart[]
+  /** `userFiles` are still the local placeholders: their ids name nothing on the server yet. */
+  userFilesPending?: boolean
   userMessageId?: string
   /**
    * The server writes this chat's user row (its transcript says so), so the client never learns its id: the
@@ -86,6 +100,13 @@ export interface LiveTurn {
 /** The turn-end store key: user-message id plus the attempt label (§5.4). */
 export const attemptKeyOf = (t: Pick<LiveTurn, 'id' | 'userMessageId' | 'attempt'>) =>
   `${t.userMessageId ?? t.id}:${t.attempt}`
+
+/**
+ * This turn's attachment ids, or none while they are still local (§7.7). Run again re-sends the
+ * same ids: the dispatch only reads those files, the user row that claimed them is already saved.
+ */
+export const fileIdsOf = (t: Pick<LiveTurn, 'userFiles' | 'userFilesPending'>) =>
+  t.userFilesPending || !t.userFiles?.length ? undefined : t.userFiles.map((f) => f.id)
 
 /** One attempt's end, written once at its terminal state (NE-4). Outcome views read from here. */
 export interface TurnEnd {
@@ -298,6 +319,8 @@ export interface ChatDeps {
     signal: AbortSignal,
   ): Promise<ChatSessionRow>
   saveMessage(sessionId: string, body: SaveMessageBody): Promise<ChatMessage>
+  /** This turn's attachments, uploaded once the chat exists; resolves to the parts it saved (§7.7). */
+  uploadFiles(sessionId: string, files: readonly File[], signal: AbortSignal): Promise<FilePart[]>
   dispatch(body: unknown, signal: AbortSignal): Promise<Response>
   /** Refetch the newest history page; true when an assistant row with this content follows the user row. */
   replyExists(sessionId: string, userMessageId: string, content: string): Promise<boolean>
@@ -316,6 +339,8 @@ interface SendCommon {
   /** Omit for a new chat; the registry mints the id (EN8). */
   sessionId?: string
   text: string
+  /** Attachments to send with it; uploaded by the turn, after the chat exists (§7.7). */
+  files?: readonly File[]
   transcript?: TranscriptOwnership
   /** Called once the chat exists (new chats), before the user row is saved. */
   onCreated?(row: ChatSessionRow): void

@@ -25,6 +25,12 @@ pub enum FlowEvent {
         server: String,
         tool: String,
     },
+    /// A parked agent is being woken to serve this flow's request. `wake_ms` is how long the wake
+    /// took when it is announced once done, and `None` when it is announced as it begins.
+    AgentWaking {
+        agent_id: String,
+        wake_ms: Option<u64>,
+    },
 }
 
 /// In-memory broadcast bus for flow events, keyed by flow_id.

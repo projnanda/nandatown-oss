@@ -8,6 +8,35 @@ mod mcp;
 mod telemetry;
 mod tools;
 
+/// What a caller sees when this agent has no model key at all. At deploy the platform's LLM
+/// router puts the agent's gateway token in `OPENAI_API_KEY`, so an empty value means neither
+/// the router nor the agent's secrets supplied a key.
+const MISSING_KEY_MESSAGE: &str = "OPENAI_API_KEY is not set for this agent. Add it in the agent's secrets, or configure a platform key.";
+
+/// The error a failed model call reports. A rejected key (401/403) is named as one, without
+/// the provider's body, which goes to the log instead.
+fn llm_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        tracing::warn!(%status, body, "model provider rejected the API key");
+        return format!(
+            "The model provider rejected this agent's API key (HTTP {}).",
+            status.as_u16()
+        );
+    }
+    // The provider's (or the LLM router's) own `error.message` when the body carries one, so the
+    // user reads a sentence rather than a JSON dump; the raw body stays in the log.
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_owned));
+    match message {
+        Some(message) => {
+            tracing::warn!(%status, body, "model call failed");
+            format!("LLM API {status}: {message}")
+        }
+        None => format!("LLM API {status}: {body}"),
+    }
+}
+
 struct InfraAgent {
     model: String,
     api_key: String,
@@ -91,17 +120,29 @@ impl InfraAgent {
             // Capture the W3C traceparent before parent_cx is moved into
             // set_parent below; the outbound LLM call needs it so the gateway
             // can attribute tokens to the originating user flow.
-            let traceparent = parent_cx.as_ref().and_then(telemetry::traceparent_for_context);
-            if let Some(cx) = parent_cx {
-                use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-                chat_span.set_parent(cx);
-            }
+            // Propagate chat_span itself (after re-homing it) so the router's `gen_ai.chat`
+            // nests under ChatCompletion and the trace view shows the model that ran.
+            let traceparent: Option<String> = match parent_cx {
+                Some(cx) => {
+                    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+                    let fallback = cx.clone();
+                    chat_span.set_parent(cx);
+                    telemetry::traceparent_for_context(&chat_span.context())
+                        .or_else(|| telemetry::traceparent_for_context(&fallback))
+                }
+                None => None,
+            };
             let capture = telemetry::capture_content();
             if capture {
                 chat_span.record(
                     "gen_ai.input.messages",
                     telemetry::genai_input_messages(&messages).to_string().as_str(),
                 );
+            }
+
+            if api_key.is_empty() {
+                yield ChatEvent::Error(MISSING_KEY_MESSAGE.to_owned());
+                return;
             }
 
             let body = serde_json::json!({
@@ -134,7 +175,7 @@ impl InfraAgent {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
-                yield ChatEvent::Error(format!("LLM API {status}: {text}"));
+                yield ChatEvent::Error(llm_error_message(status, &text));
                 return;
             }
 

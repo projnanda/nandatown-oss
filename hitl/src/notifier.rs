@@ -1,8 +1,7 @@
 //! The one concrete [`crate::dispatcher::ResumeNotifier`] this milestone
 //! ships: pushes a resolved decision into the paused agent by resolving its
-//! live address via `ContainerRuntime::endpoint()` (the same primitive
-//! `oss/server/src/agent_proxy.rs` and `a2a_dispatch.rs::resolve_endpoint`
-//! already use) and making a fresh outbound A2A `SendMessage` call carrying
+//! address through an [`AgentTargetResolver`] (the server injects the one that wakes parked
+//! agents; [`RuntimeAddress`] is the default) and making a fresh outbound A2A `SendMessage` call carrying
 //! the row's `context_id`.
 //!
 //! There is no reusable event bus and no A2A push-notification support
@@ -14,12 +13,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nasiko_runtime::{ContainerId, ContainerRuntime, ForwardTarget};
+use nasiko_runtime::ContainerRuntime;
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::dispatcher::{NotifyError, ResumeNotifier};
+use crate::target::{AgentTargetResolver, ForwardTarget, ResolveCaller, RuntimeAddress};
 use crate::types::{DECISION_APPROVE, HitlKind, HitlRequest};
 
 /// `flows.title` for the row `traceparent_for_context` registers — named here instead of inline
@@ -39,7 +39,7 @@ pub const RESUME_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 pub struct RuntimeResumeNotifier {
     db: PgPool,
-    runtime: Arc<dyn ContainerRuntime>,
+    resolver: Arc<dyn AgentTargetResolver>,
     http_client: reqwest::Client,
     /// Mirrors the platform's `NASIKO_FLOW_TIMEOUT_SECS`. Received, not re-read from the env, so
     /// this agrees with the exact bound `gateway.rs`'s `flow_user` enforces on the agent's retry.
@@ -54,75 +54,39 @@ impl RuntimeResumeNotifier {
         flow_timeout_secs: i64,
     ) -> Self {
         Self {
+            resolver: Arc::new(RuntimeAddress::new(db.clone(), runtime)),
             db,
-            runtime,
             http_client,
             flow_timeout_secs,
         }
     }
 
-    /// Resolve the agent's currently-reachable A2A endpoint. Mirrors
-    /// `a2a_dispatch.rs::resolve_endpoint`'s live-runtime-first, stored-URL-
-    /// fallback shape, simplified: this notifier only ever needs to *reach*
-    /// the agent, not also flip `agents.status` — that bookkeeping belongs to
-    /// the request-serving code path, not a background dispatcher.
-    async fn resolve_agent_endpoint(&self, agent_id: Uuid) -> Result<ForwardTarget, NotifyError> {
-        let row: Option<(Option<String>, Option<String>)> =
-            sqlx::query_as("SELECT transport_path, url FROM agents WHERE id = $1")
-                .bind(agent_id)
-                .fetch_optional(&self.db)
-                .await
-                .map_err(|e| NotifyError::EndpointResolution {
-                    agent_id,
-                    reason: format!("db lookup failed: {e}"),
-                    permanent: false,
-                })?;
+    /// Resolve the agent through `resolver` instead of the runtime's address alone. The server
+    /// injects its own, which can wake a parked agent.
+    pub fn with_resolver(mut self, resolver: Arc<dyn AgentTargetResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
 
-        let Some((transport_path, stored_url)) = row else {
-            return Err(NotifyError::EndpointResolution {
+    /// Where the nudge goes, from the injected resolver (which wakes a parked agent).
+    async fn resolve_agent_endpoint(
+        &self,
+        agent_id: Uuid,
+        owner_user_id: Uuid,
+        context_id: &str,
+    ) -> Result<ForwardTarget, NotifyError> {
+        let caller = ResolveCaller {
+            user_id: Some(owner_user_id),
+            flow_id: None,
+        };
+        self.resolver
+            .resolve(agent_id, &caller, Some(context_id))
+            .await
+            .map_err(|failure| NotifyError::EndpointResolution {
                 agent_id,
-                reason: "no such agent".to_string(),
-                permanent: true,
-            });
-        };
-
-        // The A2A spec fixes no path — it must come from the agent's card,
-        // never be assumed. See resolve_endpoint's identical reasoning.
-        let path = match transport_path.as_deref() {
-            None | Some("/") | Some("") => "",
-            Some(p) => p,
-        };
-
-        // `forwarding_endpoint()`, not `endpoint()` — this resolves where the resumed forward
-        // actually goes (the EE injection proxy when memory is enabled), matching
-        // `resolve_endpoint` in `router/a2a_dispatch.rs`.
-        let container_id = ContainerId::from_uuid(agent_id);
-        if let Ok(target) = self.runtime.forwarding_endpoint(&container_id).await {
-            return Ok(ForwardTarget {
-                url: format!("{}{path}", target.url.trim_end_matches('/')),
-                headers: target.headers,
-            });
-        }
-
-        if let Some(url) = stored_url.filter(|u| !u.is_empty()) {
-            // Bypasses whatever `forwarding_endpoint()` would otherwise route through (the
-            // injection proxy, when memory is enabled), so this resume nudge gets no L1A.
-            tracing::warn!(
-                %agent_id,
-                "hitl notifier: live runtime lookup failed, falling back to stored agents.url \
-                 (bypasses the injection proxy — this forward gets no L1A)"
-            );
-            return Ok(ForwardTarget::from(format!(
-                "{}{path}",
-                url.trim_end_matches('/')
-            )));
-        }
-
-        Err(NotifyError::EndpointResolution {
-            agent_id,
-            reason: "no live or stored endpoint".to_string(),
-            permanent: false,
-        })
+                permanent: failure.is_permanent(),
+                reason: failure.message,
+            })
     }
 
     /// Build a `traceparent` for the resume nudge whose trace_id resolves back to `context_id`
@@ -170,62 +134,31 @@ impl RuntimeResumeNotifier {
             context_id.to_string()
         } else {
             let trace_id = Uuid::new_v4().simple().to_string();
-            // Defense in depth (review finding): only map `trace_id` to
-            // `context_id` when `context_id` actually names a chat session
-            // owned by THIS HITL row's owner (`owner_user_id`) — the
-            // `WHERE EXISTS` makes the insert a no-op otherwise. On the
-            // normal path (a row persisted from a verified flow —
-            // `oss/mcp-gateway/src/session.rs::resolve_context_id` only ever
-            // hands back a session belonging to the caller it resolved a
-            // context for) this always matches; it only ever fires if some
-            // other path ever persisted a `context_id` naming a different
-            // user's session. A zero-row affect is not a no-op to shrug at
-            // (mirrors the `flows` registration guard below, same reasoning):
-            // continuing to deliver the nudge anyway does NOT merely leave a
-            // `traceparent` with no live flow behind it — the registration
-            // below runs unconditionally and would still open one, keyed on
-            // this fresh `trace_id` and attributed to `owner_user_id`, over a
-            // context that user was never granted access to. And since no
-            // `session_traces` row now maps `trace_id` back to the real
-            // `context_id`, the agent's retry resolves its own traceparent to
-            // `trace_id` itself (`resolve_context_id`'s no-mapping fallback),
-            // which never matches the HITL row's actual `context_id` — so
-            // `claim_resolved_tool_approval`'s exact-match lookup fails and
-            // the human is asked to approve the same action again. Fail
-            // loudly instead: never open that flow when the ownership check
-            // itself failed.
-            match sqlx::query(
-                "INSERT INTO session_traces (session_id, trace_id, agent_id)
-                 SELECT $1, $2, $3
-                 WHERE EXISTS (
-                     SELECT 1 FROM chat_sessions WHERE session_id = $1 AND user_id = $4
+            // Defense in depth (review finding): only allow nudging when
+            // `context_id` actually names a chat session owned by THIS HITL
+            // row's owner (`owner_user_id`). Fail loudly if ownership check
+            // fails: never open a live flow when the check fails.
+            let owned: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM chat_sessions WHERE session_id = $1 AND user_id = $2
                  )",
             )
             .bind(context_id)
-            .bind(&trace_id)
-            .bind(agent_id)
             .bind(owner_user_id)
-            .execute(&self.db)
+            .fetch_one(&self.db)
             .await
-            {
-                Ok(result) if result.rows_affected() == 0 => {
-                    tracing::warn!(
-                        %context_id, %owner_user_id,
-                        "resume nudge aborted: context_id does not name a chat session owned by \
-                         this HITL row's owner (should never happen for a row persisted through \
-                         the normal verified-flow path)"
-                    );
-                    return Err(NotifyError::ContextNotOwned {
-                        context_id: context_id.to_string(),
-                    });
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        %context_id, error = %e,
-                        "failed to record session_traces mapping for resume nudge traceparent"
-                    );
-                }
+            .unwrap_or(false);
+
+            if !owned {
+                tracing::warn!(
+                    %context_id, %owner_user_id,
+                    "resume nudge aborted: context_id does not name a chat session owned by \
+                     this HITL row's owner (should never happen for a row persisted through \
+                     the normal verified-flow path)"
+                );
+                return Err(NotifyError::ContextNotOwned {
+                    context_id: context_id.to_string(),
+                });
             }
             trace_id
         };
@@ -254,8 +187,8 @@ impl RuntimeResumeNotifier {
         //     delivered as if healthy (the agent would 403 with "traceparent does not resolve to a
         //     live flow" and the human's approval would silently do nothing).
         let registered: Option<(String,)> = match sqlx::query_as(
-            r#"INSERT INTO flows (flow_id, user_id, root_agent_id, title, status)
-               VALUES ($1, $2, $3, $4, $5)
+            r#"INSERT INTO flows (flow_id, user_id, root_agent_id, title, status, session_id)
+               VALUES ($1, $2, $3, $4, $5, $7)
                ON CONFLICT (flow_id) DO UPDATE SET status = $5
                  WHERE flows.created_at > now() - make_interval(secs => $6)
                    AND flows.user_id = $2
@@ -267,6 +200,8 @@ impl RuntimeResumeNotifier {
         .bind(FLOW_TITLE)
         .bind(FLOW_STATUS_RUNNING)
         .bind(self.flow_timeout_secs as f64)
+        // The HITL row's context is the session this nudge belongs to.
+        .bind(context_id)
         .fetch_optional(&self.db)
         .await
         {
@@ -323,7 +258,9 @@ impl ResumeNotifier for RuntimeResumeNotifier {
             .as_deref()
             .ok_or(NotifyError::MissingContextId(request.id))?;
 
-        let target = self.resolve_agent_endpoint(request.agent_id).await?;
+        let target = self
+            .resolve_agent_endpoint(request.agent_id, request.owner_user_id, context_id)
+            .await?;
         let message = build_resume_message(request);
         let body = nasiko_types::a2a::build_send_request(&message, Some(context_id));
         let traceparent = self

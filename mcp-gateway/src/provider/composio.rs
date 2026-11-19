@@ -112,6 +112,10 @@ impl ComposioProvider {
     async fn parse(&self, path: &str, resp: reqwest::Response) -> Result<Value> {
         let status = resp.status();
         let text = resp.text().await?;
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            tracing::warn!(path, status = status.as_u16(), body = %truncate(&text, 300), "composio refused the API key");
+            return Err(McpError::ComposioKeyRejected);
+        }
         if !status.is_success() {
             return Err(McpError::Composio(format!(
                 "{} → HTTP {}: {}",
@@ -213,6 +217,14 @@ impl ToolProvider for ComposioProvider {
             })?;
 
         Ok(AuthConfigCreated { auth_config_id })
+    }
+
+    async fn auth_config_exists(&self, auth_config_id: &str) -> Result<bool> {
+        let path = format!("/api/v3/auth_configs/{auth_config_id}");
+        Ok(self
+            .get_json_opt(&path, &[], DEFAULT_TIMEOUT)
+            .await?
+            .is_some())
     }
 
     async fn initiate_connection(

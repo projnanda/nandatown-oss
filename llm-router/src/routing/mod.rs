@@ -92,12 +92,89 @@ pub struct RouteInputs<'a> {
     pub tier_seed: Option<u64>,
 }
 
+impl RouteInputs<'_> {
+    /// Whether the agent's config opts into per-request tier routing: it is configured and
+    /// names at least one tier model. A config with only a `model` is a single-model config
+    /// and runs that model; drawing a tier for it would fill the tier from the global registry
+    /// with a model the user never picked (NAS-1222).
+    fn routes_by_tier(&self) -> bool {
+        self.has_llm_config
+            && (self.tier1_model.is_some()
+                || self.tier2_model.is_some()
+                || self.tier3_model.is_some())
+    }
+
+    /// The model this config names for `tier`, if any (else the global registry decides).
+    fn config_model_for(&self, tier: Tier) -> Option<&str> {
+        match tier {
+            Tier::Tier1 => self.tier1_model,
+            Tier::Tier2 => self.tier2_model,
+            Tier::Tier3 => self.tier3_model,
+        }
+    }
+}
+
+impl RouteSource {
+    /// Stable string form — the `metadata.routing` counter key for this level (NAS-1263).
+    pub fn as_label(self) -> &'static str {
+        match self {
+            RouteSource::Pinned => "pinned",
+            RouteSource::CacheHit => "cache_hit",
+            RouteSource::SmallTalk => "small_talk",
+            RouteSource::Classified => "classified",
+            RouteSource::Config => "config",
+            RouteSource::Default => "default",
+        }
+    }
+
+    /// Every level, in precedence order, so a routing block always carries the same keys and a
+    /// reader can tell "this level served no call" from "this deployment never wrote the block".
+    pub const ALL: [RouteSource; 6] = [
+        RouteSource::Pinned,
+        RouteSource::CacheHit,
+        RouteSource::SmallTalk,
+        RouteSource::Classified,
+        RouteSource::Config,
+        RouteSource::Default,
+    ];
+}
+
 /// The outcome of routing: the model to call and how it was chosen.
 #[derive(Debug, Clone)]
 pub struct RouteDecision {
     pub model: String,
     pub tier: Option<Tier>,
     pub source: RouteSource,
+}
+
+impl RouteDecision {
+    /// What this call contributes to its usage row's `metadata.routing` block (NAS-1263): one
+    /// `calls`, one for the level that served it, one for its tier if it drew one, and one for
+    /// whether that overrode the resolver's model.
+    ///
+    /// Flat integers rather than labels, because a `trace_usage` row is a whole trace's calls
+    /// merged key by key (`usage::write_trace_usage`): a label would be left holding the *last*
+    /// call's level, so a turn that classifies once and then serves three cache hits would report
+    /// itself as a cache hit and the classification would vanish. Counters add up instead, which
+    /// is also the question the ticket asks — how many calls each level and tier served.
+    pub fn to_metadata(&self, model_overridden: bool) -> serde_json::Value {
+        let mut block = serde_json::Map::new();
+        block.insert("calls".to_string(), serde_json::json!(1));
+        for source in RouteSource::ALL {
+            let served = i64::from(source == self.source);
+            block.insert(source.as_label().to_string(), serde_json::json!(served));
+        }
+        let level = self.tier.map(Tier::as_level);
+        for tier in 1..=3i16 {
+            let drawn = i64::from(level == Some(tier));
+            block.insert(format!("tier{tier}"), serde_json::json!(drawn));
+        }
+        block.insert(
+            "model_overridden".to_string(),
+            serde_json::json!(i64::from(model_overridden)),
+        );
+        serde_json::Value::Object(block)
+    }
 }
 
 /// Apply the five-level precedence and return the model to call.
@@ -119,7 +196,11 @@ pub struct RouteDecision {
 ///    with a query present and a registry entry for `(provider, tier)`. Loads the provider's
 ///    learned cells, Thompson-samples a tier, and writes the decision (incl. request type)
 ///    through to the cache so the next turn short-circuits at Level 2.
-/// 4. **Config** — the agent's configured model (`has_llm_config`).
+///
+///    Levels 2–3 run only for a **tiered** config (one naming at least one tier model). A
+///    tier the config leaves unset is filled from the global registry.
+/// 4. **Config** — the agent's configured model (`has_llm_config`); always the answer for a
+///    single-model config.
 /// 5. **Default** — no `llm_config`: the resolver's `fallback_model`, which is the request's
 ///    own provider/model (passthrough) or the platform default as the last-resort safety net.
 ///
@@ -185,11 +266,12 @@ pub async fn route_model_with(
         "route_model: LEVEL 1 (Pinned) skipped — agent not pinned"
     );
 
-    // Levels 2 & 3 apply only within a conversation and only when the agent has an
-    // explicit llm_config (opt-in to routing). No `conv_id` or no llm_config ⇒ the
-    // router never fires and behaviour is identical to before this layer — straight to
-    // the configured/default model.
-    if inputs.has_llm_config
+    // Levels 2 & 3 apply only within a conversation and only when the agent's llm_config
+    // names tier models (the opt-in to routing). No `conv_id`, no llm_config or a
+    // single-model config ⇒ the router never fires — straight to the configured/default
+    // model. Skipping Level 2 too means a conversation cached before the config lost its
+    // tiers stops using that tier model at once.
+    if inputs.routes_by_tier()
         && let Some(conv_id) = inputs.signals.conv_id.as_deref()
     {
         // Level 2 — cache hit: the sticky decision for this conversation+agent.
@@ -198,7 +280,23 @@ pub async fn route_model_with(
             agent_id = %inputs.agent_id, %conv_id,
             "route_model: LEVEL 2 (CacheHit) — looking up sticky decision for (conv_id, agent_id)"
         );
-        if let Some(hit) = cache.get(conv_id, inputs.agent_id).await {
+        // A decision cached before the config named a different model for its tier is stale:
+        // the cache key holds no config, so reusing it would keep the old model (Q3-5).
+        let hit = cache.get(conv_id, inputs.agent_id).await.filter(|hit| {
+            let configured = hit.tier.and_then(|tier| inputs.config_model_for(tier));
+            let stale = configured.is_some_and(|model| model != hit.model);
+            if stale {
+                tracing::info!(
+                    target: "nasiko::llm_router::routing",
+                    agent_id = %inputs.agent_id, %conv_id,
+                    cached_model = %hit.model,
+                    tier = ?hit.tier,
+                    "route_model: LEVEL 2 (CacheHit) ignored — the config now names a different model for the cached tier"
+                );
+            }
+            !stale
+        });
+        if let Some(hit) = hit {
             // Learning write: this turn's user message is the verdict on the previous turn's
             // answer, which the cached decision identifies. Credit it to that (tier,
             // request_type). `signal` is conservative, so a genuine new question scores None
@@ -226,7 +324,7 @@ pub async fn route_model_with(
         );
 
         // Levels 2.5 & 3 — classify, but only at a boundary where re-selecting is safe.
-        // (has_llm_config is already guarded by the outer block.)
+        // (A tiered llm_config is already guarded by the outer block.)
         if inputs.signals.is_fireable_boundary()
             && let Some(query) = inputs.query
         {
@@ -237,7 +335,7 @@ pub async fn route_model_with(
             tracing::info!(
                 target: "nasiko::llm_router::routing",
                 agent_id = %inputs.agent_id, %conv_id, provider = %inputs.provider,
-                query_preview = %inputs.query.map(query_preview).unwrap_or_default(),
+                query_chars = query.chars().count(),
                 "route_model: LEVEL 2.5 (SalienceGate) — cache miss at a fireable boundary; asking the gate whether to classify this turn"
             );
             if !gate.is_substantive(query).await {
@@ -296,11 +394,7 @@ pub async fn route_model_with(
                 }
             };
             // Per-config tier override takes priority over the global registry.
-            let config_override = match tier {
-                Tier::Tier1 => inputs.tier1_model.map(str::to_string),
-                Tier::Tier2 => inputs.tier2_model.map(str::to_string),
-                Tier::Tier3 => inputs.tier3_model.map(str::to_string),
-            };
+            let config_override = inputs.config_model_for(tier).map(str::to_string);
             let tier_model = match config_override {
                 Some(ref m) => {
                     tracing::info!(
@@ -364,7 +458,8 @@ pub async fn route_model_with(
         tracing::debug!(
             target: "nasiko::llm_router::routing",
             agent_id = %inputs.agent_id,
-            "route_model: LEVELS 2 & 3 skipped — no conv_id (not an orchestrated conversation); behaviour identical to pre-router"
+            routes_by_tier = inputs.routes_by_tier(),
+            "route_model: LEVELS 2 & 3 skipped — no conv_id (not an orchestrated conversation) or a config without tier models; behaviour identical to pre-router"
         );
     }
 
@@ -444,14 +539,8 @@ async fn maybe_learn(
         .await;
 }
 
-/// A short, log-safe preview of a query (first 120 chars) — mirrors the classifier's own
-/// `query_preview` so both stages format the query the same way in the logs.
-fn query_preview(q: &str) -> String {
-    q.chars().take(120).collect()
-}
-
 /// The model to answer a non-substantive turn with (Level 2.5). Level 2.5 is only reached
-/// inside the `has_llm_config` block, so the agent is always configured here: it gets its
+/// for a tiered config, so the agent is always configured here: it gets its
 /// cheapest available model — the per-config `tier3_model` override, else the global
 /// registry's Tier3 for the provider, else the configured model as a last resort. Never
 /// pins: the caller does not write the cache for this decision.
@@ -481,12 +570,18 @@ async fn small_talk_model(registry: &dyn TierRegistry, inputs: &RouteInputs<'_>)
 /// When the agent forwards that blob as a single `user` message to the LLM router,
 /// the salience gate and classifier would see the entire transcript instead of just the
 /// current turn. Detect the `\n\nCurrent message: ` marker and extract only the tail.
+///
+/// Coding harnesses wrap the user's words too: Claude Code puts `<system-reminder>` blocks
+/// (its instructions, attribution rules) in front of every prompt and wraps its title side call
+/// in `<session>`. Judging those would classify the harness's boilerplate instead of the
+/// request, so [`strip_harness_wrappers`] removes them first.
 pub fn latest_user_query(messages: &[crate::ir::Message]) -> Option<String> {
     let text = messages
         .iter()
         .rev()
         .find(|m| m.role == "user")
         .and_then(|m| m.text())?;
+    let text = strip_harness_wrappers(&text)?;
 
     // Strip history prefix injected by `SessionHistory::with_current_query`.
     if let Some(pos) = text.find("\n\nCurrent message: ") {
@@ -496,6 +591,37 @@ pub fn latest_user_query(messages: &[crate::ir::Message]) -> Option<String> {
         }
     }
     Some(text)
+}
+
+/// `text` without coding-harness wrappers: every `<system-reminder>…</system-reminder>` span
+/// removed, and only the inside of a `<session>…</session>` span kept. `None` when nothing but
+/// whitespace is left, so the caller falls back as it does for a turn with no text.
+pub(crate) fn strip_harness_wrappers(text: &str) -> Option<String> {
+    const REMINDER_OPEN: &str = "<system-reminder>";
+    const REMINDER_CLOSE: &str = "</system-reminder>";
+    const SESSION_OPEN: &str = "<session>";
+    const SESSION_CLOSE: &str = "</session>";
+
+    let mut rest = text;
+    let mut kept = String::with_capacity(text.len());
+    while let Some(start) = rest.find(REMINDER_OPEN) {
+        kept.push_str(&rest[..start]);
+        rest = match rest[start..].find(REMINDER_CLOSE) {
+            Some(end) => &rest[start + end + REMINDER_CLOSE.len()..],
+            // An unclosed reminder runs to the end of the text.
+            None => "",
+        };
+    }
+    kept.push_str(rest);
+
+    let kept = match (kept.find(SESSION_OPEN), kept.find(SESSION_CLOSE)) {
+        (Some(open), Some(close)) if open < close => {
+            kept[open + SESSION_OPEN.len()..close].to_string()
+        }
+        _ => kept,
+    };
+    let kept = kept.trim();
+    (!kept.is_empty()).then(|| kept.to_string())
 }
 
 /// Number of top-level user turns so far (count of `role == "user"` messages). Tool results
@@ -509,9 +635,14 @@ pub fn user_turn_ordinal(messages: &[crate::ir::Message]) -> usize {
 }
 
 /// Whether the transcript's last turn is a tool result — a coding-agent CLI mid tool-loop,
-/// which [`BoundarySignals::for_coding_agent`] must keep sticky (`Phase::Continue`).
+/// which [`BoundarySignals::for_coding_agent`] must keep sticky (`Phase::Continue`). Trailing
+/// `system` messages are skipped: Claude Code appends a reminder after the tool result (Q5-3).
 pub fn is_tool_continuation(messages: &[crate::ir::Message]) -> bool {
-    messages.last().is_some_and(|m| m.role == "tool")
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role != "system")
+        .is_some_and(|m| m.role == "tool")
 }
 
 #[cfg(test)]
@@ -535,11 +666,16 @@ mod tests {
                 puts: Mutex::new(vec![]),
             }
         }
+        /// A hit at tier 2, which [`inputs`]' config leaves to the registry, so Level 2
+        /// reuses it as is.
         fn with_hit(model: &str) -> Self {
+            Self::with_tier_hit(model, Tier::Tier2)
+        }
+        fn with_tier_hit(model: &str, tier: Tier) -> Self {
             Self {
                 hit: Some(CachedDecision {
                     model: model.into(),
-                    tier: Some(Tier::Tier1),
+                    tier: Some(tier),
                     request_type: Some(RequestType::CodeGeneration),
                 }),
                 puts: Mutex::new(vec![]),
@@ -558,6 +694,7 @@ mod tests {
                 decision.model.clone(),
             ));
         }
+        async fn forget(&self, _conv_id: &str, _agent_id: &str) {}
     }
 
     /// A gate that always judges the turn small talk — exercises the Level 2.5 branch.
@@ -577,6 +714,11 @@ mod tests {
         }
     }
 
+    /// The tier-1 model of the tiered config [`inputs`] builds. Tiers 2 and 3 are left unset
+    /// so the registry still fills them.
+    const CFG_TIER1: &str = "cfg-tier1";
+
+    /// A tiered config (only tier 1 set) — the opt-in to Levels 2–3.
     fn inputs<'a>(
         provider: &'a str,
         signals: &'a BoundarySignals,
@@ -588,7 +730,7 @@ mod tests {
             fallback_model: "cfg-model",
             has_llm_config: true,
             pinned_model: pinned,
-            tier1_model: None,
+            tier1_model: Some(CFG_TIER1),
             tier2_model: None,
             tier3_model: None,
             signals,
@@ -633,6 +775,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_hit_is_ignored_when_the_config_names_another_model_for_its_tier() {
+        // Q3-5: the conversation was pinned to tier 2 = model A; the config now says tier 2 = B.
+        // Not a fireable boundary, so the stale hit must fall through rather than reclassify.
+        let cache = FakeCache::with_tier_hit("model-a", Tier::Tier2);
+        let s = signals(Some("c1"), Phase::Continue, Mode::FreeFlowing);
+        let mut i = inputs("anthropic", &s, None);
+        i.tier2_model = Some("model-b");
+        let d = route_model(
+            &cache,
+            &test_support::StubRegistry,
+            &InMemoryCellStore::new(),
+            &AllowAllGate,
+            &i,
+        )
+        .await;
+        assert_ne!(d.source, RouteSource::CacheHit);
+        assert_ne!(d.model, "model-a");
+
+        // The same hit is still reused while the config agrees with it.
+        i.tier2_model = Some("model-a");
+        let d = route_model(
+            &cache,
+            &test_support::StubRegistry,
+            &InMemoryCellStore::new(),
+            &AllowAllGate,
+            &i,
+        )
+        .await;
+        assert_eq!(
+            (d.source, d.model.as_str()),
+            (RouteSource::CacheHit, "model-a")
+        );
+    }
+
+    #[tokio::test]
     async fn level3_classifies_at_boundary_and_writes_cache() {
         // The classifier now Thompson-samples a tier, so the exact tier is stochastic — but
         // it must resolve to one of anthropic's seeded models and write that decision through
@@ -649,7 +826,7 @@ mod tests {
         .await;
         assert_eq!(d.source, RouteSource::Classified);
         assert!(d.tier.is_some());
-        let expected_models = ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"];
+        let expected_models = [CFG_TIER1, "claude-sonnet-4-6", "claude-haiku-4-5"];
         assert!(
             expected_models.contains(&d.model.as_str()),
             "unexpected model: {}",
@@ -805,8 +982,8 @@ mod tests {
 
     #[tokio::test]
     async fn level2_5_small_talk_serves_cheapest_config_model_and_does_not_cache() {
-        // Gate says non-substantive: a configured agent gets its cheapest model (registry
-        // Tier3 for anthropic = claude-haiku-4-5), tagged SmallTalk, and the cache is never
+        // Gate says non-substantive: a tiered agent with no tier-3 model gets its cheapest
+        // model (registry Tier3 for anthropic = claude-haiku-4-5), tagged SmallTalk, and the cache is never
         // written — so the session is not pinned on small talk.
         let cache = FakeCache::empty();
         let s = signals(Some("c1"), Phase::Switch, Mode::FreeFlowing);
@@ -892,7 +1069,7 @@ mod tests {
         // A continuation turn whose message approves the prior answer: the router returns the
         // sticky cached model (Level 2) AND folds a positive reward into the cached decision's
         // (tier, request_type) cell for this provider.
-        let cache = FakeCache::with_hit("claude-opus-4-8"); // hit tier=Tier1, rt=CodeGeneration
+        let cache = FakeCache::with_hit("claude-opus-4-8"); // hit tier=Tier2, rt=CodeGeneration
         let cells = InMemoryCellStore::new();
         let s = signals(Some("c1"), Phase::Continue, Mode::FreeFlowing);
         let mut i = inputs("anthropic", &s, None);
@@ -909,7 +1086,7 @@ mod tests {
         assert_eq!(d.model, "claude-opus-4-8");
         let learned = cells.load("anthropic").await;
         let cell = learned
-            .get(&(Tier::Tier1, RequestType::CodeGeneration))
+            .get(&(Tier::Tier2, RequestType::CodeGeneration))
             .expect("positive feedback should have created a learned cell");
         assert_eq!(cell.quality_mean, 1.0);
         assert_eq!(cell.samples, 1);
@@ -938,20 +1115,95 @@ mod tests {
 
     #[tokio::test]
     async fn level3_registry_miss_falls_through_to_config() {
-        // gemini has no seeded tiers ⇒ classification can't resolve a model ⇒ Level 4.
-        let cache = FakeCache::empty();
+        // gemini has no seeded tiers ⇒ a draw of a tier the config leaves unset can't resolve
+        // a model ⇒ Level 4, nothing cached. A draw of tier 1 uses the config's own model.
         let s = signals(Some("c1"), Phase::Switch, Mode::FreeFlowing);
-        let d = route_model(
-            &cache,
-            &test_support::StubRegistry,
-            &InMemoryCellStore::new(),
-            &AllowAllGate,
-            &inputs("gemini", &s, None),
-        )
-        .await;
-        assert_eq!(d.source, RouteSource::Config);
-        assert_eq!(d.model, "cfg-model");
-        assert!(cache.puts.lock().unwrap().is_empty());
+        let mut saw_miss = false;
+        for seed in 0..64 {
+            let cache = FakeCache::empty();
+            let mut i = inputs("gemini", &s, None);
+            i.tier_seed = Some(seed);
+            let d = route_model(
+                &cache,
+                &test_support::StubRegistry,
+                &InMemoryCellStore::new(),
+                &AllowAllGate,
+                &i,
+            )
+            .await;
+            let puts = cache.puts.lock().unwrap().len();
+            match d.tier {
+                Some(Tier::Tier1) => {
+                    assert_eq!(
+                        (d.source, d.model.as_str(), puts),
+                        (RouteSource::Classified, CFG_TIER1, 1)
+                    );
+                }
+                _ => assert_eq!(
+                    (d.source, d.model.as_str(), puts),
+                    (RouteSource::Config, "cfg-model", 0)
+                ),
+            }
+            saw_miss |= d.source == RouteSource::Config;
+        }
+        assert!(saw_miss, "no draw missed the registry");
+    }
+
+    #[tokio::test]
+    async fn single_model_config_serves_its_model_and_never_routes_by_tier() {
+        // NAS-1222: a config with a model and no tier models runs that model. Even at a
+        // fireable boundary, with a stale cached tier decision and a registry that knows the
+        // provider, the router must not draw a tier and swap in a registry model.
+        let s = signals(Some("c1"), Phase::Switch, Mode::FreeFlowing);
+        for gate in [&AllowAllGate as &dyn SalienceGate, &DenyGate] {
+            for cache in [FakeCache::empty(), FakeCache::with_hit("stale-tier-model")] {
+                let mut i = inputs("openai", &s, None);
+                i.tier1_model = None;
+                let d = route_model(
+                    &cache,
+                    &test_support::StubRegistry,
+                    &InMemoryCellStore::new(),
+                    gate,
+                    &i,
+                )
+                .await;
+                assert_eq!(d.source, RouteSource::Config);
+                assert_eq!(d.model, "cfg-model");
+                assert_eq!(d.tier, None);
+                assert!(cache.puts.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fully_tiered_config_only_serves_its_own_tier_models() {
+        // Every tier set ⇒ every draw resolves to one of the config's three models, never a
+        // registry model.
+        let s = signals(Some("c1"), Phase::Switch, Mode::FreeFlowing);
+        for seed in 0..64 {
+            let mut i = inputs("openai", &s, None);
+            i.tier2_model = Some("cfg-tier2");
+            i.tier3_model = Some("cfg-tier3");
+            i.tier_seed = Some(seed);
+            let d = route_model(
+                &FakeCache::empty(),
+                &test_support::StubRegistry,
+                &InMemoryCellStore::new(),
+                &AllowAllGate,
+                &i,
+            )
+            .await;
+            let expected = match d.tier {
+                Some(Tier::Tier1) => CFG_TIER1,
+                Some(Tier::Tier2) => "cfg-tier2",
+                Some(Tier::Tier3) => "cfg-tier3",
+                None => panic!("a tiered config at a boundary must classify"),
+            };
+            assert_eq!(
+                (d.source, d.model.as_str()),
+                (RouteSource::Classified, expected)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1046,6 +1298,45 @@ mod tests {
             picks.len(),
             1,
             "same seed + inputs must pick one model: {picks:?}"
+        );
+    }
+
+    /// BUG-24: Claude Code's own turn shapes, as recorded on 4 Nov (TO-15).
+    #[test]
+    fn latest_user_query_ignores_claude_code_reminders() {
+        let blocks = |texts: &[&str]| Message {
+            role: "user".into(),
+            content: Some(Value::Array(
+                texts
+                    .iter()
+                    .map(|t| serde_json::json!({"type": "text", "text": t}))
+                    .collect(),
+            )),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            extra: Map::new(),
+        };
+        let prompt = "Add a mul(a, b) function to ops.py and a test for it.";
+        let turn = blocks(&[
+            "<system-reminder>\nCodebase and user instructions are shown below.\n</system-reminder>\n",
+            "<system-reminder>\nAttribution for git commits.\n</system-reminder>\n",
+            prompt,
+        ]);
+        assert_eq!(latest_user_query(&[turn]).as_deref(), Some(prompt));
+
+        let title_call = blocks(&[&format!(
+            "<session>\n{prompt}\n</session>\n\nWrite the title in the predominant language of the session."
+        )]);
+        assert_eq!(latest_user_query(&[title_call]).as_deref(), Some(prompt));
+
+        let only_reminder = blocks(&["<system-reminder>\nnothing else\n</system-reminder>"]);
+        assert_eq!(latest_user_query(&[only_reminder]), None);
+
+        let unclosed = blocks(&["fix the build <system-reminder>\ntrailing"]);
+        assert_eq!(
+            latest_user_query(&[unclosed]).as_deref(),
+            Some("fix the build")
         );
     }
 
@@ -1147,5 +1438,72 @@ mod tests {
         ]));
         assert!(!is_tool_continuation(&[msg("user"), msg("assistant")]));
         assert!(!is_tool_continuation(&[]));
+        // Q5-3: Claude Code appends a system reminder after the tool result.
+        assert!(is_tool_continuation(&[
+            msg("user"),
+            msg("assistant"),
+            msg("tool"),
+            msg("system")
+        ]));
+        assert!(!is_tool_continuation(&[msg("user"), msg("system")]));
+        assert!(!is_tool_continuation(&[msg("system")]));
+    }
+
+    /// NAS-1263: the block a routed call contributes — one `calls`, one for its level, one for its
+    /// tier, and the override flag. Every key is present, so a zero reads as "this level served no
+    /// call" rather than "this deployment does not record it".
+    #[test]
+    fn to_metadata_counts_the_level_and_tier_that_served_the_call() {
+        let decision = RouteDecision {
+            model: "gpt-4o-mini".into(),
+            tier: Some(Tier::Tier3),
+            source: RouteSource::SmallTalk,
+        };
+        assert_eq!(
+            decision.to_metadata(true),
+            serde_json::json!({
+                "calls": 1,
+                "pinned": 0,
+                "cache_hit": 0,
+                "small_talk": 1,
+                "classified": 0,
+                "config": 0,
+                "default": 0,
+                "tier1": 0,
+                "tier2": 0,
+                "tier3": 1,
+                "model_overridden": 1,
+            })
+        );
+    }
+
+    /// A level that draws no tier (pinned, config, default) still carries all three tier keys at
+    /// zero — the counters are added up across a trace, and a missing key would make one call's
+    /// block a different shape from another's.
+    #[test]
+    fn to_metadata_of_an_untiered_level_counts_no_tier() {
+        let decision = RouteDecision {
+            model: "gpt-4o".into(),
+            tier: None,
+            source: RouteSource::Pinned,
+        };
+        let block = decision.to_metadata(false);
+        assert_eq!(block["pinned"], 1);
+        assert_eq!(block["model_overridden"], 0);
+        for tier in ["tier1", "tier2", "tier3"] {
+            assert_eq!(block[tier], 0, "{tier}");
+        }
+    }
+
+    /// Each level has its own label, and no two share one: the labels are the counter keys, so a
+    /// collision would silently add two levels together.
+    #[test]
+    fn every_route_source_has_its_own_label() {
+        let labels: Vec<&str> = RouteSource::ALL.iter().map(|s| s.as_label()).collect();
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(labels.len(), unique.len());
+        assert_eq!(RouteSource::SmallTalk.as_label(), "small_talk");
     }
 }

@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "planner": "./graph.py:planner",
+    "writer": "./graph.py:writer"
+  },
+  "env": ".env"
+}

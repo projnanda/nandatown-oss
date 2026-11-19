@@ -16,6 +16,7 @@ use crate::reranker::Reranker;
 use crate::selector::AgentSelector;
 use crate::selector::ConversationMessage;
 use crate::types::{AgentCard, RouteRequest, RouteResult, RouterLogEntry};
+use crate::user_key;
 use crate::vector_store::{TextEmbeddingCache, VectorStore};
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -61,7 +62,8 @@ impl Default for RouterConfig {
 
 pub struct OssRoutingEngine {
     config: RouterConfig,
-    selector: AgentSelector,
+    http_client: Client,
+    router_model: String,
     api_key: String,
     base_url: String,
     embedding_model: String,
@@ -70,9 +72,17 @@ pub struct OssRoutingEngine {
     /// without this `SessionHistory::fetch_pacms` would re-embed the same
     /// messages on every call. See `TextEmbeddingCache` docs.
     history_embedding_cache: TextEmbeddingCache,
+    /// In-process LLM router for platform-key calls (embeddings + selector).
+    backend: Option<crate::llm_backend::SharedLlmBackend>,
 }
 
 impl OssRoutingEngine {
+    /// Route platform-key embeddings and selection through `backend`.
+    pub fn with_backend(mut self, backend: crate::llm_backend::SharedLlmBackend) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
     pub fn new(
         config: RouterConfig,
         http_client: Client,
@@ -81,15 +91,15 @@ impl OssRoutingEngine {
         router_model: String,
         embedding_model: String,
     ) -> Self {
-        let provider = LLMProvider::new(http_client, api_key.clone(), base_url.clone());
-        let selector = AgentSelector::new(provider, router_model);
         Self {
             config,
-            selector,
+            http_client,
+            router_model,
             api_key,
             base_url,
             embedding_model,
             history_embedding_cache: Arc::new(DashMap::new()),
+            backend: None,
         }
     }
 
@@ -127,12 +137,38 @@ impl RoutingEngine for OssRoutingEngine {
         // Fetch available agents + conversation history in parallel. History
         // is selected per the caller's own stored strategy and budget tier —
         // see `context_selection::fetch_for_user`.
-        let history_store = VectorStore::for_embedding(
-            self.api_key.clone(),
-            self.base_url.clone(),
-            self.embedding_model.clone(),
-            Arc::clone(&self.history_embedding_cache),
-        );
+        // The key a user saved from the UI wins over the server's own.
+        let saved_key: Option<String> = user_key::saved_openai_key(pool, req.user_id).await;
+        // No saved user key + router available: platform calls go through the router.
+        let routed: Option<crate::vector_store::RoutedEmbedder> = match (&saved_key, &self.backend)
+        {
+            (None, Some(b)) => Some(crate::vector_store::RoutedEmbedder {
+                backend: Arc::clone(b),
+                call: crate::llm_backend::LlmCallContext {
+                    user_id: req.user_id,
+                    component: crate::llm_backend::PlatformComponent::RouterSelection.to_string(),
+                    session_id: Some(req.session_id.clone()),
+                },
+            }),
+            _ => None,
+        };
+        let api_key: String = saved_key.unwrap_or_else(|| self.api_key.clone());
+        // Direct (non-routed) calls hit OpenAI: use an OpenAI embedding model there.
+        let direct_model: String =
+            crate::providers::direct_embedding_model(&self.embedding_model, &self.base_url);
+        let history_store = match &routed {
+            Some(r) => VectorStore::for_embedding_routed(
+                r.clone(),
+                self.embedding_model.clone(),
+                Arc::clone(&self.history_embedding_cache),
+            ),
+            None => VectorStore::for_embedding(
+                api_key.clone(),
+                self.base_url.clone(),
+                direct_model.clone(),
+                Arc::clone(&self.history_embedding_cache),
+            ),
+        };
         // Resolved before the join: the workspace override is a borrow, and a temporary inside the
         // join would not outlive it.
         let tiers = self.config.context_tiers.with_overrides(pool).await;
@@ -173,14 +209,27 @@ impl RoutingEngine for OssRoutingEngine {
             VectorStore::disabled_from(agents.clone())
         } else {
             tracing::info!("routing_engine: stage 1 (shortlist) — building vector store");
-            VectorStore::build(
-                agents.clone(),
-                self.api_key.clone(),
-                self.base_url.clone(),
-                self.embedding_model.clone(),
-                pool,
-            )
-            .await
+            match &routed {
+                Some(r) => {
+                    VectorStore::build_routed(
+                        agents.clone(),
+                        r.clone(),
+                        self.embedding_model.clone(),
+                        pool,
+                    )
+                    .await
+                }
+                None => {
+                    VectorStore::build(
+                        agents.clone(),
+                        api_key.clone(),
+                        self.base_url.clone(),
+                        direct_model.clone(),
+                        pool,
+                    )
+                    .await
+                }
+            }
         });
         let shortlist = store
             .shortlist(
@@ -227,8 +276,15 @@ impl RoutingEngine for OssRoutingEngine {
             })
             .collect();
 
-        let (selected_agent, fallback_used, reasoning, selector_usage) = match self
-            .selector
+        let mut provider =
+            LLMProvider::new(self.http_client.clone(), api_key, self.base_url.clone());
+        if let Some(r) = &routed {
+            provider = provider.with_backend(Arc::clone(&r.backend), r.call.clone());
+        }
+        // Router writes trace_usage for routed calls; skip our own write.
+        let record_usage: bool = routed.is_none();
+        let selector = AgentSelector::new(provider, self.router_model.clone());
+        let (selected_agent, fallback_used, reasoning, selector_usage) = match selector
             .select_agent(&req.query, &history_msgs, &summaries, policy)
             .await
         {
@@ -260,8 +316,11 @@ impl RoutingEngine for OssRoutingEngine {
                 // before the log row rather than after, because the row points
                 // at it; skipping this is what made a tuning session's rejected
                 // calls free in FinOps.
-                let selection_token_usage_id =
-                    write_selector_token_usage(pool, req.user_id, &req.session_id, &usage).await;
+                if record_usage {
+                    record_selector_usage(pool, req.user_id, &req.session_id, &usage).await;
+                }
+                // trace_usage rows are keyed (trace_id, agent_name), not by uuid.
+                let selection_token_usage_id: Option<Uuid> = None;
                 // A refusal is still a routing decision: log it like any other,
                 // so it isn't invisible to /api/orchestrator/stats and FinOps —
                 // only successful selections used to reach this log table.
@@ -308,12 +367,12 @@ impl RoutingEngine for OssRoutingEngine {
         );
         tracing::info!(total_elapsed_ms = total_ms, "routing_engine: route() done");
 
-        // Write selector token usage to the token_usage table (fire-and-forget)
-        let selection_token_usage_id: Option<Uuid> = if let Some(ref cr) = selector_usage {
-            write_selector_token_usage(pool, req.user_id, &req.session_id, cr).await
-        } else {
-            None
-        };
+        // Add selector usage to trace_usage (non-fatal). The log row's
+        // selection_token_usage_id stays NULL: trace_usage has no row uuid.
+        if let Some(ref cr) = selector_usage.filter(|_| record_usage) {
+            record_selector_usage(pool, req.user_id, &req.session_id, cr).await;
+        }
+        let selection_token_usage_id: Option<Uuid> = None;
 
         // Fire-and-forget log insert (never blocks the response)
         let entry = RouterLogEntry {
@@ -401,43 +460,61 @@ fn spawn_router_log(pool: &PgPool, entry: RouterLogEntry) {
     });
 }
 
-/// Writes the Stage 3 selector's token usage to the `token_usage` table.
-/// Returns the UUID of the inserted row, or None on failure.
-async fn write_selector_token_usage(
+/// Writes the selector's usage row in its own task and waits for it.
+///
+/// The provider call is already paid for, so the row must land even if the
+/// caller's `route()` future is dropped mid-write (client disconnect). The
+/// spawned task outlives the caller; awaiting the handle keeps the write
+/// ordered before the router log row.
+async fn record_selector_usage(
     pool: &PgPool,
     user_id: Uuid,
     session_id: &str,
     cr: &crate::providers::CompletionResult,
-) -> Option<Uuid> {
-    let input = cr.usage.prompt_tokens;
-    let output = cr.usage.completion_tokens;
-    let total = cr.usage.total_tokens;
+) {
+    let pool: PgPool = pool.clone();
+    let session_id: String = session_id.to_owned();
+    let cr: crate::providers::CompletionResult = cr.clone();
+    let handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
+        write_selector_usage(&pool, user_id, &session_id, &cr).await;
+    });
+    if let Err(err) = handle.await {
+        tracing::warn!(%err, "selector usage task failed (non-fatal)");
+    }
+}
 
-    let result = sqlx::query_scalar::<_, Uuid>(
-        r#"INSERT INTO token_usage (
-            user_id, operation_type, session_id, provider, model,
-            input_tokens, output_tokens, total_tokens,
-            latency_ms, streaming, metadata
-        ) VALUES ($1, 'router_selection', $2, $3, $4, $5, $6, $7, $8, false, '{}'::jsonb)
-        RETURNING id"#,
+/// Adds the Stage 3 selector's token usage to `trace_usage` under
+/// `(session_id, "router_selection")`. Failures are logged and swallowed.
+async fn write_selector_usage(
+    pool: &PgPool,
+    user_id: Uuid,
+    session_id: &str,
+    cr: &crate::providers::CompletionResult,
+) {
+    let usage = crate::maf::llm::LlmUsage {
+        input_tokens: cr.usage.prompt_tokens as i64,
+        output_tokens: cr.usage.completion_tokens as i64,
+        total_tokens: cr.usage.total_tokens as i64,
+        cached_tokens: 0,
+        model: cr.model.clone(),
+        latency_ms: cr.latency_ms as i64,
+    };
+    let metadata = serde_json::json!({ "operation_type": "router_selection" });
+    // Not a MAF call, so not one for the ledger, which would record it as one. The selector
+    // records no key source, so a ledger entry could not say who paid for it.
+    let result = crate::maf::executor::insert_trace_usage(
+        pool,
+        &nasiko_pricing::NoUsageLedger,
+        user_id,
+        Some(session_id),
+        "router_selection",
+        &cr.provider,
+        &usage,
+        metadata,
     )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(&cr.provider)
-    .bind(&cr.model)
-    .bind(input)
-    .bind(output)
-    .bind(total)
-    .bind(cr.latency_ms)
-    .fetch_one(pool)
     .await;
-
-    match result {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to write selector token usage (non-fatal)");
-            None
-        }
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "failed to write selector usage (non-fatal)");
     }
 }
 

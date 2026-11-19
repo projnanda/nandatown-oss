@@ -398,7 +398,7 @@ pub fn rm(agent: &str, force: bool) -> Result<()> {
     Ok(())
 }
 
-const PUBLIC_REGISTRY_URL: &str = "https://registry.nasiko.dev";
+const PUBLIC_REGISTRY_URL: &str = "https://registry.nasiko.com";
 
 fn registry_url() -> String {
     crate::config::artifact_registry_url().unwrap_or_else(|| PUBLIC_REGISTRY_URL.to_string())
@@ -589,7 +589,7 @@ pub fn cmd_ls() -> Result<()> {
         return Ok(());
     }
 
-    // Same label the web UI shows (e.g. "Claude Code (ankit@nasiko.com)") —
+    // Same label the web UI shows (e.g. "Claude Code (dev@example.com)") —
     // `AgentRecord.name` stays the real identifier used for chat targeting
     // and resolution elsewhere, so it isn't touched, just not what's printed.
     let rows: Vec<LsTableRow> = agents
@@ -735,6 +735,8 @@ pub fn cmd_deploy(source: &str, agent_name: Option<&str>) -> Result<()> {
         // flags of its own yet.
         false,
         None,
+        None,
+        // No --hitl/--no-hitl here; the server applies the kind's default.
         None,
     );
 

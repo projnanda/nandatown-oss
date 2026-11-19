@@ -35,8 +35,13 @@ pub fn load() -> Result<Config> {
     }
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let config: Config = serde_json::from_str(&content)?;
-    Ok(config)
+    serde_json::from_str(&content).map_err(|e| {
+        anyhow::anyhow!(
+            "{} is not valid JSON ({e}) — fix or delete it, then run: {} connect <url>",
+            path.display(),
+            crate::commands::local_agents::cli_name()
+        )
+    })
 }
 
 pub fn save(config: &Config) -> Result<()> {
@@ -61,9 +66,51 @@ pub fn save(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// The control plane a fresh install talks to until another is connected, baked in at build
+/// time from `NASIKO_CLOUD_URL`. The published release sets it to the hosted Free plane
+/// (`just release-cli-oss`); a build from source leaves it unset, so that binary points at
+/// nothing until `connect`. `NASIKO_CLOUD_URL` at run time overrides it either way.
+const BUILT_IN_CLOUD_URL: Option<&str> = option_env!("NASIKO_CLOUD_URL");
+
+/// The name the default control plane is saved under.
+pub const DEFAULT_CLOUD_NAME: &str = "nasiko";
+
+static DEFAULT_CLOUD_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Lets [`active_cluster`] fall back to the default control plane, when there is one. The
+/// `nasiko` binary turns it on at startup; a CLI built on this library (an admin CLI, say)
+/// leaves it off and keeps the "no active cluster" error.
+pub fn enable_default_cloud() {
+    DEFAULT_CLOUD_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `NASIKO_CLOUD_URL` from the environment, else the one built in; `None` when neither is set.
+fn default_cloud_url() -> Option<String> {
+    let runtime = std::env::var("NASIKO_CLOUD_URL").ok();
+    [runtime.as_deref(), BUILT_IN_CLOUD_URL]
+        .into_iter()
+        .flatten()
+        .map(|url| url.trim().trim_end_matches('/'))
+        .find(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
 /// Get the active cluster entry.
+///
+/// With [`enable_default_cloud`] and a default control plane, a config with no control plane
+/// at all — a fresh install — is pointed at the default and saved, so the first command works
+/// without a `connect`. Once any control plane is saved, nothing is chosen on the user's behalf.
 pub fn active_cluster() -> Result<(String, ClusterEntry)> {
-    let config = load()?;
+    let mut config = load()?;
+    if config.active.is_none()
+        && config.clusters.is_empty()
+        && DEFAULT_CLOUD_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && let Some(url) = default_cloud_url()
+    {
+        connect(DEFAULT_CLOUD_NAME, &url)?;
+        config = load()?;
+    }
     let name = config.active.ok_or_else(|| {
         // One plain line: callers wrap this error into their own messages and some print it to
         // stdout, so it must carry no line breaks or color codes. No `up` hint either: the error
@@ -76,7 +123,7 @@ pub fn active_cluster() -> Result<(String, ClusterEntry)> {
     let entry = config
         .clusters
         .get(&name)
-        .ok_or_else(|| anyhow::anyhow!("cluster '{}' not found in config", name))?
+        .ok_or_else(|| missing_active_cluster(&name))?
         .clone();
     Ok((name, entry))
 }
@@ -200,17 +247,31 @@ pub fn connect(name: &str, url: &str) -> Result<()> {
     save(&config)
 }
 
-/// Save username + token for the active cluster after login.
+/// The active cluster names an entry the config file does not have (hand-edited, or removed).
+/// One plain line, like the other active-cluster errors.
+fn missing_active_cluster(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "active cluster '{name}' is not in {} — run: {} connect <url>, or {} use <name>",
+        config_path().display(),
+        crate::commands::local_agents::cli_name(),
+        crate::commands::local_agents::cli_name()
+    )
+}
+
+/// Save username + token for the active cluster after login. Fails rather than reporting a
+/// sign-in that saved nothing when the active cluster has no entry.
 pub fn save_login(username: &str, token: &str) -> Result<()> {
     let mut config = load()?;
     let name = config
         .active
         .clone()
         .ok_or_else(|| anyhow::anyhow!("no active cluster"))?;
-    if let Some(entry) = config.clusters.get_mut(&name) {
-        entry.username = Some(username.to_string());
-        entry.token = Some(token.to_string());
-    }
+    let entry = config
+        .clusters
+        .get_mut(&name)
+        .ok_or_else(|| missing_active_cluster(&name))?;
+    entry.username = Some(username.to_string());
+    entry.token = Some(token.to_string());
     save(&config)
 }
 

@@ -2,13 +2,17 @@
  * Agent detail (plan §7.3). URLs carry the UUID; a name resolves through the directory (one
  * match redirects, several show a chooser, none is the not-found state), since the server's
  * name lookups aren't owner-scoped. Status comes from the reconciled list row
- * (`useAgentStatus`), not the detail. Manage-only tabs are hidden; a bad `tab` falls back.
+ * (`useAgentStatus`), not the detail. Manage-only tabs are hidden; a bad `tab` falls back. A layer adds tabs through
+ * the `agentTabs` slot.
  */
-import { useQuery } from '@tanstack/react-query'
+import { useQueries, useQuery } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
 import { MoreHorizontal } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode } from 'react'
+import type { AgentTab } from '@nasiko/app-core/edition/edition'
+import { useSlots } from '@nasiko/app-core/edition/edition-context'
 import { TopBar } from '@nasiko/app-core/shell/TopBar'
+import { Alert, AlertDescription, AlertTitle } from '@nasiko/ui/primitives/alert'
 import { Badge } from '@nasiko/ui/primitives/badge'
 import { Button } from '@nasiko/ui/primitives/button'
 import {
@@ -52,9 +56,11 @@ import { SettingsTab } from './detail/SettingsTab'
 import { VersionsTab } from './detail/VersionsTab'
 import { AgentBuildsTab } from '@nasiko/features/deploy/AgentBuildsTab'
 import { AgentMcpTab } from '@nasiko/features/mcp/components/AgentMcpTab'
+import { SharedMcpTab } from '@nasiko/features/mcp/components/SharedMcpTab'
 import { isUuid, type AgentView } from './normalize'
 import { DETAIL_TABS, type DetailTab } from './search'
-import { actionsFor, displayStatus, isHarness } from './status'
+import { actionsFor, displayStatus, isDiscovered, isHarness } from './status'
+import { shownStatus } from './watch'
 
 export function AgentDetailPage({ agentRef, tab }: { agentRef: string; tab?: string }) {
   if (!isUuid(agentRef)) return <ResolveByName name={agentRef} tab={tab} />
@@ -164,10 +170,27 @@ function ResolveByName({ name, tab }: { name: string; tab?: string }) {
 }
 
 function tabsFor(agent: AgentView): DetailTab[] {
-  // A harness is an ordinary agent id to the MCP gateway, so its manager gets the MCP tab too.
-  if (agent.isHarness)
-    return agent.canManage ? ['overview', 'mcp', 'details'] : ['overview', 'details']
-  return agent.canManage ? [...DETAIL_TABS] : ['overview', 'activity', 'versions', 'details']
+  // A coding harness has its own native MCP client and server config, so the platform's MCP
+  // Gateway tab (allow/block per connector) doesn't apply to it.
+  if (agent.isHarness) return ['overview', 'details']
+  // Someone it is shared with gets an MCP tab too: which servers they must connect themselves (SharedMcpTab).
+  return agent.canManage ? [...DETAIL_TABS] : ['overview', 'activity', 'versions', 'mcp', 'details']
+}
+
+/** The core's tabs with each layer tab after the one it names (or at the end); tabs naming the same one keep their order. */
+function withLayerTabs(core: readonly string[], layer: readonly AgentTab[]): string[] {
+  const out = [...core]
+  for (const t of layer) {
+    const at = t.after ? out.indexOf(t.after) : -1
+    if (at < 0) {
+      out.push(t.key)
+      continue
+    }
+    // Before the next core tab, so past any layer tab already placed after the same one.
+    const next = out.findIndex((k, i) => i > at && core.includes(k))
+    out.splice(next < 0 ? out.length : next, 0, t.key)
+  }
+  return out
 }
 
 function AgentDetail({ id, tab }: { id: string; tab?: string }) {
@@ -192,9 +215,21 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
   const errors = useErrorLogs(id, !!agent && !agent.isHarness)
   const [tailOpen, setTailOpen] = useState(false)
 
+  const { agentTabs } = useSlots()
+  const layerTabs = agent ? agentTabs.filter((t) => t.visible(agent)) : []
+  const probes = useQueries({ queries: agent ? layerTabs.map((t) => t.query(id, agent)) : [] })
+  // A layer tab shows once its read says so; a failed read shows it too (the tab reports the failure itself).
+  const extra = layerTabs.filter((t, i) => {
+    const p = probes[i]
+    return !!p && (p.isError || (p.data !== undefined && t.shown(p.data)))
+  })
+  const waiting = layerTabs.filter((_, i) => probes[i]?.isPending).map((t) => t.key)
+
   const allowed = agent ? tabsFor(agent) : []
-  const current: DetailTab = allowed.includes(tab as DetailTab) ? (tab as DetailTab) : 'overview'
-  const badTab = !!agent && !!tab && current !== tab
+  const tabs = withLayerTabs(allowed, extra)
+  const current = tab && tabs.includes(tab) ? tab : 'overview'
+  // A layer tab still being checked isn't bad yet: a link to it opens it once its read answers.
+  const badTab = !!agent && !!tab && current !== tab && !waiting.includes(tab)
   // An unknown or hidden tab falls back to Overview without a history entry.
   useEffect(() => {
     if (badTab)
@@ -257,11 +292,44 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
       {status.failed ? (
         <p className="text-xs text-muted-foreground">{copy.couldntRefresh}</p>
       ) : null}
+      {/* Someone it is shared with can't start it, so say who stopped it rather than offering Start. */}
+      {!agent.canManage && !agent.isHarness && display === 'stopped' ? (
+        <p role="status" className="text-sm text-muted-foreground">
+          {copy.stoppedByOwner}
+        </p>
+      ) : null}
+      {/* Under the header on every tab: what Parked means, and Start (in the header) or Always on for a manager. */}
+      {display === 'parked' ? (
+        // A note, not the primitive's `alert`: it explains a state, nothing just went wrong.
+        <Alert role="note">
+          <AlertTitle>{copy.parkedTitle}</AlertTitle>
+          <AlertDescription>
+            <p>
+              {copy.parkedBody}{' '}
+              {agent.canManage && agent.parkingPolicy === 'auto' && agent.residentAvailable ? (
+                <>
+                  {copy.parkedKeepRunning}{' '}
+                  <Button
+                    variant="link"
+                    className="h-auto p-0 align-baseline"
+                    onClick={() => setTab('settings')}
+                  >
+                    {copy.tabSettings}
+                  </Button>
+                  .
+                </>
+              ) : agent.canManage ? (
+                copy.parkedStart
+              ) : null}
+            </p>
+          </AlertDescription>
+        </Alert>
+      ) : null}
       <Tabs value={current} onValueChange={setTab}>
         <TabsList data-tour="agent-tabs" className="max-w-full justify-start overflow-x-auto">
-          {allowed.map((t) => (
+          {tabs.map((t) => (
             <TabsTrigger key={t} value={t}>
-              {labels[t]}
+              {extra.find((x) => x.key === t)?.label ?? labels[t as DetailTab]}
               {t === 'activity' && hasErrors ? (
                 <span
                   className="ml-1 size-1.5 rounded-full bg-destructive"
@@ -283,6 +351,7 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
               setTab('activity')
               setTailOpen(true)
             }}
+            onViewDetails={() => setTab('details')}
           />
           {agent.isHarness ? (
             <p className="pt-3 text-sm">
@@ -314,7 +383,15 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
         ) : null}
         {allowed.includes('mcp') ? (
           <TabsContent value="mcp" className="pt-3">
-            <AgentMcpTab agentId={agent.id} harness={agent.isHarness} />
+            {agent.canManage ? (
+              <AgentMcpTab
+                agentId={agent.id}
+                harness={agent.isHarness}
+                local={isDiscovered(agent)}
+              />
+            ) : (
+              <SharedMcpTab agentId={agent.id} />
+            )}
           </TabsContent>
         ) : null}
         {allowed.includes('access') ? (
@@ -332,6 +409,11 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
             <SettingsTab agent={agent} />
           </TabsContent>
         ) : null}
+        {extra.map((t) => (
+          <TabsContent key={t.key} value={t.key} className="pt-3">
+            <t.Tab agentId={agent.id} />
+          </TabsContent>
+        ))}
       </Tabs>
     </div>
   )
@@ -370,7 +452,8 @@ function Header({
           title={
             <span className="flex flex-wrap items-center gap-2">
               <span className="truncate">{agent.displayName}</span>
-              <StatusBadge display={display} raw={raw} />
+              {/* Only the badge: the buttons keep their place (disabled) while the restart is checked. */}
+              <StatusBadge display={shownStatus(display, flow.w.watch)} raw={raw} />
             </span>
           }
           description={

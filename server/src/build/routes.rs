@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::BuildStatus;
 use crate::agents::upload::BuildJobPayload;
-use crate::agents::utils::set_build_status;
+use crate::agents::utils::{set_build_status, store_build_logs};
 use crate::auth::Claims;
 use crate::state::AppState;
 
@@ -217,7 +217,10 @@ struct BuildRecord {
     version_tag: String,
     image_reference: String,
     status: BuildStatus,
-    logs_url: Option<String>,
+    // `logs_url` is deliberately not a field here: it now holds an internal `blob:<key>` pointer,
+    // not a URL a client can use, so it is never sent to clients. `SELECT *` still returns the
+    // column; sqlx `FromRow` ignores columns without a matching field. Logs are served as text by
+    // `get_build_logs`, which resolves the pointer server-side.
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -311,7 +314,13 @@ async fn create_build(
             .await
         {
             tracing::error!(%e, %agent_id, %key, "create_build: failed to upload source");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            // A storage backend fault (credentials, endpoint, bucket) is the operator's to fix,
+            // and the error that says which is in the log.
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "file storage is unavailable; ask your admin to check the S3_* settings",
+            )
+                .into_response();
         }
         Some(key)
     } else {
@@ -376,11 +385,15 @@ pub async fn execute_build(
     http_client: reqwest::Client,
     allowed_hosts: Vec<String>,
     capability_generator_model: String,
+    llm_backend: nasiko_orchestrator::llm_backend::SharedLlmBackend,
 ) {
     set_build_status(&db, build_id, BuildStatus::Building).await;
 
     let image_tag = format!("{agent_name}:{version_tag}");
     let tmp_dir = std::env::temp_dir().join(format!("nasiko-build-{build_id}"));
+
+    // The image build's captured output, filled once the build runs so the Builds tab can show it.
+    let mut build_logs = String::new();
 
     let result: Result<(), String> = async {
         // Acquire source into tmp_dir
@@ -419,10 +432,11 @@ pub async fn execute_build(
             .await
             .map_err(|e| format!("spawn_blocking tar: {e}"))?
             .map_err(|e| format!("tar source: {e}"))?;
-        runtime
+        build_logs = runtime
             .build(&tar_bytes, &image_tag)
             .await
-            .map_err(|e| format!("docker build: {e}"))?;
+            .map_err(|e| format!("docker build: {e}"))?
+            .logs;
 
         Ok(())
     }
@@ -434,6 +448,7 @@ pub async fn execute_build(
     match result {
         Ok(()) => {
             set_build_status(&db, build_id, BuildStatus::Success).await;
+            store_build_logs(&db, oci_storage.as_ref(), build_id, &build_logs).await;
 
             // `create_build` targets an *existing* agent (it 404s otherwise) and is
             // reachable from the UI's Builds page for a repeat build. Fetch the
@@ -504,6 +519,7 @@ pub async fn execute_build(
                     key,
                     &agent_name,
                     &capability_generator_model,
+                    &llm_backend,
                 )
                 .await;
             }
@@ -511,6 +527,19 @@ pub async fn execute_build(
         Err(e) => {
             tracing::error!(build_id = %build_id, %e, "build failed");
             set_build_status(&db, build_id, BuildStatus::Failed).await;
+            // Persist what explains the failure: the build output if the image built, otherwise the
+            // error text, which carries the builder's own log for a build failure.
+            store_build_logs(
+                &db,
+                oci_storage.as_ref(),
+                build_id,
+                if build_logs.trim().is_empty() {
+                    &e
+                } else {
+                    &build_logs
+                },
+            )
+            .await;
         }
     }
 }
@@ -612,16 +641,33 @@ async fn get_build_logs(
     if !state.auth.can_deploy(&identity).await {
         return crate::unavailable();
     }
-    let url: Option<String> = sqlx::query_scalar("SELECT logs_url FROM agent_builds WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await
-        .ok()
-        .flatten();
+    // Prefer the offloaded log where one was stored; otherwise serve the captured build output
+    // persisted on the row itself. `logs_url` holds a `blob:<key>` pointer for logs stored in
+    // object storage (the normal path now — see `store_build_logs`): we fetch the object and
+    // return its text, so the browser never has to reach the (in-cluster) object store itself.
+    // A bare URL is treated as an external link and returned as-is (dormant), and a NULL
+    // `logs_url` falls back to the `logs` column (older rows, or an upload that had to fall back).
+    let row: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT logs_url, logs FROM agent_builds WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .ok()
+            .flatten();
 
-    match url {
-        Some(u) => u.into_response(),
-        None => (StatusCode::NOT_FOUND, "no logs available").into_response(),
+    match row {
+        Some((Some(reference), _)) => match reference.strip_prefix("blob:") {
+            Some(key) => match state.oci_storage.get_blob(key).await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned().into_response(),
+                Err(e) => {
+                    tracing::error!(build_id = %id, %e, "failed to read build logs from object storage");
+                    (StatusCode::NOT_FOUND, "no logs available").into_response()
+                }
+            },
+            None => reference.into_response(),
+        },
+        Some((None, Some(logs))) if !logs.trim().is_empty() => logs.into_response(),
+        _ => (StatusCode::NOT_FOUND, "no logs available").into_response(),
     }
 }
 
@@ -754,6 +800,7 @@ pub async fn auto_generate_capabilities_pub(
     source_key: &str,
     agent_name: &str,
     capability_generator_model: &str,
+    llm_backend: &nasiko_orchestrator::llm_backend::SharedLlmBackend,
 ) {
     use crate::capabilities::generator::CapabilityGenerator;
     use nasiko_orchestrator::providers::LLMProvider;
@@ -771,7 +818,38 @@ pub async fn auto_generate_capabilities_pub(
         None => return,
     };
 
-    let provider = LLMProvider::from_env(http_client.clone());
+    let owner: Option<Uuid> = sqlx::query_scalar(
+        "SELECT owner_id FROM agents WHERE name = $1 AND deleted_at IS NULL \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(agent_name)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let provider = match owner {
+        // No saved user key: the call goes through the in-process LLM router.
+        Some(owner) => {
+            nasiko_orchestrator::user_key::routed_llm_provider(
+                db,
+                http_client.clone(),
+                owner,
+                Some(llm_backend),
+                "capability_generation",
+            )
+            .await
+        }
+        None => LLMProvider::from_env(http_client.clone()).with_backend(
+            std::sync::Arc::clone(llm_backend),
+            nasiko_orchestrator::llm_backend::LlmCallContext {
+                user_id: Uuid::nil(),
+                component:
+                    nasiko_orchestrator::llm_backend::PlatformComponent::CapabilityGeneration
+                        .to_string(),
+                session_id: None,
+            },
+        ),
+    };
     // Caller passes `state.config.capability_generator_model` (already
     // resolved from `CAPABILITY_GENERATOR_MODEL`, default "gpt-4o-mini") —
     // see `capabilities/routes.rs::make_generator` for the same fix; this
