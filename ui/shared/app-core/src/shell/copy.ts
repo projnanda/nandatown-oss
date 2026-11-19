@@ -102,11 +102,11 @@ export const copy = {
   // The early-access card at the foot of the sidebar, its rail button and the login line (OSS only; WaitlistCta.tsx).
   waitlist: {
     badge: 'Early access',
-    title: 'Join the Nasiko waitlist',
+    title: 'Join the Nandatown waitlist',
     line: 'Get managed Open Runtime early, with help from the team.',
     cta: 'Join the waitlist',
     newTab: '(opens in a new tab)',
-    loginLead: 'New to Nasiko?',
+    loginLead: 'New to Nandatown?',
   },
   // The free-assessment card above the sidebar footer and its rail row (AssessmentCta.tsx); it replaced the waitlist's.
   assessment: {
@@ -127,7 +127,7 @@ export const copy = {
   // The desktop app's sign-in, while it runs Nasiko on this computer (ForgotPassword.tsx).
   forgotPassword: {
     link: 'Forgot password?',
-    lead: "The password can't be recovered. You can reset Nasiko on this computer and start over.",
+    lead: "The password can't be recovered. You can reset Nandatown on this computer and start over.",
   },
   account: {
     menu: (name: string) => `Account: ${name}`,
@@ -141,9 +141,9 @@ export const copy = {
     sidebarTour: 'Tour the sidebar',
   },
   login: {
-    title: 'Sign in to Nasiko',
+    title: 'Sign in to Nandatown',
     // The decorative showcase beside the form (aria-hidden; the h1 names the page). Its chips are `nav` labels.
-    showcaseTitle: 'Nasiko',
+    showcaseTitle: 'Nandatown',
     // nasiko.com's hero: the lead, then "for" and each word in turn, looping (LoginShowcase).
     showcaseLead: 'The Open Runtime',
     showcaseFor: 'for',
@@ -163,7 +163,7 @@ export const copy = {
     // nasiko.com's own summary (its meta description). Mock mode pre-fills the form and the sidebar badge says MOCK
     // DATA; the local live login (admin / changeme) is in CLAUDE.md.
     tagline:
-      'Nasiko helps enterprises account for what their AI agents cost, can access, and do, across every model and provider.',
+      'Nandatown helps enterprises account for what their AI agents cost, can access, and do, across every model and provider.',
     passwordChanged: 'Password changed. Please sign in again with your new password.',
     wrongCredentials: 'Wrong username or password.',
     rateLimited: 'Too many attempts. Wait a minute and try again.',
@@ -171,7 +171,7 @@ export const copy = {
     // without saying the account exists, like the 401 message.
     locked: (minutes: number) =>
       `Too many failed sign-ins. Try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`,
-    unreachable: "Can't reach nasiko-server. Is `just run-stack` running?",
+    unreachable: "Can't reach the Nandatown server. Is `just run-stack` running?",
     timedOut: 'The server took too long to answer. Try again in a moment.',
     failed: 'Login failed. Check the server logs.',
     // The login cookie is HttpOnly: only the server can end it, so a failed logout leaves this

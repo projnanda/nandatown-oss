@@ -128,7 +128,7 @@ pub(crate) async fn register_coding_agent(
             .into_response();
     };
     let label = format!("{display_name} ({email})");
-    let description = format!("Local {display_name} sessions and LLM traffic managed by Nasiko");
+    let description = format!("Local {display_name} sessions and LLM traffic managed by Nandatown");
     let metadata = serde_json::json!({
         "source": "nasiko-cli-integration",
         "integration_id": integration_id,

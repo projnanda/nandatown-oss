@@ -1,24 +1,24 @@
-![Nasiko](docs/assets/nasiko-runtime-banner.png)
+![Nandatown](docs/assets/nandatown-banner.png)
 
-**Nasiko is the OpenRuntime for AI agents.**<br />
+**Nandatown is the OpenRuntime for AI agents.**<br />
 See every coding agent your team runs and what it costs. Route it to the models you choose. Then deploy and govern your own agents on the same runtime.
 
-**[📚 Documentation](https://docs.nasiko.com)**  •  **[💬 Discord](https://discord.com/invite/HmnfkTfjFv)**  •  **[🐛 Report a bug](https://github.com/Nasiko-Labs/nasiko/issues)**
+**[📚 Documentation](https://docs.nasiko.com)**  •  **[💬 Discord](https://discord.com/invite/HmnfkTfjFv)**  •  **[🐛 Report a bug](https://github.com/projnanda/nandatown-oss/issues)**
 
-[![GitHub stars](https://shieldcn.dev/github/stars/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=amber&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/stargazers)
-[![GitHub forks](https://shieldcn.dev/github/forks/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=blue&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/network/members)
-[![Latest release](https://shieldcn.dev/github/release/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=violet&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/releases)
-[![License: Apache-2.0](https://shieldcn.dev/badge/License-Apache_2.0-red.svg?mode=light&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/blob/main/LICENSE)
+[![GitHub stars](https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=amber&font=geist-mono)](https://github.com/projnanda/nandatown-oss/stargazers)
+[![GitHub forks](https://shieldcn.dev/github/forks/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=blue&font=geist-mono)](https://github.com/projnanda/nandatown-oss/network/members)
+[![Latest release](https://shieldcn.dev/github/release/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=violet&font=geist-mono)](https://github.com/projnanda/nandatown-oss/releases)
+[![License: Apache-2.0](https://shieldcn.dev/badge/License-Apache_2.0-red.svg?mode=light&font=geist-mono)](https://github.com/projnanda/nandatown-oss/blob/main/LICENSE)
 
-[![Built with Rust](https://shieldcn.dev/badge/Language-Rust-orange.svg?logo=rust&mode=light&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko)
-[![Open issues](https://shieldcn.dev/github/issues/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=cyan&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/issues)
-[![Pull requests](https://shieldcn.dev/github/prs/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=green&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/pulls)
-[![CI](https://shieldcn.dev/github/ci/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=purple&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/actions)
-[![PRs Welcome](https://shieldcn.dev/badge/PRs-Welcome-pink.svg?mode=light&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/pulls)
+[![Built with Rust](https://shieldcn.dev/badge/Language-Rust-orange.svg?logo=rust&mode=light&font=geist-mono)](https://github.com/projnanda/nandatown-oss)
+[![Open issues](https://shieldcn.dev/github/issues/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=cyan&font=geist-mono)](https://github.com/projnanda/nandatown-oss/issues)
+[![Pull requests](https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=green&font=geist-mono)](https://github.com/projnanda/nandatown-oss/pulls)
+[![CI](https://shieldcn.dev/github/ci/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=purple&font=geist-mono)](https://github.com/projnanda/nandatown-oss/actions)
+[![PRs Welcome](https://shieldcn.dev/badge/PRs-Welcome-pink.svg?mode=light&font=geist-mono)](https://github.com/projnanda/nandatown-oss/pulls)
 
 ## Table of Contents
 
-- [Why Nasiko](#why-nasiko)
+- [Why Nandatown](#why-nandatown)
 - [Features](#features)
 - [Architecture](#architecture)
 - [Quick start](#quick-start)
@@ -27,20 +27,20 @@ See every coding agent your team runs and what it costs. Route it to the models 
 - [Troubleshooting](#troubleshooting)
 - [Community](#community)
 
-## Why Nasiko
+## Why Nandatown
 
 Your developers already run coding agents: Claude Code, Codex, Cursor, OpenCode, often several at
 once, each with its own dashboard and billing. At the end of the month nobody can say who spent
 what, on which model.
 
-Nasiko finds those agents, puts their spend in one place, and gives you back the model choice.
+Nandatown finds those agents, puts their spend in one place, and gives you back the model choice.
 Your cost history, policy and model choice stay with you, not with any one vendor.
 
 - **Non-invasive.** Discovery changes nothing. Reporting and routing are opt-in, with no wrapper
   or SDK in your code.
 - **Non-intrusive.** After a one-time setup, developers keep using their harness exactly as before.
 
-![Nasiko Dashboard](docs/assets/ui-dashboard.png)
+![Nandatown Dashboard](docs/assets/ui-dashboard.png)
 
 ## Features
 
@@ -50,7 +50,7 @@ Your cost history, policy and model choice stay with you, not with any one vendo
 | --------------------- | ----------------------------------------------------------------------------------------------------- |
 | **Discovery**         | Finds Claude Code, Codex, OpenCode and Cursor CLI on a machine. Read-only: no account, nothing sent. |
 | **Session reporting** | Every completed turn, with its tokens and cost, lands in one dashboard. Past sessions are imported.  |
-| **Model routing**     | Point a harness at Nasiko instead of its vendor. Claude Code can run on your OpenAI key.             |
+| **Model routing**     | Point a harness at Nandatown instead of its vendor. Claude Code can run on your OpenAI key.             |
 
 ### TokenOps
 
@@ -82,7 +82,7 @@ Your cost history, policy and model choice stay with you, not with any one vendo
 
 ## Architecture
 
-To attribute spend across vendors and enforce a budget or a tool rule, Nasiko has to sit where the
+To attribute spend across vendors and enforce a budget or a tool rule, Nandatown has to sit where the
 calls happen. So it runs as a **single server process** that every agent call passes through, with
 state in **Postgres**, **Redis** and **S3** (RustFS) and traces in **Tempo / Loki / OTel**.
 
@@ -176,7 +176,7 @@ Or build it from source with Rust 1.88+: `cargo install --path cli/ --force`.
 **2. Start the server**
 
 ```sh
-git clone https://github.com/Nasiko-Labs/nasiko.git && cd nasiko
+git clone https://github.com/projnanda/nandatown-oss.git && cd nandatown-oss
 cp .env.example .env
 docker compose up -d
 ```
@@ -214,7 +214,7 @@ Now [measure and route your coding agents](#coding-agents) or
 
 ### Run from source
 
-Working on Nasiko itself? Run the server natively with hot-reload. This needs Rust 1.88+,
+Working on Nandatown itself? Run the server natively with hot-reload. This needs Rust 1.88+,
 [`just`](https://github.com/casey/just), `protoc` (`brew install protobuf` or
 `apt install protobuf-compiler`) and Docker for the backing services:
 
@@ -238,7 +238,7 @@ Reporting and routing are separate opt-ins. Use either or both.
 | OpenCode    | yes                     | yes           |
 | Cursor CLI  | yes                     | not yet       |
 
-Want another harness? [Open an issue](https://github.com/Nasiko-Labs/nasiko/issues).
+Want another harness? [Open an issue](https://github.com/projnanda/nandatown-oss/issues).
 
 ### Discover
 
@@ -254,7 +254,7 @@ routing, MCP and reporting are connected. `nasiko status claude` shows one in de
 `nasiko agents discover` also finds A2A agents running on the machine, from any framework, by
 looking for an agent card on listening ports and Docker published ports. It probes those ports,
 which is why it is a separate command. `nasiko connect <agent>` then routes a discovered agent's
-LLM calls (and, if you ask, MCP tools) through Nasiko, and `nasiko disconnect <agent>` undoes it.
+LLM calls (and, if you ask, MCP tools) through Nandatown, and `nasiko disconnect <agent>` undoes it.
 
 ### Report sessions
 
@@ -278,7 +278,7 @@ Codex asks you to trust the new hooks on its next start, and OpenCode needs a re
 
 ### Route models
 
-Register a provider key once, then point a harness at Nasiko. Claude Code's requests can then be
+Register a provider key once, then point a harness at Nandatown. Claude Code's requests can then be
 served by your OpenAI key:
 
 ```sh
@@ -294,7 +294,7 @@ per user, so connecting affects every session of that harness on the machine.
 
 ## Deploy your own agents
 
-Nasiko runs any agent that speaks [A2A](https://github.com/a2aproject/a2a-spec) v1.0, in Python,
+Nandatown runs any agent that speaks [A2A](https://github.com/a2aproject/a2a-spec) v1.0, in Python,
 Rust, Go or TypeScript. There is no SDK to adopt.
 
 ```sh
@@ -366,8 +366,8 @@ More: [server](https://docs.nasiko.com/self-hosting/troubleshooting) and
 - **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) covers local setup, conventions and the PR flow
 - **Design docs:** [`docs/`](docs/) for the A2A protocol, MCP gateway internals and CLI design
 
-[![GitHub stars](https://shieldcn.dev/github/stars/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=red&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/stargazers)
-[![Total commits](https://shieldcn.dev/github/commits/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=amber&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/commits)
-[![Pull requests](https://shieldcn.dev/github/prs/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=violet&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/pulls)
+[![GitHub stars](https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=red&font=geist-mono)](https://github.com/projnanda/nandatown-oss/stargazers)
+[![Total commits](https://shieldcn.dev/github/commits/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=amber&font=geist-mono)](https://github.com/projnanda/nandatown-oss/commits)
+[![Pull requests](https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=violet&font=geist-mono)](https://github.com/projnanda/nandatown-oss/pulls)
 
 Licensed under **Apache-2.0**. See [LICENSE](LICENSE). Stars, issues and PRs are always welcome.

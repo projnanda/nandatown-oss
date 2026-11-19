@@ -37,7 +37,7 @@ const sidebarState = () =>
   document.querySelector('[data-slot="sidebar"]')?.getAttribute('data-state')
 const sidebar = () => document.querySelector<HTMLElement>('[data-slot="sidebar"]')!
 /** The open sidebar's brand link (the phone top bar has one too; the rail's mark is the Expand button). */
-const sidebarBrand = () => within(sidebar()).getByRole('link', { name: 'Nasiko' })
+const sidebarBrand = () => within(sidebar()).getByRole('link', { name: 'Nandatown' })
 /** The sidebar starts as the rail; a stored choice opens it. */
 const expanded = () => {
   document.cookie = 'sidebar_state=true; path=/'
@@ -148,7 +148,7 @@ describe('sidebar items', () => {
 
   it('renders /login without the sidebar', async () => {
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
     expect(screen.queryByRole('navigation', { name: 'Main' })).toBeNull()
   })
 
@@ -165,7 +165,7 @@ describe('sidebar items', () => {
   it.each(['/', '/status'])('sends a signed-out visitor from %s to /login', async (url) => {
     configureMocks({ loggedIn: false })
     const { router } = renderApp(url)
-    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
+    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
     expect(router.state.location.pathname).toBe('/login')
     expect(router.state.location.search).toMatchObject({ redirect: url })
   })
@@ -894,35 +894,14 @@ describe('sign out (eng D6)', () => {
 })
 
 describe('assessment banner', () => {
-  it('sits above the top bar in one sticky block and stays dismissed once closed', async () => {
-    renderApp('/agents')
-    const banner = await screen.findByRole('region', { name: copy.assessment.title })
-    const bar = document.querySelector('[data-slot="topbar"]')!
-    // Before the bar, in the same sticky block; not in the sidebar.
-    expect(banner.nextElementSibling).toBe(bar)
-    expect(banner.parentElement).toHaveClass('sticky')
-    expect(banner.closest('[data-slot="sidebar"]')).toBeNull()
-    // The pages' sticky rows clear both.
-    expect(document.querySelector('[data-slot="sidebar-wrapper"]')).toHaveClass(
-      '[--topbar-h:calc(3.25rem_+_var(--banner-h))]',
-    )
-    expect(within(banner).getByRole('link', { name: copy.assessment.cta })).toHaveAttribute(
-      'href',
-      '/assessment',
-    )
-    // The sidebar's row waits for the banner to go, so the assessment never shows twice.
-    const sidebarRow = () =>
-      within(document.querySelector<HTMLElement>('[data-slot="sidebar"]')!).queryByRole('link', {
-        name: copy.help.assessment,
-      })
-    expect(sidebarRow()).toBeNull()
-    await userEvent.click(screen.getByRole('button', { name: copy.assessment.dismiss }))
-    expect(screen.queryByRole('region', { name: copy.assessment.title })).toBeNull()
-    expect(sidebarRow()).toHaveAttribute('href', '/assessment')
-    cleanup()
+  it('is not shown: Nandatown offers no assessment (it books a call with Nasiko), nor a sidebar row for it', async () => {
     renderApp('/agents')
     await screen.findByRole('navigation', { name: 'Main' })
     expect(screen.queryByRole('region', { name: copy.assessment.title })).toBeNull()
-    expect(sidebarRow()).toHaveAttribute('href', '/assessment')
+    expect(
+      within(document.querySelector<HTMLElement>('[data-slot="sidebar"]')!).queryByRole('link', {
+        name: copy.help.assessment,
+      }),
+    ).toBeNull()
   })
 })

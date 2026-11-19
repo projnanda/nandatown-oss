@@ -43,7 +43,7 @@ const firstTime = () =>
   })
 // The open guide is modal: Base UI hides the rest of the page from the accessibility tree.
 const nav = () => screen.getByRole('navigation', { name: shellCopy.navLabel, hidden: true })
-const guide = () => screen.findByRole('dialog', { name: /welcome to nasiko/i })
+const guide = () => screen.findByRole('dialog', { name: /welcome to nandatown/i })
 /** The primary button stays focusable while off, so it says so with aria-disabled. */
 const off = (b: HTMLElement) => expect(b).toHaveAttribute('aria-disabled', 'true')
 const on = (b: HTMLElement) => expect(b).not.toHaveAttribute('aria-disabled', 'true')

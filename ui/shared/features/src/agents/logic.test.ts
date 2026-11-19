@@ -1,7 +1,7 @@
 /**
  * Agents pure logic (plan §10, unit): status matrix, detail normalization, list dedupe,
  * truth-check / roll back timing, the error table, the URL guard, the retired-strings ban
- * and the first-run commands against the recorded `nasiko --help` output.
+ * and the first-run commands against the recorded `nasiko --help` output (the binary Nandatown installs as `nasiko`).
  */
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -354,7 +354,8 @@ describe('copy', () => {
 })
 
 describe('first-run commands match the installed CLI', () => {
-  const usage = (help: string) => help.match(/^Usage: (.+)$/m)![1]!
+  // The recordings name the binary `nasiko`; Nandatown's installer puts it on the PATH as `nasiko`.
+  const usage = (help: string) => help.match(/^Usage: (.+)$/m)![1]!.replace(/^nasiko /, 'nasiko ')
   const cmds = firstRunCommands('https://nasiko.example')
 
   it('connect takes the page origin as <TARGET>', () => {

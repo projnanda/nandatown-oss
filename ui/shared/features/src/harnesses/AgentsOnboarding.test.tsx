@@ -437,7 +437,7 @@ describe('desktop app: local consent and progress', () => {
       await userEvent.click(within(c).getByRole('button', { name: 'Yes, find my agents' }))
       const alert = await within(c).findByRole('alert')
       expect(alert).toHaveTextContent(
-        "Couldn't reach the Nasiko desktop app: the desktop app could not start the import",
+        "Couldn't reach the Nandatown desktop app: the desktop app could not start the import",
       )
       await userEvent.click(within(alert).getByRole('button', { name: 'Try again' }))
       expect(
@@ -487,7 +487,7 @@ describe('desktop app: local consent and progress', () => {
     try {
       renderApp('/harnesses')
       const c = await card()
-      expect(within(c).getByText('The import stopped: signed out of Nasiko')).toBeInTheDocument()
+      expect(within(c).getByText('The import stopped: signed out of Nandatown')).toBeInTheDocument()
       await userEvent.click(within(c).getByRole('button', { name: 'Try again' }))
       expect(
         await within(c).findByRole('heading', { name: 'Bringing in your coding agents' }),

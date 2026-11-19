@@ -24,12 +24,12 @@ export const copy = {
         : 'All set · every answer can be changed',
   },
   steps: {
-    welcome: { title: 'Welcome', sub: 'What Nasiko does for you' },
+    welcome: { title: 'Welcome', sub: 'What Nandatown does for you' },
     start: { title: 'Agent and key', sub: 'A first agent, your key' },
     harness: { title: 'Coding harnesses', sub: 'Your sessions, past and new' },
   } satisfies Record<StepId, { title: string; sub: string }>,
   welcome: {
-    title: 'Welcome to Nasiko',
+    title: 'Welcome to Nandatown',
     // Open Runtime's narrative comes back ahead of the capabilities (user review 2026-11-05). It meters spend, never
     // "pays for" agents: that read as Nasiko covering the user's model costs (NAS-1592). No lead-in to the stages
     // below: "work flows through it in four stages" was unclear, and the row stands on its own.
@@ -43,7 +43,7 @@ export const copy = {
       { title: 'Govern', line: 'Budgets, guardrails and traces' },
     ],
     stagesLabel: 'How work flows through Open Runtime',
-    does: 'What Nasiko does',
+    does: 'What Nandatown does',
     get: 'What you get',
     // One row per category (user review 2026-11-05: six rows repeated each other): run, measure, cut, harnesses.
     rows: [
@@ -179,7 +179,7 @@ export const copy = {
   harness: {
     title: 'Bring in your coding harnesses',
     intro:
-      'Claude Code, Codex, Cursor and the rest report every session to Nasiko: what it cost, which models it used, and the sessions you had before today.',
+      'Claude Code, Codex, Cursor and the rest report every session to Nandatown: what it cost, which models it used, and the sessions you had before today.',
     steps: {
       install: 'Install the CLI',
       connect: 'Connect it to this server',

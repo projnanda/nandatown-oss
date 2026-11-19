@@ -340,7 +340,7 @@ export const copy = {
   // Errors (errors.ts builds the entries)
   errUnmapped: (text: string, status: number) => `Open Runtime said: ${text} (HTTP ${status})`,
   errDown: 'Open Runtime isn’t answering.',
-  errDownFix: 'Check that nasiko-server is running, then retry.',
+  errDownFix: 'Check that the server is running, then retry.',
 } as const
 
 /** Retired forms a copy test bans from this page (plan §2). */

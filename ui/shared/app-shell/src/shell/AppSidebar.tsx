@@ -7,9 +7,6 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useRouter, useRouterState } from '@tanstack/react-router'
 import {
   ArrowLeft,
-  BookOpen,
-  Bug,
-  ClipboardCheck,
   CircleAlert,
   CircleUser,
   Compass,
@@ -65,7 +62,6 @@ import { ApiError } from '@nasiko/data-access/client'
 import { SIDEBAR_HEALTH_INTERVAL_MS, useHealth } from '@nasiko/data-access/health'
 import { env } from '@nasiko/app-core/env'
 import { IS_MAC } from '@nasiko/ui/lib/keys'
-import { DOCS_URL, SUPPORT_MAIL_URL } from '@nasiko/app-core/links'
 import { askForTour } from '@nasiko/app-core/tour'
 import { cn } from '@nasiko/ui/lib/utils'
 import { pickShared, withoutWindow } from '@nasiko/app-core/shell/context'
@@ -91,9 +87,8 @@ import {
   type Theme,
 } from '@nasiko/app-core/shell/theme'
 import { SidebarPanelContext } from '@nasiko/app-core/shell/panelSlot'
-// The waitlist card gave way to the free-assessment banner above the top bar (AssessmentCta.tsx); WaitlistCta.tsx stays
-// for now.
-// import { WaitlistCard } from './WaitlistCta'
+// Nandatown shows neither upstream's waitlist card nor the free-assessment card that replaced it: both lead to
+// Nasiko's own team. WaitlistCta.tsx and AssessmentCta.tsx stay, unused, so core syncs merge cleanly.
 
 /** How long a pending health check stays quiet before "Checking…" shows (design review 2A). */
 const CHECKING_DELAY_MS = 1_000
@@ -113,8 +108,7 @@ export type NavBadges = Partial<Record<string, { count: number; label: string }>
 export function AppSidebar({
   badges,
   hidden,
-  assessment = false,
-}: { badges?: NavBadges; hidden?: readonly string[]; assessment?: boolean } = {}) {
+}: { badges?: NavBadges; hidden?: readonly string[] } = {}) {
   const pathname = useRouterState({ select: (s) => s.location.pathname })
   const href = useRouterState({ select: (s) => s.location.href })
   const navigate = useNavigate()
@@ -242,10 +236,11 @@ export function AppSidebar({
           className="flex min-h-0 flex-1 flex-col"
         />
       ) : null}
-      {/* {holds ? null : <WaitlistCard />} */}
+      {/* Not while a page's panel holds the sidebar: Chat's history and Settings' sections keep the room, and Chat's dot
+          background stays its page's one effect (CLAUDE.md, Aceternity effects). */}
       <SidebarFooter className={cn(GROUP, 'gap-0 border-t border-sidebar-border py-2')}>
         <SidebarMenu>
-          <HelpRows pathname={pathname} onPick={pick} assessment={assessment} />
+          <HelpRows pathname={pathname} onPick={pick} />
           {SHOW_STATUS ? <StatusRow /> : null}
           <AccountMenu onPick={pick} />
         </SidebarMenu>
@@ -443,45 +438,11 @@ function NavGroups({
   )
 }
 
-/** How to use (the docs), the CLI guide (in the app) and Report an issue (a mail to support), above the account. */
-function HelpRows({
-  pathname,
-  onPick,
-  assessment,
-}: {
-  pathname: string
-  onPick(): void
-  assessment: boolean
-}) {
+/** The CLI guide (in the app), above the account. Nandatown drops upstream's How to use and Talk to an expert rows: they open Nasiko's docs and booking page. */
+function HelpRows({ pathname, onPick }: { pathname: string; onPick(): void }) {
   const { setOpenMobile } = useSidebar()
-  // A mail link opens the mail app, not a tab: `newTab` false.
-  const external = (href: string, label: string, Icon: typeof BookOpen, newTab = true) => (
-    <SidebarMenuItem>
-      <SidebarMenuButton
-        tooltip={label}
-        className={ROW}
-        render={
-          newTab ? (
-            <a
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label={`${label} ${copy.help.newTab}`}
-            />
-          ) : (
-            // eslint-disable-next-line jsx-a11y/anchor-has-content -- its content is the button's children, rendered into it
-            <a href={href} />
-          )
-        }
-      >
-        <Icon aria-hidden />
-        <span className={LABEL}>{label}</span>
-      </SidebarMenuButton>
-    </SidebarMenuItem>
-  )
   return (
     <>
-      {external(DOCS_URL, copy.help.docs, BookOpen)}
       <SidebarMenuItem>
         <SidebarMenuButton
           isActive={pathname === '/cli'}
@@ -501,29 +462,6 @@ function HelpRows({
           <span className={LABEL}>{copy.help.cli}</span>
         </SidebarMenuButton>
       </SidebarMenuItem>
-      {/* Only once its banner is dismissed, so the assessment stays one click away without showing twice. */}
-      {assessment ? (
-        <SidebarMenuItem>
-          <SidebarMenuButton
-            isActive={pathname === '/assessment'}
-            tooltip={copy.help.assessment}
-            className={cn(ROW, ACTIVE_ROW)}
-            render={
-              <Link
-                to="/assessment"
-                onClick={() => {
-                  onPick()
-                  setOpenMobile(false)
-                }}
-              />
-            }
-          >
-            <ClipboardCheck aria-hidden />
-            <span className={LABEL}>{copy.help.assessment}</span>
-          </SidebarMenuButton>
-        </SidebarMenuItem>
-      ) : null}
-      {external(SUPPORT_MAIL_URL, copy.help.issue, Bug, false)}
     </>
   )
 }

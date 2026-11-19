@@ -60,7 +60,7 @@ describe('in the desktop app', () => {
     as('desktop-unasked')
     renderApp('/harnesses')
     const claude = await row('claude')
-    expect(within(claude).getByText('Not routed through Nasiko')).toBeInTheDocument()
+    expect(within(claude).getByText('Not routed through Nandatown')).toBeInTheDocument()
     expect(within(claude).getByRole('button', { name: 'Connect' })).toBeEnabled()
     expect(within(claude).queryByRole('button', { name: 'Disconnect' })).toBeNull()
     // Nothing is routed until asked: the picker starts on the user's default config.
@@ -99,7 +99,7 @@ describe('in the desktop app', () => {
       expect(body.config).toMatch(/^5eed0007-/)
 
       await user.click(within(claude).getByRole('button', { name: 'Disconnect' }))
-      await within(claude).findByText('Not routed through Nasiko')
+      await within(claude).findByText('Not routed through Nandatown')
       const disconnect = rec.requests.find((r) => r.url.pathname === `${ROUTING}/disconnect`)
       expect(disconnect?.body).toEqual({ agent: 'claude' })
     } finally {
@@ -146,7 +146,7 @@ describe('in the desktop app', () => {
     expect(alert).toHaveTextContent(
       "Couldn't change Claude Code's routing: Nasiko can't route Codex with this LLM config: unknown provider 'x'.",
     )
-    expect(within(claude).getByText('Not routed through Nasiko')).toBeInTheDocument()
+    expect(within(claude).getByText('Not routed through Nandatown')).toBeInTheDocument()
   })
 })
 

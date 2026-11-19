@@ -108,7 +108,7 @@ function Loaded({ wf, run }: { wf: Workflow; run?: string }) {
     )
   return (
     <div className={COLUMN}>
-      <title>{`${wf.name} · Nasiko`}</title>
+      <title>{`${wf.name} · Nandatown`}</title>
       <TopBar
         trail={
           live

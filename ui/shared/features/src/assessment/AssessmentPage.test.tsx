@@ -1,9 +1,9 @@
-/** The free assessment (`/assessment`) and the sidebar's ways to it and to help (AssessmentCta, HelpRows). */
+/** The free assessment (`/assessment`) and the sidebar's help rows (HelpRows); Nandatown links neither to Nasiko. */
 import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 import { copy as shell } from '@nasiko/app-core/shell/copy'
-import { DOCS_URL, SALES_CALL_URL, SUPPORT_MAIL_URL } from '@nasiko/app-core/links'
+import { SALES_CALL_URL } from '@nasiko/app-core/links'
 import {
   assessmentBookingsMockState,
   assessmentsMockState,
@@ -147,27 +147,18 @@ describe('assessment', () => {
     expect(assessmentBookingsMockState()).toEqual([])
   })
 
-  it('puts the help rows in the sidebar and the assessment banner above the top bar, the waitlist gone', async () => {
+  it('keeps only the CLI guide in the sidebar: no docs, issue or assessment rows, no banner (Nandatown)', async () => {
     document.cookie = 'sidebar_state=true; path=/'
     renderApp('/')
     await screen.findByRole('navigation', { name: 'Main' })
     const sidebar = document.querySelector<HTMLElement>('[data-slot="sidebar"]')!
     const s = within(sidebar)
-    expect(s.getByRole('link', { name: new RegExp(`^${shell.help.docs}`) })).toHaveAttribute(
-      'href',
-      DOCS_URL,
-    )
-    expect(s.getByRole('link', { name: shell.help.issue })).toHaveAttribute(
-      'href',
-      SUPPORT_MAIL_URL,
-    )
+    expect(s.queryByRole('link', { name: new RegExp(`^${shell.help.docs}`) })).toBeNull()
+    expect(s.queryByRole('link', { name: shell.help.issue })).toBeNull()
+    expect(s.queryByRole('link', { name: shell.help.assessment })).toBeNull()
     expect(s.getAllByRole('link', { name: shell.help.cli })[0]).toHaveAttribute('href', '/cli')
     expect(s.queryByRole('link', { name: shell.assessment.cta })).toBeNull()
-    const banner = screen.getByRole('region', { name: shell.assessment.title })
-    expect(within(banner).getByRole('link', { name: shell.assessment.cta })).toHaveAttribute(
-      'href',
-      '/assessment',
-    )
+    expect(screen.queryByRole('region', { name: shell.assessment.title })).toBeNull()
     expect(s.queryByText(shell.waitlist.badge)).toBeNull()
     document.cookie = 'sidebar_state=; path=/; max-age=0'
   })

@@ -1,5 +1,5 @@
 /**
- * The one page-level loading state: the Nasiko mark drawing itself (our take on Aceternity's LoaderThree,
+ * The one page-level loading state: the Nandatown mark drawing itself (our take on Aceternity's LoaderThree,
  * `--animate-mark-draw` in index.css). A page shows it while its primary data loads, in place of section skeletons;
  * the router's pending UI (`RoutePending`) is the same loader. Reduced motion shows the filled mark, still.
  *
@@ -8,7 +8,7 @@
  * header above it), on a fixed layer that lets clicks through. `inline` centres it in its own box instead: a tab panel or a
  * column that loads after the page has shown (pass the box's height in `className`).
  */
-import { MARK_BARS } from '@nasiko/ui/composites/markBars'
+import { MARK_DOTS } from '@nasiko/ui/composites/markDots'
 import { cn } from '@nasiko/ui/lib/utils'
 
 export function PageLoader({
@@ -38,19 +38,20 @@ export function PageLoader({
       <svg
         role="img"
         aria-label={label}
-        viewBox="-1 -1 66 66"
+        viewBox="-7 -7 456 457"
         fill="currentColor"
         stroke="currentColor"
-        strokeWidth={0.75}
+        strokeWidth={5}
         className="size-14 text-logo"
       >
-        {MARK_BARS.map((b, i) => (
-          <rect
-            key={`${b.x},${b.y}`}
-            {...b}
+        {/* 512 dots: stagger them in 16 waves so the draw takes as long as upstream's 16-bar mark did. */}
+        {MARK_DOTS.map((d, i) => (
+          <circle
+            key={`${d.cx},${d.cy}`}
+            {...d}
             pathLength={1}
             className="animate-mark-draw [stroke-dasharray:1] motion-reduce:animate-none"
-            style={{ animationDelay: `${i * 40}ms` }}
+            style={{ animationDelay: `${(i % 16) * 40}ms` }}
           />
         ))}
       </svg>

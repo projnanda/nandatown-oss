@@ -86,7 +86,7 @@ export function TracesDrawer({
             >
               <Info className="mt-0.5 size-4 shrink-0 text-info" aria-hidden />
               <div>
-                <p className="font-medium">Trace drill-down needs a newer nasiko-server</p>
+                <p className="font-medium">Trace drill-down needs a newer Nandatown server</p>
                 <p className="mt-1 text-xs text-muted-foreground">
                   This view uses the proposed <code>/finops/top-traces</code> endpoint, which this
                   server doesn't have yet. Set <code>VITE_NASIKO_MOCK=top-traces</code> to preview
