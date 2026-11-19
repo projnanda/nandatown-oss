@@ -43,7 +43,7 @@ const firstTime = () =>
   })
 // The open guide is modal: Base UI hides the rest of the page from the accessibility tree.
 const nav = () => screen.getByRole('navigation', { name: shellCopy.navLabel, hidden: true })
-const guide = () => screen.findByRole('dialog', { name: /welcome to nandatown/i })
+const guide = () => screen.findByRole('dialog', { name: /welcome to nasiko/i })
 /** The primary button stays focusable while off, so it says so with aria-disabled. */
 const off = (b: HTMLElement) => expect(b).toHaveAttribute('aria-disabled', 'true')
 const on = (b: HTMLElement) => expect(b).not.toHaveAttribute('aria-disabled', 'true')
@@ -200,11 +200,11 @@ describe('first-run guide', () => {
     await advance(user)
     await screen.findByRole('heading', { name: 'Bring in your coding harnesses' })
     // Install, then connect, which signs in itself; nothing else.
-    const commands = screen.getAllByText(/^(curl|nandatown) /).map((c) => c.textContent)
+    const commands = screen.getAllByText(/^(curl|nasiko) /).map((c) => c.textContent)
     expect(commands).toEqual([
-      `curl -fsSL ${window.location.origin}/install.sh | bash`,
+      'curl -fsSL https://registry.nasiko.com/r/nasiko/install | bash',
       // This server, not the control plane built into the CLI's release (NAS-1464).
-      `nandatown connect ${window.location.origin}`,
+      `nasiko connect ${window.location.origin}`,
     ])
     expect(screen.queryByRole('button', { name: 'Skip guide' })).toBeNull()
     // More ways on than the harnesses.

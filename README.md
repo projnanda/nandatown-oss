@@ -1,137 +1,90 @@
-<p align="center">
-  <img src="docs/assets/nandatown-banner.png" alt="Nandatown" width="100%" />
-</p>
+![Nasiko](docs/assets/nasiko-runtime-banner.png)
 
-<p align="center">
-  <strong>Deploy, route, secure, and observe any <a href="https://github.com/a2aproject/a2a-spec">A2A</a>-speaking agent
-  with a single command</strong> — no gateway, no sidecar, no glue code.
-</p>
+**Nasiko is the OpenRuntime for AI agents.**<br />
+See every coding agent your team runs and what it costs. Route it to the models you choose. Then deploy and govern your own agents on the same runtime.
 
-<p align="center">
-  <a href="https://docs.nasiko.com"><b>📚 Documentation</b></a>
-  &nbsp;•&nbsp;
-  <a href="https://discord.com/invite/HmnfkTfjFv"><b>💬 Discord</b></a>
-  &nbsp;•&nbsp;
-  <a href="https://github.com/projnanda/nandatown-oss/issues"><b>🐛 Report a bug</b></a>
-</p>
+**[📚 Documentation](https://docs.nasiko.com)**  •  **[💬 Discord](https://discord.com/invite/HmnfkTfjFv)**  •  **[🐛 Report a bug](https://github.com/Nasiko-Labs/nasiko/issues)**
 
-<!-- Shieldcn badges: badge groups + colored single badges, tuned for both GitHub color schemes -->
-<p align="center">
-  <a href="https://github.com/projnanda/nandatown-oss/stargazers">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=amber&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=amber&font=geist-mono" alt="GitHub stars" />
-    </picture>
-  </a>
-  <a href="https://github.com/projnanda/nandatown-oss/network/members">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/forks/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=blue&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/forks/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=blue&font=geist-mono" alt="GitHub forks" />
-    </picture>
-  </a>
-  <a href="https://github.com/projnanda/nandatown-oss/releases">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/release/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=violet&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/release/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=violet&font=geist-mono" alt="Latest release" />
-    </picture>
-  </a>
-  <a href="https://github.com/projnanda/nandatown-oss/blob/main/LICENSE">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/License-Apache_2.0-red.svg?mode=dark&font=geist-mono" />
-      <img src="https://shieldcn.dev/badge/License-Apache_2.0-red.svg?mode=light&font=geist-mono" alt="License: Apache-2.0" />
-    </picture>
-  </a>
-</p>
-<p align="center">
-  <a href="https://github.com/projnanda/nandatown-oss">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/Language-Rust-orange.svg?logo=rust&mode=dark&font=geist-mono" />
-      <img src="https://shieldcn.dev/badge/Language-Rust-orange.svg?logo=rust&mode=light&font=geist-mono" alt="Built with Rust" />
-    </picture>
-  </a>
-  <a href="https://github.com/projnanda/nandatown-oss/issues">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/issues/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=cyan&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/issues/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=cyan&font=geist-mono" alt="Open issues" />
-    </picture>
-  </a>
-  <a href="https://github.com/projnanda/nandatown-oss/pulls">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=green&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=green&font=geist-mono" alt="Pull requests" />
-    </picture>
-  </a>
-  <a href="https://github.com/projnanda/nandatown-oss">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/ci/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=purple&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/ci/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=purple&font=geist-mono" alt="CI" />
-    </picture>
-  </a>
-  <a href="https://github.com/projnanda/nandatown-oss/pulls">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/PRs-Welcome-pink.svg?mode=dark&font=geist-mono" />
-      <img src="https://shieldcn.dev/badge/PRs-Welcome-pink.svg?mode=light&font=geist-mono" alt="PRs Welcome" />
-    </picture>
-  </a>
-</p>
+[![GitHub stars](https://shieldcn.dev/github/stars/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=amber&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/stargazers)
+[![GitHub forks](https://shieldcn.dev/github/forks/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=blue&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/network/members)
+[![Latest release](https://shieldcn.dev/github/release/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=violet&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/releases)
+[![License: Apache-2.0](https://shieldcn.dev/badge/License-Apache_2.0-red.svg?mode=light&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/blob/main/LICENSE)
+
+[![Built with Rust](https://shieldcn.dev/badge/Language-Rust-orange.svg?logo=rust&mode=light&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko)
+[![Open issues](https://shieldcn.dev/github/issues/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=cyan&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/issues)
+[![Pull requests](https://shieldcn.dev/github/prs/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=green&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/pulls)
+[![CI](https://shieldcn.dev/github/ci/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=purple&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/actions)
+[![PRs Welcome](https://shieldcn.dev/badge/PRs-Welcome-pink.svg?mode=light&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/pulls)
 
 ## Table of Contents
 
-- [What is Nandatown?](#what-is-nandatown)
+- [Why Nasiko](#why-nasiko)
 - [Features](#features)
 - [Architecture](#architecture)
-- [Requirements](#requirements)
-- [Quick Start — Docker only (no Rust needed)](#quick-start--docker-only-no-rust-needed)
-- [Setup guides by operating system](#setup-guides-by-operating-system)
-- [CLI — install & use](#cli--install--use)
-- [Environment Variables](#environment-variables)
-- [Project Structure](#project-structure)
+- [Quick start](#quick-start)
+- [Coding agents](#coding-agents)
+- [Deploy your own agents](#deploy-your-own-agents)
 - [Troubleshooting](#troubleshooting)
-- [Project Activity](#project-activity)
-- [Documentation & Links](#documentation--links)
-- [Support](#support)
-- [Contributing](#contributing)
-- [License](#license)
+- [Community](#community)
 
-## What is Nandatown?
+## Why Nasiko
 
-Running more than a couple of agents quickly turns into an operations problem: *who calls whom*,
-*which key does each agent hold*, *what did that call cost*, *why did it fail?*
+Your developers already run coding agents: Claude Code, Codex, Cursor, OpenCode, often several at
+once, each with its own dashboard and billing. At the end of the month nobody can say who spent
+what, on which model.
 
-Nandatown is a **single control-plane process** that sits in front of every agent and answers all of that.
-It terminates TLS, authenticates every request, and proxies all agent-to-agent traffic itself, so agents
-are **never publicly reachable** — every hop is a checkpoint for rate limits, ACLs, and tracing.
+Nasiko finds those agents, puts their spend in one place, and gives you back the model choice.
+Your cost history, policy and model choice stay with you, not with any one vendor.
 
-**Different language, same A2A protocol** — bring your own agents in Python, Rust, Go, or TypeScript.
-No proprietary agent format, no lock-in.
+- **Non-invasive.** Discovery changes nothing. Reporting and routing are opt-in, with no wrapper
+  or SDK in your code.
+- **Non-intrusive.** After a one-time setup, developers keep using their harness exactly as before.
 
-<p align="center">
-  <img src="docs/assets/ui-dashboard.png" alt="Nandatown Dashboard" width="900" />
-  <br />
-  <sub><b>Nandatown Dashboard</b> — deploy agents, route traffic, manage tools, and watch traces.</sub>
-</p>
+![Nasiko Dashboard](docs/assets/ui-dashboard.png)
 
 ## Features
 
-| Feature | What it does |
-|---|---|
-| **Deploy anything that speaks A2A** | `nasiko deploy` builds, pushes to the embedded registry, and runs it. No external registry required. |
-| **Intelligent routing engine** | 3-stage pipeline — shortlist by embedding similarity, rerank on conversation context, then LLM final pick. Callers don't need to know your fleet. |
-| **Single ingress, always proxied** | Agents are never publicly reachable; every agent-to-agent call is proxied through the server. |
-| **MCP Gateway** | One permanent URL gives every agent a merged, permission-filtered view of Composio toolkits and custom MCP servers — without the agent holding the credentials. |
-| **LLM Router** | Agents get an `OPENAI_BASE_URL` + a short-lived identity token instead of a real key. The router resolves provider/model/key server-side. No agent or log ever sees a real API key. |
-| **Full observability** | Every dispatch and proxy hop emits a real OTel span -> one end-to-end trace. Token usage & cost are auto-collected from `gen_ai.*` attributes. |
-| **Flow guards** | Redis-backed cascade limits (depth, fan-out, token budget, timeout, cycle detection) stop runaway agent loops. |
-| **Encrypted secrets** | Per-agent secrets are AES-256-GCM encrypted at rest, injected only at deploy time. |
-| **Access control** | User to-agent ownership/grants and an agent-to-agent allowlist gate every proxy call, independently. |
-| **Embedded OCI registry** | Self-hosted, S3-backed registry with layer dedup — `nasiko push` / `nasiko deploy` need nothing external. |
-| **CLI-first, no lock-in** | `nasiko new`, `run`, `chat`, `deploy`. Bring your own LLM provider. |
+### Your coding agents
+
+| Feature               | What it does                                                                                          |
+| --------------------- | ----------------------------------------------------------------------------------------------------- |
+| **Discovery**         | Finds Claude Code, Codex, OpenCode and Cursor CLI on a machine. Read-only: no account, nothing sent. |
+| **Session reporting** | Every completed turn, with its tokens and cost, lands in one dashboard. Past sessions are imported.  |
+| **Model routing**     | Point a harness at Nasiko instead of its vendor. Claude Code can run on your OpenAI key.             |
+
+### TokenOps
+
+| Feature                   | What it does                                                                                               |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **LLM Router**            | Agents get a short-lived token, never a real API key. Provider, model and key are resolved on the server. |
+| **Cost attribution**      | Usage and cost per agent and per model, instead of one provider total you have to reverse-engineer.       |
+| **Token optimization**    | Compresses large payloads, compacts tool schemas and picks which chat history a request carries. Every saving is recorded. |
+| **One trace per request** | Every hop emits an OTel span, so a request is one end-to-end trace with its cost attached.               |
+
+### Policy and governance
+
+| Feature                     | What it does                                                                                            |
+| --------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Single ingress**          | Agents are never publicly reachable. Every agent-to-agent call goes through the server.                 |
+| **Access control**          | Ownership and grants for people, plus an allowlist for which agents may call which.                     |
+| **MCP Gateway**             | One URL gives each agent the tools it was granted. Credentials stay with the gateway, never the agent. |
+| **Human in the loop**       | Set a tool to **ask** and the agent pauses until someone approves it.                                   |
+| **Flow guards**             | Limits on depth, fan-out, token budget and cycles stop runaway agent loops.                             |
+| **Encrypted secrets**       | Per-agent secrets are encrypted at rest with AES-256-GCM and injected at deploy.                        |
+
+### Orchestration
+
+| Feature                     | What it does                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------ |
+| **Deploy any A2A agent**    | `nasiko deploy` builds, pushes and runs it. No proprietary format and no SDK.                    |
+| **Routing engine**          | Picks the right agent for a request in three stages: embedding shortlist, rerank, LLM selection. |
+| **Built-in registry**       | An embedded, S3-backed OCI registry, so nothing external is needed to push and deploy.           |
+
 ## Architecture
 
-Nandatown is a **single process** — there is no separate gateway. Every inter-agent call is proxied back
-through the server, the single chokepoint where flow limits, ACLs, and observability are enforced.
-Durable state lives in **Postgres**, **Redis**, and **S3** (RustFS), with optional observability via
-**Tempo / Loki / the OTel Collector**.
+To attribute spend across vendors and enforce a budget or a tool rule, Nasiko has to sit where the
+calls happen. So it runs as a **single server process** that every agent call passes through, with
+state in **Postgres**, **Redis** and **S3** (RustFS) and traces in **Tempo / Loki / OTel**.
 
 ```mermaid
 flowchart LR
@@ -144,7 +97,6 @@ flowchart LR
         direction TB
         API["REST API (agents, builds, uploads)"]
         AUTH["Auth (session JWT, TLS, rate-limit, ACLs)"]
-        OIDC["OIDC client (SSO)"]
         ROUTE["Routing engine (shortlist, rerank, select)"]
         PROXY["A2A Proxy (generic agent reverse-proxy)"]
         MCP["MCP Gateway (tools/list, tools/call, OAuth)"]
@@ -152,7 +104,7 @@ flowchart LR
         OCI["Embedded OCI registry (/v2/*)"]
         FLOW["Flow guards (depth, fan-out, token budget, cycles)"]
         SECRETS["Secrets engine (AES-256-GCM)"]
-        GITHUB["GitHub App integration"]
+        GITHUB["GitHub integration (OAuth)"]
     end
 
     subgraph Infra["Backing services (Docker)"]
@@ -177,7 +129,6 @@ flowchart LR
     API --> ROUTE
     API --> GITHUB
     ROUTE --> FLOW
-    OIDC --> AUTH
     SECRETS --> API
 
     AUTH -. gates .-> API
@@ -201,462 +152,222 @@ flowchart LR
     OTEL --> LOKI
 ```
 
-> Every request to an agent is either dispatched by the routing engine or proxied generically — both
-> paths originate **inside** the server. Agents never receive a direct, public request, and both call
-> back out into the LLM Router and MCP Gateway rather than holding real API keys or tool credentials.
+Agents never receive a direct public request, and they call the LLM Router and MCP Gateway instead
+of holding real API keys or tool credentials.
 
----
+## Quick start
 
-## Requirements
+You need [Docker](https://docs.docker.com/get-docker/) with Compose V2 for the server. The CLI alone
+is enough to discover coding agents. On Linux, add yourself to the `docker` group first:
+`sudo usermod -aG docker "$USER"`, then log out and back in.
 
-| Component | Minimum version | Why |
-|---|---|---|
-| **Docker Engine + Compose V2** | Compose V2 plugin (the `docker compose` command — not the legacy standalone `docker-compose` v1 binary) | `docker-compose.yml` uses the extended `depends_on: condition: service_healthy` syntax; the Docker-only path needs nothing else. |
-| **Rust** | 1.85+ (stable) | The workspace targets `edition = "2024"` (see [`Cargo.toml`](Cargo.toml)), stabilized in Rust 1.85 — only needed for the CLI / Path B developer setup, not the Docker-only path. |
-| **A2A protocol** | Spec **v1.0** exactly (latest upstream release: v1.0.1, Linux Foundation) | Nandatown requires and hardcodes the `A2A-Version: 1.0` header on every request; agents on older/pre-1.0 spec versions (e.g. 0.2.x, 0.3.0) are rejected with `-32009 VersionNotSupported` (see [`docs/A2A_PROTOCOL.md`](docs/A2A_PROTOCOL.md)). Any agent speaking v1.0 works, regardless of its implementation language. |
-
----
-
-## Quick Start — Docker only (no Rust needed)
-
-The fastest way to run Nandatown requires **only [Docker](https://docs.docker.com/get-docker/)** (with Compose).
-The server builds itself from source inside Docker.
-
-### 1. Clone and configure
+**1. Install the CLI**
 
 ```sh
-git clone https://github.com/projnanda/nandatown-oss.git
-cd nandatown-oss
-cp .env.example .env
+# macOS and Linux
+curl -fsSL https://registry.nasiko.com/r/nasiko/install | bash
+
+# Windows (PowerShell)
+irm https://registry.nasiko.com/r/nasiko/install-ps1 | iex
 ```
 
-Edit `.env` and set at minimum:
+Or build it from source with Rust 1.88+: `cargo install --path cli/ --force`.
 
-- `OPENAI_API_KEY` — your OpenAI key (used by the routing engine and injected into agents)
-- `ADMIN_PASSWORD` — password for the bootstrap admin account
-
-### 2. Start the platform
+**2. Start the server**
 
 ```sh
+git clone https://github.com/Nasiko-Labs/nasiko.git && cd nasiko
+cp .env.example .env
 docker compose up -d
 ```
 
-This builds the server image and starts the full stack:
-**Postgres · Redis · RustFS (S3) · OTel Collector · Tempo · Loki · nasiko-server**.
+The first build compiles the server inside Docker and takes a few minutes. Then open
+**[http://localhost:8080](http://localhost:8080)** and log in as `admin` / `changeme`.
 
-- First build takes a few minutes (compiles Rust inside Docker) — subsequent builds are fast.
-- Open **http://localhost:8080** for the dashboard and log in with `ADMIN_USERNAME` / `ADMIN_PASSWORD`
-  (default `admin` / `changeme`).
+The `.env` defaults work on your own machine. Before anyone else can reach the server, change these:
+
+| Variable                 | Set it to                                                    |
+| ------------------------ | ------------------------------------------------------------ |
+| `SECRETS_ENCRYPTION_KEY` | `openssl rand -base64 32`, once. A new key can't read old secrets. |
+| `JWT_SECRET`             | `openssl rand -base64 48`                                    |
+| `AGENT_JWT_SECRET`       | another `openssl rand -base64 48`, different from the one above |
+| `ADMIN_PASSWORD`         | anything but `changeme`                                      |
+| `OPENAI_API_KEY`         | your key, for dashboard chat, the routing engine and deployed agents |
+
+After editing `.env`, run `docker compose up -d` again. Every variable is described in
+[`server/.env.example`](server/.env.example).
 
 ```sh
-docker compose logs -f server   # follow server logs
+docker compose logs -f server   # follow the server logs
 docker compose down             # stop everything
 docker compose up -d --build    # rebuild after pulling new changes
 ```
 
-> No Docker? Use the [Developer / Rust setup](#path-b--developer--rust-setup) below.
-## Setup guides by operating system
-
-You have **two supported paths**:
-
-| Path | Requires | Best for |
-|---|---|---|
-| **A. Docker-only** | Docker only | Anyone who just wants to run the platform |
-| **B. Source / Rust** | Rust + `just` | Contributors, developers, hot-reload |
-
-### Path A — Docker-only
-
-<details>
-<summary><b>Windows</b></summary>
-
-1. Install **Docker Desktop** -> https://www.docker.com/products/docker-desktop/
-2. Open Docker Desktop and wait until the engine is running.
-3. In a terminal (PowerShell or Git Bash):
-   ```powershell
-   git clone https://github.com/projnanda/nandatown-oss.git
-   cd nandatown-oss
-   Copy-Item .env.example .env
-   # edit .env -> set OPENAI_API_KEY and ADMIN_PASSWORD
-   docker compose up -d
-   ```
-4. Open http://localhost:8080 and log in.
-
-> Windows troubleshooting: see the [Troubleshooting](#troubleshooting) section (port conflicts,
-> line endings, encryption key, WSL, Docker Desktop).
-</details>
-
-<details>
-<summary><b>macOS</b></summary>
-
-1. Install **Docker Desktop for Mac** -> https://www.docker.com/products/docker-desktop/
-2. Open Docker Desktop until the engine is running.
-3. In Terminal:
-   ```sh
-   git clone https://github.com/projnanda/nandatown-oss.git
-   cd nandatown-oss
-   cp .env.example .env
-   # edit .env -> set OPENAI_API_KEY and ADMIN_PASSWORD
-   docker compose up -d
-   ```
-4. Open http://localhost:8080 and log in.
-
-> `host.docker.internal` resolves out of the box on Docker Desktop (macOS + Windows), so agents can
-> reach the MCP gateway without extra setup.
-</details>
-
-<details>
-<summary><b>Linux</b></summary>
-
-1. Install Docker engine + Compose plugin -> https://docs.docker.com/engine/install/
-2. Add your user to the `docker` group and re-login:
-   ```sh
-   sudo usermod -aG docker "$USER"
-   newgrp docker
-   ```
-3. In a terminal:
-   ```sh
-   git clone https://github.com/projnanda/nandatown-oss.git
-   cd nandatown-oss
-   cp .env.example .env
-   # edit .env -> set OPENAI_API_KEY and ADMIN_PASSWORD
-   docker compose up -d
-   ```
-4. Open http://localhost:8080 and log in.
-
-> **Linux note:** native Docker does **not** provide `host.docker.internal` automatically. If agents
-> report `[Errno -2] Name or service not known`, run Docker with
-> `--add-host host.docker.internal:host-gateway` or set `MCP_GATEWAY_PUBLIC_URL` to the bridge IP
-> (see [Troubleshooting](#troubleshooting)).
-</details>
-
-### Toolchain setup — Rust, `just`, etc. (for the CLI / Path B)
-
-<details>
-<summary><b>Windows</b></summary>
-
-```powershell
-# 1. Rust (installs rustup + stable toolchain)
-winget install --id Rustlang.Rustup -e
-# (reopen your terminal, then verify)
-rustc --version; cargo --version
-
-# 2. `just` command runner + cargo-watch (after Rust is installed)
-cargo install just cargo-watch
-
-# 3. If you plan to build native Windows binaries, also install the C++ linkers:
-winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
-```
-> Building the CLI **does not** require the C++ Build Tools — it uses a pure-Rust toolchain. The
-> C++ linkers are only needed if native crates (e.g. `ring`) fail to link on the MSVC toolchain.
-</details>
-
-<details>
-<summary><b>macOS</b></summary>
+**3. Connect the CLI**
 
 ```sh
-# 1. Xcode Command Line Tools (provides the C toolchain/linker)
-xcode-select --install
-
-# 2. Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# 3. `just` + cargo-watch
-cargo install just cargo-watch
+nasiko connect http://localhost:8080   # registers the server and logs you in: admin / changeme, or your ADMIN_PASSWORD
 ```
-</details>
 
-<details>
-<summary><b>Linux (Debian/Ubuntu)</b></summary>
+Now [measure and route your coding agents](#coding-agents) or
+[deploy your own](#deploy-your-own-agents).
+
+### Run from source
+
+Working on Nasiko itself? Run the server natively with hot-reload. This needs Rust 1.88+,
+[`just`](https://github.com/casey/just), `protoc` (`brew install protobuf` or
+`apt install protobuf-compiler`) and Docker for the backing services:
 
 ```sh
-# 1. Build dependencies (cc, OpenSSL)
-sudo apt update && sudo apt install -y build-essential pkg-config libssl-dev
-
-# 2. Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-
-# 3. `just` + cargo-watch
-cargo install just cargo-watch
-
-# 4. Docker engine + compose (if not using Docker Desktop)
-#    See https://docs.docker.com/engine/install/ubuntu/
+just infra    # Postgres, Redis, RustFS and the OTel stack in Docker
+just dev      # the server, rebuilt on every change (cargo install cargo-watch)
 ```
-</details>
 
-After setup, verify everything:
+To see coding-agent tokens and cost on a native server, set
+`CODING_AGENT_OTLP_ENDPOINT=http://localhost:4318` in `server/.env` (Compose sets it for you).
+Toolchain setup, tests and code layout are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Coding agents
+
+Reporting and routing are separate opt-ins. Use either or both.
+
+| Harness     | Discovery and reporting | Model routing |
+| ----------- | ----------------------- | ------------- |
+| Claude Code | yes                     | yes           |
+| Codex       | yes                     | yes           |
+| OpenCode    | yes                     | yes           |
+| Cursor CLI  | yes                     | not yet       |
+
+Want another harness? [Open an issue](https://github.com/Nasiko-Labs/nasiko/issues).
+
+### Discover
+
+Works before you have a server or an account:
 
 ```sh
-rustc --version   && cargo --version
-just --version
-docker --version  && docker compose version
+nasiko status
 ```
 
-### Path B — Developer / Rust setup
+Under **Coding agents** it lists each harness with whether it is installed and whether LLM
+routing, MCP and reporting are connected. `nasiko status claude` shows one in detail.
 
-Requires **[Rust (rustup)](https://rustup.rs)**, **[`just`](https://github.com/casey/just)**
-(`cargo install just`), and **Docker**.
+`nasiko agents discover` also finds A2A agents running on the machine, from any framework, by
+looking for an agent card on listening ports and Docker published ports. It probes those ports,
+which is why it is a separate command. `nasiko connect <agent>` then routes a discovered agent's
+LLM calls (and, if you ask, MCP tools) through Nasiko, and `nasiko disconnect <agent>` undoes it.
+
+### Report sessions
+
+With the server running and the CLI signed in ([Quick start](#quick-start)), one command connects
+every detected harness and imports its past sessions:
 
 ```sh
-# 1. Start infrastructure only (Postgres, Redis, RustFS, OTel stack)
-just infra
-
-# 2. Configure the server env
-cp server/.env.example server/.env
-# edit server/.env -> set OPENAI_API_KEY at minimum
-
-# 3. Run the server natively (hot-reload)
-just dev
-# ...or without hot-reload:
-just run
+nasiko agents setup
 ```
 
-The server runs on http://localhost:8080. `just dev` auto-rebuilds on changes (needs
-[`cargo-watch`](https://github.com/watchexec/cargo-watch)).
-
-Useful dev commands:
+Finish one turn in a connected harness, then check that it arrived:
 
 ```sh
-just check        # cargo check --workspace
-just clippy       # lint (zero-warnings policy)
-just test-unit    # fast hermetic unit tests (no infra needed)
-just test         # unit + integration tests (needs: just infra)
+nasiko sessions                  # recorded sessions
+nasiko agents status             # import progress
 ```
 
-Building from source:
+Run `nasiko connect claude --reporting --no-content` first to keep prompt and response text out.
+Codex asks you to trust the new hooks on its next start, and OpenCode needs a restart.
+[How reporting works](https://docs.nasiko.com/coding-agents/session-reporting).
+
+### Route models
+
+Register a provider key once, then point a harness at Nasiko. Claude Code's requests can then be
+served by your OpenAI key:
 
 ```sh
-cargo build --release -p nasiko          # CLI binary
-cargo build --release -p nasiko-server   # Server binary
+nasiko llm-config create --name my-openai --provider openai --model gpt-4o \
+  --api-key-secret OPENAI_API_KEY --secret-value "$OPENAI_API_KEY"
+nasiko connect claude --config my-openai
 ```
 
-## CLI — install & use
+`connect codex` and `connect opencode` work the same way, and `nasiko disconnect <agent>` undoes
+it. The key stays encrypted on the server; the harness only gets a short-lived token. Settings are
+per user, so connecting affects every session of that harness on the machine.
+[What `connect` changes](https://docs.nasiko.com/coding-agents/routing).
 
-The CLI needs **Rust** to build from source (it is a separate `cli/` crate). You also need
-[Docker](https://docs.docker.com/get-docker/) to build/deploy agent images.
+## Deploy your own agents
 
-### Install the CLI
+Nasiko runs any agent that speaks [A2A](https://github.com/a2aproject/a2a-spec) v1.0, in Python,
+Rust, Go or TypeScript. There is no SDK to adopt.
 
 ```sh
-# from the repo root
-cargo install --path cli/
-# ...or build a standalone binary
-cargo build --release -p nasiko
+nasiko new openai my-agent && cd my-agent   # scaffold from a template
+nasiko deploy .                             # build, push and deploy
+nasiko chat --agent my-agent "Hello there"
 ```
 
-Add it to your `PATH` if it is not already (Cargo's `bin` dir: `~/.cargo/bin`).
+Deployed agents use the server's `OPENAI_API_KEY` unless you give them their own with
+`nasiko secrets set`, so set it in `.env` before you chat.
 
-### Deploy your first agent
+`nasiko deploy` builds locally with Docker. `nasiko upload` sends the source and the server builds it.
+You can also deploy from the dashboard: upload source, import from GitHub, or pull from the registry.
+
+| Command                                      | What it does                              |
+| -------------------------------------------- | ----------------------------------------- |
+| `nasiko ps`                                  | List running agents                       |
+| `nasiko logs <agent> -f`                     | Follow an agent's logs                    |
+| `nasiko stop` / `start` / `restart` / `scale` | Agent lifecycle                          |
+| `nasiko rm <agent>`                          | Remove an agent                           |
+| `nasiko secrets set`                         | Store encrypted per-agent secrets         |
+| `nasiko mcp`                                 | Manage tools and tool permissions         |
+| `nasiko observe`                             | Sessions, traces, stats and spend         |
+
+Run `nasiko <command> --help` for every option.
+
+### Give your agent tools
+
+Each deployed agent reaches its tools through the MCP Gateway and only sees what it was granted.
+Toolkits such as GitHub come from Composio: set `COMPOSIO_API_KEY` in `.env`, or save a key under
+Settings → MCP toolkits, first.
 
 ```sh
-nasiko connect http://localhost:8080
-nasiko auth login                          # log in with ADMIN_USERNAME / ADMIN_PASSWORD
-nasiko new openai my-agent && cd my-agent  # scaffold from a template
-nasiko deploy .                            # build, push, and deploy
-nasiko chat "Hello there"                  # talk to your agent (message must contain a space,
-                                            # or use --agent: nasiko chat --agent my-agent "Hello")
+nasiko mcp connect --toolkit github                                         # connect your account
+nasiko mcp agent-tools enable my-agent <connector-id>                       # grant it to my-agent
+nasiko mcp agent-tools set-rule my-agent <connector-id> "GITHUB_DELETE_*" ask   # allow | ask | block
 ```
 
-You can also deploy agents directly from the dashboard UI — upload source, import from GitHub, or
-pull from the artifact registry.
+Bring your own MCP server with `nasiko mcp connector register <name> <url>`.
+[Connect your agent to the gateway](https://docs.nasiko.com/build/mcp/agent-integration).
 
-### Handy CLI commands
+### Pause for a human
 
-| Command | Description |
-|---|---|
-| `nasiko connect <url>` | Register a control plane and switch to it |
-| `nasiko auth login` | Authenticate with the active cluster |
-| `nasiko new [template] [name]` | Scaffold a new agent project |
-| `nasiko build` / `nasiko run` | Build the agent image / build + run it locally |
-| `nasiko push` / `nasiko deploy <image>` | Push image / build-push-deploy to the cluster |
-| `nasiko upload [source]` | Upload source; the server builds it (no local Docker) |
-| `nasiko ps` | List running agents |
-| `nasiko logs <agent> -f` | Stream (and follow) agent logs |
-| `nasiko stop` / `start` / `restart` / `scale <n>` | Agent lifecycle |
-| `nasiko rm --name <agent>` | Terminate + deregister an agent (positional `id` only accepts a UUID) |
-| `nasiko chat <agent>` | Interactive or one-shot A2A chat |
-| `nasiko secrets set` | Configure encrypted per-agent secrets |
-| `nasiko mcp` | Manage MCP Gateway connectors and tool permissions |
-| `nasiko observe` | Observability: sessions, traces, spans, stats, FinOps |
-| `nasiko maf` | Multi-agent flow workflows (create/run/inspect) |
-| `nasiko registry` | Browse the artifact registry |
-| `nasiko github` | GitHub integration (status/repos/connect/disconnect/clone) |
+An agent can stop mid-task to ask a question or wait for a tool approval, then resume the same task
+with the answer. It's plain A2A, shown in dashboard **Chat** and `nasiko chat`.
+[Pause for a human](https://docs.nasiko.com/build/human-in-the-loop).
 
-Run `nasiko --help` for the full, workflow-ordered command list.
-
-## Environment Variables
-
-Everything is env-driven through a single `Config` struct (`config/src/lib.rs`); required keys fail
-fast at startup. When running via `docker compose`, the infrastructure URLs (`DATABASE_URL`,
-`REDIS_URL`, `S3_ENDPOINT`, OTel/Tempo/Loki, agent network) are set automatically by
-`docker-compose.yml`. See [`.env.example`](.env.example) for every variable with descriptions.
-
-| Variable | Purpose | Default |
-|---|---|---|
-| `OPENAI_API_KEY` | LLM provider for the router + agents | optional (`sk-...`) |
-| `SECRETS_ENCRYPTION_KEY` | Base64 32-byte AES-256-GCM key | **required** |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | Bootstrap admin account | `admin` / `changeme` |
-| `JWT_SECRET` | JWT signing secret | **required** |
-| `S3_BUCKET` / `S3_ACCESS_KEY` / `S3_SECRET_KEY` / `S3_REGION` | S3 storage for the OCI registry | set by compose |
-| `AGENT_RUNTIME` | Container runtime (`docker` in OSS) | `docker` |
-| `DATABASE_URL` / `REDIS_URL` / `S3_ENDPOINT` | Infra connections | set by compose |
-| `COMPOSIO_API_KEY` | Composio platform (MCP toolkits) | optional |
-| `SEED_TOOLKITS` | Composio toolkits to auto-register at boot | optional |
-| `MCP_GATEWAY_PUBLIC_URL` | Public URL injected into agents for the MCP gateway | set by compose |
-| `SEED_AGENTS` | Space-separated images auto-deployed at boot | optional |
-| `ROUTER_MODEL` / `EMBEDDING_MODEL` | Routing-engine models | see `config/` |
-| `NASIKO_FLOW_MAX_DEPTH` / `NASIKO_FLOW_MAX_FAN_OUT` / `NASIKO_FLOW_MAX_TOKENS` | Flow-guard cascade limits | see `config/` |
-## Project Structure
-
-```
-server/         Control plane: Axum routes, auth, agent proxy, build worker, embedded UI
-orchestrator/   Routing engine: semantic agent selection (shortlist, rerank, select)
-mcp-gateway/    MCP Gateway: connectors, tool aggregation, per-agent permissions, OAuth
-llm-router/     Provider-agnostic OpenAI-compatible egress proxy for agent LLM calls
-runtime/        ContainerRuntime trait + DockerRuntime (bollard)
-auth/           AuthService trait + OSS implementation (JWT login, RBAC hooks)
-flow/           FlowGuard: anti-DoS cascade limits + live flow events
-secrets/        AES-256-GCM encryption for agent secrets at rest
-oci/            Embedded OCI Distribution v2 registry (S3-backed, layer dedup)
-observability/  OTel init, Tempo/Loki clients, DB-backed model pricing
-agent-proxy/    Agent ID -> running-container endpoint resolution
-github/         GitHub OAuth + repo import for source-based deploys
-types/          A2A protocol + registry types
-config/         Single env-driven Config struct
-utils/          Shared helpers
-cli/            nasiko binary (agent developer CLI, sync HTTP via ureq)
-agents/         Example and seed agents (each a standalone A2A container)
-migrations/     Postgres migrations (sqlx, run automatically at startup)
-ui/             Frontend (vanilla JS web components, embedded in the server binary)
-docs/           Design docs (architecture, protocol, conventions)
-```
+> **Try it:** `nasiko upload agents/general-assistant-1.1.1.zip` deploys a complete example that
+> uses MCP tools and pauses for approval. Type `hitl input test` to see a pause without an LLM key.
 
 ## Troubleshooting
 
-### Quick fixes - one command
+| Problem                                          | Fix                                                                                     |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `permission denied` on the Docker socket         | Start Docker Desktop, or on Linux: `sudo usermod -aG docker "$USER" && newgrp docker`   |
+| Server can't reach Postgres                      | Wait until `docker compose ps` shows `healthy`                                          |
+| `.env` changes have no effect                    | Run `docker compose up -d`, not `restart`                                               |
+| `address already in use` (9000, 4317, 4318)      | Find the process with `lsof -i :9000`; on Windows keep one Docker engine and `wsl --shutdown` |
+| Agent can't reach the MCP gateway (Linux)        | Add `--add-host host.docker.internal:host-gateway`, or set `MCP_GATEWAY_PUBLIC_URL` to the bridge IP |
+| After upgrading, the server exits with `migration 60 was previously applied but has been modified` | This release renumbered some database migrations. Start from a new database: `docker compose down -v`, then `docker compose up -d --build` (this deletes existing data) |
 
-| Problem | One command |
-|---|---|
-| CLI won't compile: `link.exe not found` / `cc not found` (Windows) | Use the Docker-only path, or `winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"` then reopen the terminal |
-| CLI won't compile: `dlltool ... Invalid bfd target` | `winget install MSYS2.MSYS2` then add `C:\msys64\mingw64\bin` to PATH ahead of `C:\MinGW`, or switch to MSVC |
-| `: command not found` when sourcing `.env` | `sed -i 's/\r$//' server/.env` |
-| `invalid SECRETS_ENCRYPTION_KEY` at startup | `sed -i.bak "s/^SECRETS_ENCRYPTION_KEY=.*/SECRETS_ENCRYPTION_KEY=$(openssl rand -base64 32)/" .env` |
-| `address already in use` on ports 9000/4317/4318 | Stop Docker Desktop, then `wsl --shutdown` (Windows) and rerun `docker compose up -d` |
-| `permission denied` on Docker socket | `sudo usermod -aG docker "$USER" && newgrp docker` (*nix/WSL) |
-| WSL `ext4.vhdx: path not found` | `wsl --unregister Ubuntu && wsl --install -d Ubuntu` |
-| Agent upload -> `500 agents_owner_id_fkey` | Log out and back in, or `docker compose down -v && docker compose up -d` then log in fresh |
-| Server can't reach Postgres | `docker compose up -d` and wait for `healthy` |
-| Agent `Name or service not known` (Linux Docker) | Recreate with `--add-host host.docker.internal:host-gateway` |
-| `SEED_TOOLKITS is set but COMPOSIO_API_KEY is not` at startup | Expected and harmless — `SEED_TOOLKITS` ships active by default in `.env.example`. Set `COMPOSIO_API_KEY` in `.env` to actually register Composio toolkits, or comment out `SEED_TOOLKITS` to silence the warning |
+More: [server](https://docs.nasiko.com/self-hosting/troubleshooting) and
+[coding agents](https://docs.nasiko.com/coding-agents/troubleshooting).
 
-### Windows
+## Community
 
-| Symptom | Cause / fix |
-|---|---|
-| `link.exe not found` / `linker 'cc' not found` when building the CLI | MSVC C++ Build Tools not installed. Use the Docker-only path (no Rust), or install [VS Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) with the "Desktop development with C++" workload. |
-| `error: dlltool ... Invalid bfd target` | A broken 32-bit MinGW (`C:\MinGW`) cannot build 64-bit. Install a real 64-bit MinGW-w64 (e.g. [MSYS2](https://www.msys2.org/)) or switch to the MSVC toolchain. |
-| `: command not found` when sourcing `.env` | Windows line endings (CRLF) break bash `source`. Convert: `sed -i 's/\r$//' server/.env` |
-| `invalid SECRETS_ENCRYPTION_KEY ... Invalid padding` | Invalid key in `.env`. Generate one: `openssl rand -base64 32` |
-| `address already in use` on ports 9000/4317/4318 | Two Docker engines fighting (Docker Desktop + WSL native). Keep **one**; run `wsl --shutdown`, reopen, `docker compose up -d` |
-| `permission denied ... Docker daemon socket` (inside WSL) | Add user to `docker` group: `sudo usermod -aG docker $USER`, then re-login |
-| `Wsl ... ext4.vhdx: path not found` | Corrupt WSL distro. `wsl --unregister Ubuntu` then `wsl --install -d Ubuntu` |
-| Agent upload -> `500` / `agents_owner_id_fkey` | Stale login token from an old DB. **Log out, log back in** (or `docker compose down -v` + fresh login) |
+- **Docs:** [docs.nasiko.com](https://docs.nasiko.com)
+- **Discord:** [join the community](https://discord.com/invite/HmnfkTfjFv) for questions and ideas
+- **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) covers local setup, conventions and the PR flow
+- **Design docs:** [`docs/`](docs/) for the A2A protocol, MCP gateway internals and CLI design
 
-### macOS
+[![GitHub stars](https://shieldcn.dev/github/stars/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=red&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/stargazers)
+[![Total commits](https://shieldcn.dev/github/commits/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=amber&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/commits)
+[![Pull requests](https://shieldcn.dev/github/prs/Nasiko-Labs/nasiko.svg?variant=secondary&mode=light&theme=violet&font=geist-mono)](https://github.com/Nasiko-Labs/nasiko/pulls)
 
-| Symptom | Cause / fix |
-|---|---|
-| `linker 'cc' not found` | `xcode-select --install` (Command Line Tools) missing |
-| `permission denied ... Docker daemon` | Start Docker Desktop and wait for the engine |
-| `address already in use` | Another process on ports 9000/4317/4318. `lsof -i :9000` to find it. |
-
-### Linux
-
-| Symptom | Cause / fix |
-|---|---|
-| `permission denied ... Docker socket` | `sudo usermod -aG docker $USER` then log out/in (or `newgrp docker`) |
-| `error: linker 'cc' not found` (building CLI) | Missing build tools: `sudo apt install -y build-essential pkg-config libssl-dev` |
-| Agent `[Errno -2] Name or service not known` | `host.docker.internal` is not provided by native Docker. See the Linux note in [Path A](#path-a--docker-only), or set `MCP_GATEWAY_PUBLIC_URL` to the bridge IP |
-| First `cargo` build very slow | Normal — it compiles the whole workspace. Prefer a native clone over a mounted/9p filesystem. |
-### All platforms
-
-| Symptom | Fix |
-|---|---|
-| `failed to connect to Postgres` at startup | Infra is not up yet — run `docker compose up -d` (or `just infra`) and wait for healthy |
-| `docker: command not found` | Docker not installed/running. Install [Docker](https://docs.docker.com/get-docker/). |
-| Dashboard will not load | Verify `docker compose ps` shows `server` as `Up`; open `http://localhost:8080` |
-
-## Project Activity
-
-<div align="center">
-  <table>
-    <tr>
-      <td align="center" valign="middle" style="padding:8px 16px">
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset=".github/shieldcn/star-chart-dark.svg">
-          <img alt="Star history" src=".github/shieldcn/star-chart-light.svg" width="520" />
-        </picture>
-      </td>
-      <td align="center" valign="middle" style="padding:8px 16px">
-        <a href="https://github.com/projnanda/nandatown-oss/issues">
-          <img src="https://shieldcn.dev/chart/github/issues/projnanda/nandatown-oss.svg?theme=blue&width=520&height=220&border=true" alt="Issues over time" />
-        </a>
-      </td>
-    </tr>
-  </table>
-</div>
-
-<br/>
-
-<div align="center">
-  <a href="https://github.com/projnanda/nandatown-oss/stargazers">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=red&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/stars/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=red&font=geist-mono" alt="GitHub stars" />
-    </picture>
-  </a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/projnanda/nandatown-oss/commits">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/commits/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=amber&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/commits/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=amber&font=geist-mono" alt="Total commits" />
-    </picture>
-  </a>
-  &nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/projnanda/nandatown-oss/pulls">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=dark&theme=violet&font=geist-mono" />
-      <img src="https://shieldcn.dev/github/prs/projnanda/nandatown-oss.svg?variant=secondary&mode=light&theme=violet&font=geist-mono" alt="Pull requests" />
-    </picture>
-  </a>
-</div>
-
-## Documentation & Links
-
-- **Official docs** — **[docs.nasiko.com](https://docs.nasiko.com)** — guides, API reference, and concepts
-- **Design docs** — [`docs/`](docs/): architecture, the A2A protocol, agent lifecycle, MCP Gateway internals, CLI design, networking
-- **A2A protocol** — https://github.com/a2aproject/a2a-spec
-- **Rust toolchain** — https://rustup.rs
-- **Docker** — https://docs.docker.com/get-docker/
-- **`just` command runner** — https://github.com/casey/just
-- **`cargo-watch`** (hot-reload) — https://github.com/watchexec/cargo-watch
-- **Versus shields** — https://shieldcn.dev (premium README badges & charts)
-
-## Support
-
-Questions, ideas, or stuck on setup? Join the community on Discord:
-
-**[discord.com/invite/HmnfkTfjFv](https://discord.com/invite/HmnfkTfjFv)**
-
-## Contributing
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for local setup, code conventions, and the PR flow.
-
-## License
-
-**Apache-2.0** — see [`LICENSE`](LICENSE).
-
-<p align="center">
-  <sub>Built with love by the Nandatown team. Stars, issues, and PRs are always welcome.</sub>
-</p>
+Licensed under **Apache-2.0**. See [LICENSE](LICENSE). Stars, issues and PRs are always welcome.

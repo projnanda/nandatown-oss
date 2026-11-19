@@ -34,7 +34,7 @@ describe('What connecting a coding agent sends', () => {
     expect(notice).not.toHaveTextContent(copy.chatHistory.localTitle)
   })
 
-  it('on a Nandatown on this computer: chat history can sync, and the CLI asks first', async () => {
+  it('on a Nasiko on this computer: chat history can sync, and the CLI asks first', async () => {
     as('agents-none')
     renderApp('/harnesses')
     const notice = await within(await card()).findByTestId('chat-history-notice')

@@ -320,7 +320,7 @@ export const copy = {
   agentMcpSubHarness:
     'MCP servers this coding harness may use. Set each tool to allow or block. Approval before a call isn’t available for coding harnesses yet.',
   agentMcpSubLocal:
-    'MCP servers this agent may use from the machine it runs on. Set each tool to allow or block. Approval before a call isn’t available for agents running outside Nandatown yet.',
+    'MCP servers this agent may use from the machine it runs on. Set each tool to allow or block. Approval before a call isn’t available for agents running outside Nasiko yet.',
   noAgentServers: 'No MCP servers available',
   noAgentServersFix: 'Connect servers on the MCP servers page to make their tools available here.',
   openCatalog: 'Open MCP servers',

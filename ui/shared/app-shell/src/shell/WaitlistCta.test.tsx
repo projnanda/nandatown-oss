@@ -62,7 +62,7 @@ describe.skip('waitlist', () => {
 
   it('adds one quiet line under Sign in', async () => {
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
+    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
     const link = screen.getByRole('link', cardLink)
     expect(link).toHaveAttribute('href', env.waitlistUrl)
     expect(link).toHaveAttribute('target', '_blank')

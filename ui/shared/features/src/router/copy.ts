@@ -157,7 +157,7 @@ export const copy = {
   notRoutable: (p: string) =>
     `The router can’t call ${p}: it isn’t built in or a registered custom provider.`,
   registryTitle: 'Models the router picks per tier',
-  registryWayOut: 'Superusers change these with nandatown model-registry set.',
+  registryWayOut: 'Superusers change these with nasiko model-registry set.',
   registryEmpty: 'No tier models set',
   tierLabels: ['Advanced reasoning', 'Balanced', 'Fast responses'] as const,
   catalogFailed: 'Couldn’t load the provider catalog',
@@ -340,7 +340,7 @@ export const copy = {
   // Errors (errors.ts builds the entries)
   errUnmapped: (text: string, status: number) => `Open Runtime said: ${text} (HTTP ${status})`,
   errDown: 'Open Runtime isn’t answering.',
-  errDownFix: 'Check that the server is running, then retry.',
+  errDownFix: 'Check that nasiko-server is running, then retry.',
 } as const
 
 /** Retired forms a copy test bans from this page (plan §2). */

@@ -73,17 +73,18 @@ export const copy = {
   noMatchBody: 'Clear the agent, lane and status filters to see every session in this view.',
   clearFilters: 'Clear filters',
   sparseLive:
-    'Sessions come from chat traffic: run `nandatown chat <agent>` against a deployed agent, or use mock data with `npm run dev`.',
+    'Sessions come from chat traffic: run `nasiko chat <agent>` against a deployed agent, or use mock data with `npm run dev`.',
   noTraceData:
     'No trace data found for these sessions: their agents may not export traces yet, or the sessions were moved here from another workspace, which brings their history but not their trace spans.',
   noTraceDataFix:
-    'Each session still opens on its own page. On a self-hosted server, also check that TEMPO_URL and LOKI_URL are set on the server (README › Live data).',
+    'Each session still opens on its own page. On a self-hosted server, also check that TEMPO_URL and LOKI_URL are set on nasiko-server (README › Live data).',
   noTraceDataLongWindow:
     'Trace details are missing for this window, most likely because the server searches Tempo across all of it and Tempo refuses searches of 7 days or more.',
   noTraceDataLongWindowFix:
     'Open a session to see its trace, or pick 7d. If 7d is empty too, the trace store may be down (README › Live data).',
   notConfigured: "Observability isn't configured on this server.",
-  notConfiguredFix: 'Set TEMPO_URL and LOKI_URL on the server (README › Live data) and restart it.',
+  notConfiguredFix:
+    'Set TEMPO_URL and LOKI_URL on nasiko-server (README › Live data) and restart it.',
   /** A 503 that is not the missing trace store (StateCard.tsx `ErrorState`). */
   unavailable: "This isn't available right now.",
   traceStoreError: 'The trace store returned an error.',
@@ -93,7 +94,7 @@ export const copy = {
   notFoundSession:
     "This session isn't available: it doesn't exist, or it belongs to another user (non-superusers see only their own sessions).",
   serverDown: (apiUrl: string) =>
-    `Is the Nandatown server running at ${apiUrl}? Run \`just run-stack\`.`,
+    `Is nasiko-server running at ${apiUrl}? Run \`just run-stack\` in nasiko-cloud-rs.`,
 
   traceNotFound: 'Trace not found, or not visible to you.',
   traceExpiredTools: 'The full trace has expired. Its tool calls are kept and listed below.',

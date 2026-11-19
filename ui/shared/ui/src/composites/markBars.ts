@@ -1,0 +1,21 @@
+/** The mark's bars in its 64 × 64 box (shared with `PageLoader`, which draws them one by one). */
+export const MARK_BARS = [
+  { x: 0, y: 0, width: 3.2524, height: 54.0487, rx: 0.8853 },
+  { x: 5.5187, y: 0, width: 3.2524, height: 59.0244, rx: 0.8853 },
+  { x: 11.0479, y: 0, width: 3.2524, height: 64, rx: 0.8853 },
+  { x: 16.5666, y: 0, width: 3.2524, height: 64, rx: 0.8853 },
+  { x: 22.0851, y: 0, width: 3.2524, height: 22.9705, rx: 0.8853 },
+  { x: 27.6143, y: 0, width: 3.2524, height: 22.9705, rx: 0.8853 },
+  { x: 33.1329, y: 0, width: 3.2524, height: 28.7024, rx: 0.8853 },
+  { x: 38.6621, y: 0, width: 3.2524, height: 33.2838, rx: 0.8853 },
+  { x: 44.1809, y: 0, width: 3.2524, height: 22.9705, rx: 0.8853 },
+  { x: 49.6995, y: 0, width: 3.2524, height: 22.8959, rx: 0.8853 },
+  { x: 55.2287, y: 4.9755, width: 3.2524, height: 59.0244, rx: 0.8853 },
+  { x: 60.7475, y: 9.951, width: 3.2524, height: 54.0488, rx: 0.8853 },
+  { x: 22.0958, y: 53.8676, width: 3.2524, height: 10.1321, rx: 0.8853 },
+  { x: 27.6249, y: 53.8676, width: 3.2524, height: 10.1321, rx: 0.8853 },
+  { x: 33.1749, y: 43.5546, width: 3.2524, height: 20.4454, rx: 0.8853 },
+  { x: 38.6937, y: 48.1359, width: 3.2524, height: 15.864, rx: 0.8853 },
+  { x: 44.1809, y: 53.8676, width: 3.2524, height: 10.1321, rx: 0.8853 },
+  { x: 49.6995, y: 53.8676, width: 3.2524, height: 10.1321, rx: 0.8853 },
+] as const

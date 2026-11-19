@@ -13,12 +13,12 @@ function StatusPage() {
       <PageHeader title="Backend status" />
       <Card data-tour="status-backend" className="gap-0 p-4 text-sm">
         <div>
-          OSS Nandatown server via the Vite proxy:{' '}
-          <strong data-testid="backend-state">{state}</strong>
+          OSS nasiko-server via the Vite proxy: <strong data-testid="backend-state">{state}</strong>
         </div>
         {health.isError ? (
           <p className="mt-2 text-muted-foreground">
-            Start it with <code>just run-stack</code>, or point the dev proxy's API URL at it.
+            Start it from <code>nasiko-cloud-rs</code> with <code>just run-stack</code>, or point{' '}
+            <code>NASIKO_API_URL</code> at it.
           </p>
         ) : null}
       </Card>

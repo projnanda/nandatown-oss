@@ -14,6 +14,8 @@ import { copy } from '@nasiko/app-core/shell/copy'
 import { activeItem, NAV_GROUPS, NAV_ITEMS } from '@nasiko/app-core/shell/nav'
 import { StaleBuildNotice } from './StaleBuildNotice'
 import { ShellTopBar } from '@nasiko/app-core/shell/TopBar'
+import { AssessmentBanner } from './AssessmentCta'
+import { useAssessmentBanner } from './assessmentBanner'
 import { SidebarPanelContext } from '@nasiko/app-core/shell/panelSlot'
 import { readSidebarCookie } from '@nasiko/app-core/shell/sidebarState'
 
@@ -57,6 +59,9 @@ export function AppShell({
   // Only a user toggle sets `choice`, and the sidebar writes the cookie then, so the default is never stored.
   const [choice, setChoice] = useState(readSidebarCookie)
   const open = choice ?? false
+  const [bannerShown, dismissBanner] = useAssessmentBanner()
+  // Not on the assessment page itself.
+  const banner = bannerShown && pathname !== '/assessment'
   // The drill-in slot (sidebarPanel.ts): the sidebar hands out `target`, a page's SidebarPanel portals into it.
   const [target, setTarget] = useState<HTMLElement | null>(null)
   const [panels, setPanels] = useState(0)
@@ -75,8 +80,7 @@ export function AppShell({
         item={item}
         pathname={pathname}
         bare={bare}
-        // Nandatown shows no assessment banner (AssessmentCta.tsx): it books a call with Nasiko's own team.
-        banner={null}
+        banner={banner ? <AssessmentBanner onDismiss={dismissBanner} /> : null}
       >
         {fullHeight ? (
           <div className="min-h-0 flex-1">
@@ -97,7 +101,11 @@ export function AppShell({
         open={open}
         onOpenChange={setChoice}
         // A bare page has no bar to clear: its sticky rows and anchor jumps go to the top, or under the banner.
-        className={cn(fullHeight ? 'h-dvh' : 'min-h-screen', bare && 'md:[--topbar-h:0px]')}
+        className={cn(
+          fullHeight ? 'h-dvh' : 'min-h-screen',
+          banner && '[--banner-h:2.75rem] [--topbar-h:calc(3.25rem_+_var(--banner-h))]',
+          bare && (banner ? 'md:[--topbar-h:var(--banner-h)]' : 'md:[--topbar-h:0px]'),
+        )}
       >
         {/* A button, not an `#main` link: a fragment navigation would add a history entry and make
           the router reload the route (review: red team). */}
@@ -109,7 +117,8 @@ export function AppShell({
         >
           {copy.skipToContent}
         </Button>
-        <AppSidebar badges={badges} hidden={hidden} />
+        {/* Its assessment row takes over once the banner is dismissed. */}
+        <AppSidebar badges={badges} hidden={hidden} assessment={!bannerShown} />
         {Split ? <Split path={pathname}>{inset}</Split> : inset}
         {end}
       </SidebarProvider>

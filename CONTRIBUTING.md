@@ -1,6 +1,6 @@
-# Contributing to Nandatown
+# Contributing to Nasiko
 
-Thanks for your interest in Nandatown. This guide explains what we accept, how a pull request is
+Thanks for your interest in Nasiko. This guide explains what we accept, how a pull request is
 handled, and the checks a change must pass.
 
 ## Which repo does your change belong in?

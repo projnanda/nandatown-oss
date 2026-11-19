@@ -214,7 +214,7 @@ describe('login error mapping', () => {
     await user.type(await screen.findByLabelText('Username'), 'admin')
     await user.type(screen.getByLabelText('Password'), 'x')
     await user.click(screen.getByRole('button', { name: 'Sign in' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent("Can't reach the Nandatown server")
+    expect(await screen.findByRole('alert')).toHaveTextContent("Can't reach nasiko-server")
     expect(screen.getByRole('alert')).not.toHaveTextContent('took too long')
   })
 
@@ -224,7 +224,7 @@ describe('login error mapping', () => {
     server.use(http.post('/api/auth/login', () => new HttpResponse('bad gateway', { status: 502 })))
     renderApp('/login')
     await user.click(await screen.findByRole('button', { name: 'Sign in' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent("Can't reach the Nandatown server")
+    expect(await screen.findByRole('alert')).toHaveTextContent("Can't reach nasiko-server")
     server.use(http.post('/api/auth/login', () => new HttpResponse('boom', { status: 500 })))
     await user.click(screen.getByRole('button', { name: 'Sign in' }))
     expect(await screen.findByText('Login failed. Check the server logs.')).toBeInTheDocument()
@@ -284,7 +284,7 @@ describe('the failed-logout notice', () => {
     it('a stale ?signout=failed after a newer sign-in shows no notice', async () => {
       // No barrier stored: someone signed in since (the barrier would be '1' otherwise).
       renderApp('/login?signout=failed')
-      await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
+      await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
       expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull()
     })
 
@@ -324,7 +324,7 @@ describe('layout', () => {
   it('keeps the decorative showcase out of the accessibility tree and off narrow screens', async () => {
     configureMocks({ loggedIn: false })
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
+    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
     const panel = screen.getByTestId('login-showcase')
     expect(panel).toHaveAttribute('aria-hidden', 'true')
     expect(panel).toHaveClass('hidden', 'md:flex')
@@ -333,13 +333,13 @@ describe('layout', () => {
     const form = screen.getByLabelText('Username').closest('form')!
     expect(panel.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(panel.querySelector('svg')).not.toBeNull()
-    expect(screen.getAllByRole('img', { name: 'Nandatown' })).toHaveLength(1)
+    expect(screen.getAllByRole('img', { name: 'Nasiko' })).toHaveLength(1)
   })
 
   it('offers no password reset or remember-me the server cannot honour', async () => {
     configureMocks({ loggedIn: false })
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
+    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
     expect(screen.queryByText(/forgot password/i)).toBeNull()
     expect(screen.queryByText(/keep me signed in/i)).toBeNull()
   })
@@ -361,7 +361,7 @@ describe('layout', () => {
   it('has no mode switch: the page follows the stored choice or the system', async () => {
     configureMocks({ loggedIn: false })
     renderApp('/login')
-    await screen.findByRole('heading', { name: 'Sign in to Nandatown' })
+    await screen.findByRole('heading', { name: 'Sign in to Nasiko' })
     expect(screen.queryByRole('radiogroup', { name: 'Mode' })).toBeNull()
   })
 

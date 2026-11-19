@@ -14,6 +14,6 @@ describe('/cli Get started', () => {
       within(start)
         .getAllByRole('code')
         .map((c) => c.textContent),
-    ).toEqual([copy.install.unixCommand, `nandatown connect ${window.location.origin}`])
+    ).toEqual([copy.install.unixCommand, `nasiko connect ${window.location.origin}`])
   })
 })
