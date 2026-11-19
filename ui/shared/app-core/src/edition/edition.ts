@@ -70,6 +70,30 @@ export interface GranteeKind {
   Section: ComponentType<{ agentId: string }>
 }
 
+/**
+ * A tab a layer adds to an agent's detail page. It shows once `query` answers and `shown` agrees with the answer; a
+ * read that fails shows it too, and the tab reports the failure itself. Build it with `agentTab()`, which pairs the
+ * query's data type with `shown`.
+ */
+export interface AgentTab<T = unknown> {
+  /** Its `?tab=` value: unique among the core's tabs and every layer's. */
+  key: string
+  label: string
+  /**
+   * The core tab it follows (e.g. `activity`), after any earlier layer tab that follows it too; the end of the list
+   * when absent or that tab isn't shown.
+   */
+  after?: string
+  /** Whether this viewer may see it at all (the core's manage-only tabs go by `canManage`). */
+  visible: (agent: { canManage: boolean; isHarness: boolean }) => boolean
+  /** Its probe; it gets the agent too, for a layer whose own rule goes beyond `canManage`. */
+  query: (agentId: string, agent: { canManage: boolean; isHarness: boolean }) => SlotQuery<T>
+  shown: (data: T) => boolean
+  Tab: ComponentType<{ agentId: string }>
+}
+
+export const agentTab = <T>(t: AgentTab<T>) => t as unknown as AgentTab
+
 /** Who else an MCP server can be shared with, besides users (EE: org units). */
 interface ConnectorGranteeKind {
   key: string
@@ -80,6 +104,7 @@ interface ConnectorGranteeKind {
 
 /** A section a layer adds to Settings' in-page nav (EE: Single sign-on), at `/settings?section=<key>`. */
 export interface SettingsSection {
+  /** A later layer's section with the same key replaces this one, where it stands. */
   key: string
   label: string
   /** Which nav group it sits in; Security sections come before Secrets. */
@@ -88,19 +113,35 @@ export interface SettingsSection {
   after?: string
   /** Admin-only, like the core's workspace sections. It draws its own page header (its words load with it). */
   Section: ComponentType
+  /** The layer's own check that the section exists on this server; listed once it answers true. Always listed when absent. */
+  available?: (userId: string) => SlotQuery<boolean>
 }
 
 /**
- * A layer's own personal (non-admin) settings row, e.g. EE's memory L2-proxy-consent toggle. Unlike
+ * A layer's own personal (non-admin) settings row. Unlike
  * `SettingsSection` — which renders at `/settings?section=<key>`, a page the core redirects every non-superuser
  * away from — this is a plain nav link to the layer's own dedicated route (its own file under `routes/_app/`,
  * same as the core's Chat context), so every user, admin or not, can reach it. Placed in the Security group,
- * after Chat context: a data/recall preference, the same bucket as that one, not an Account (UI/auth) one.
+ * after Chat context: a data preference, the same bucket as that one, not an Account (UI/auth) one.
  */
 export interface PersonalSettingsLink {
   key: string
   label: string
-  /** The layer's own route, e.g. `/settings/memory` — not `/settings?section=`. */
+  /** The layer's own route, e.g. `/settings/<name>` — not `/settings?section=`. */
+  to: string
+  /**
+   * Its nav group: Security (after Secrets) when absent. Workspace puts it after the admin's sections, and shows the
+   * group to a member for it (MT: the Free plan's admin-only Registry and MCP toolkits, which say so).
+   */
+  group?: 'workspace' | 'security'
+  /** The layer's own check that the page exists on this server; the link is listed once it answers true. */
+  available?: (userId: string) => SlotQuery<boolean>
+}
+
+/** A tab a layer adds to Access control, after the edition's own (MT: Invites). Its page is the layer's own route. */
+export interface AccessSection {
+  label: string
+  /** The layer's own route, e.g. `/access/invites`; it frames itself as an Access control page. */
   to: string
 }
 
@@ -122,7 +163,7 @@ export interface OrgUnitFilterProps {
 }
 
 /**
- * The product tour of a layer's own pages (EE: Access control). Matched after the core's pages; its steps load only
+ * The product tour of a layer's own pages (EE: Access control). Matched before the core's pages; its steps load only
  * when it opens, so a layer's tour text stays out of its shell.
  */
 export interface LayerTour {
@@ -142,19 +183,6 @@ export interface LayerTour {
  * Every member is a hook or a component, and the OSS answer (`NO_BUDGETS`) is a real implementation returning
  * "off", not `null`: the core calls these unconditionally, so a nullable slot would make them conditional hooks.
  */
-export type BudgetCrossing = { kind: 'reached' } | { kind: 'crosses'; date: string }
-
-/** One budget's use this period, as the home's table cell and the hub read it. */
-export interface RowBudget {
-  used: number
-  limit: number
-  /** When the period resets (ISO), for the month name. */
-  resetsAt: string
-  /** Calls with no price this period: counted as $0, so use is a floor. */
-  unpriced: boolean
-  crossing: BudgetCrossing | null
-}
-
 /** A budget that needs the viewer, as a Needs you row. */
 export interface BudgetItem {
   id: string
@@ -177,20 +205,6 @@ export interface BudgetItem {
   covers: 'routed_calls' | 'all_priced'
 }
 
-/** Where budgets stand on this server: `off` covers both "no layer" and "this server has none" (a bare 404). */
-export type BudgetsState = 'off' | 'loading' | 'failed' | 'stale' | 'ok'
-
-export interface HomeBudgets {
-  state: BudgetsState
-  /** Agent budgets by agent id; null until both reads answered. */
-  byAgent: ReadonlyMap<string, RowBudget> | null
-  /** The viewer's own monthly budget, when they set one. */
-  own: RowBudget | null
-  updatedAt: number
-  /** Mock data (a preview of the contract): the page labels it so. */
-  preview: boolean
-}
-
 /** What the Overview's fleet-health rating needs from budgets: a stopped or exceeded budget is an agent's reason. */
 export interface OverviewBudgets {
   byAgent: ReadonlyMap<string, { stopped: boolean; exceeded: boolean }>
@@ -209,6 +223,18 @@ export type BudgetSource<T> =
   | { state: 'failed' }
   | { state: 'ok'; value: T; incomplete?: boolean }
 
+/** One section a layer adds to an agent's Settings tab. */
+export interface AgentSettingsSection {
+  key: string
+  Section: ComponentType<{ agent: AgentSettingsRef }>
+}
+
+/** The agent an `agentSettingsSections` entry renders for. */
+export interface AgentSettingsRef {
+  id: string
+  name: string
+}
+
 /** The fields the hub's Budget section needs; the core passes them rather than its own `AgentView`. */
 export interface HubBudgetAgent {
   id: string
@@ -218,8 +244,6 @@ export interface HubBudgetAgent {
 }
 
 export interface BudgetsSurface {
-  /** The home's budget column and the viewer's own budget. */
-  useHomeBudgets: (enabled: boolean, meSub: string) => HomeBudgets
   /** The Overview's rating inputs. */
   useOverviewBudgets: (enabled: boolean) => OverviewBudgets
   /** Needs you's budget rows. */
@@ -299,6 +323,14 @@ export interface BudgetsSurface {
     /** The page's other reads have settled, so `#router-budgets` can scroll to its final position. */
     pageReady: boolean
   }> | null
+  /**
+   * Whether this viewer is refused the whole budgets surface outright — a plan decision, not a role one (MT: the
+   * shared Free plane, where nobody is ever an org admin, so nobody could ever satisfy the owner-budget write rule).
+   * `/budgets` shows `BlockedPage` instead of the real page when this is true; EE and OSS never block.
+   */
+  useBlocked: () => boolean
+  /** What `/budgets` shows instead, while `useBlocked` is true. `null` where nothing ever blocks (EE, OSS). */
+  BlockedPage: ComponentType | null
 }
 
 const NO_BUDGET_SOURCE = { state: 'absent' } as const
@@ -308,7 +340,6 @@ const NO_LEDGER_BUDGETS = { shares: null, headline: null, panel: null }
 const NO_RETRY = () => {}
 /** The OSS answer: budgets do not exist in this build, so every surface is off and nothing is ever read. */
 export const NO_BUDGETS: BudgetsSurface = {
-  useHomeBudgets: () => ({ state: 'off', byAgent: null, own: null, updatedAt: 0, preview: false }),
   useOverviewBudgets: () => ({
     byAgent: new Map(),
     settled: true,
@@ -327,6 +358,8 @@ export const NO_BUDGETS: BudgetsSurface = {
   useRouterTab: () => false,
   RouterTab: null,
   FirstRunStrip: null,
+  useBlocked: () => false,
+  BlockedPage: null,
 }
 
 /** Every slot has an OSS fallback in the core; a slot is added in the PR whose layer first fills it. */
@@ -337,15 +370,25 @@ export interface ChatRefusal {
   action: string
   /** The server's own words, shown under Details in place of the raw failure text. */
   detail: string
+  /** Running again may work (the agent wasn't ready yet), so the card offers it. */
+  retry?: boolean
 }
 
 export interface Slots {
   harnessOrgScope: HarnessOrgScope | null
   homeOrgScope: HomeOrgScope | null
   granteeKinds: GranteeKind[]
+  /** Tabs a layer adds to an agent's detail page. */
+  agentTabs: AgentTab[]
   connectorGranteeKinds: ConnectorGranteeKind[]
   settingsSections: SettingsSection[]
   personalSettingsLinks: PersonalSettingsLink[]
+  /**
+   * Sections a layer adds to an agent's Settings tab (managers only, after Token optimization; EE: Memory recall).
+   * A section decides for itself who sees it and renders nothing otherwise. Not shown for coding harnesses, which
+   * have no Settings tab.
+   */
+  agentSettingsSections: AgentSettingsSection[]
   loginMethods: ComponentType<LoginMethodsProps> | null
   /** /login's username and password form. false when an edition signs in only through `loginMethods`. */
   passwordSignIn: boolean
@@ -357,6 +400,24 @@ export interface Slots {
    * item), which shrinks to its icon in the rail.
    */
   sidebarBrand: ComponentType | null
+  /**
+   * A layer's card at the end of the sidebar's scrolling nav (MT: the plan), at the bottom while the nav fits. Hidden
+   * while a page's panel holds the sidebar; it draws its own collapsed-rail form.
+   */
+  sidebarCard: ComponentType | null
+  /**
+   * A layer's notices above the top bar on every page (MT: the plan's trial, grace and balance banners, and what a
+   * 402 Payment Required means, from `paymentRequired.ts`).
+   */
+  shellNotice: ComponentType | null
+  /**
+   * Agents say where they run (MT: Local for a coding harness on a member's machine, Cloud for the rest), and the
+   * Agents catalog lists the local ones by default, so an admin sees the whole fleet in one view (TM-5, FR-4).
+   */
+  agentPlacement: boolean
+  /** Takes "Create user"'s place on Access control → Users (MT: a way to its Invites tab, where people are invited). */
+  userInvites: ComponentType | null
+  accessSections: AccessSection[]
   shellEnd: ComponentType<{ path: string }> | null
   /**
    * Wraps the page in a split with a panel of its own. While the panel shows beside the page, it sets
@@ -381,10 +442,18 @@ export interface Slots {
   /** Budgets (Enterprise only). `NO_BUDGETS` in an OSS build: every surface off, nothing read. */
   budgets: BudgetsSurface
   /**
-   * Reads a failed chat turn's text for a refusal that running again won't fix (EE: a budget stop). Recognised, the
-   * card shows these words with no Run again and no agent logs. OSS: none, every failure is the generic one.
+   * Reads a failed chat turn's text, or the server's words for a turn it couldn't start, for a refusal the layer
+   * knows (EE: a budget stop, which running again won't fix). Recognised, the card shows these words, with no Run
+   * again and no agent logs unless the refusal says running again may work. OSS: none, every failure is the generic
+   * one.
    */
   chatRefusal: ((detail: string) => ChatRefusal | null) | null
+  /**
+   * Whether the setup guide offers its Starter pack tab: a layer that knows the workspace's plan answers it (the MT
+   * layer offers it on the Free plan only, so an upgraded workspace starts clean and brings its own agents). Null: the
+   * tab is always offered.
+   */
+  starterPack: StarterPack | null
 }
 
 export interface BudgetsOrgRoleOf {
@@ -420,19 +489,42 @@ export interface NavHidden<T = unknown> {
 
 export const navHidden = <T>(n: NavHidden<T>) => n as NavHidden
 
+/** The setup guide's Starter pack tab, offered by `offered(data)` once `query` has answered (`Slots.starterPack`). */
+export interface StarterPack<T = unknown> {
+  query: SlotQuery<T>
+  /** `data` is undefined when the read failed: the layer decides what that means. */
+  offered: (data: T | undefined) => boolean
+  /** A note at the top of the tab, such as what the plan includes for these agents; none without it. */
+  note?: string
+  /**
+   * Where the pack is offered, what the Deploy page's model-key notice says in place of its own line, such as what the
+   * plan includes for the agents a user deploys; without it the notice keeps its line.
+   */
+  deployNote?: string
+}
+
+export const starterPack = <T>(s: StarterPack<T>) => s as unknown as StarterPack
+
 /** The core's answer for every slot: an OSS build renders exactly this. */
 export const OSS_SLOTS: Slots = {
   harnessOrgScope: null,
   homeOrgScope: null,
   granteeKinds: [],
+  agentTabs: [],
   connectorGranteeKinds: [],
   settingsSections: [],
   personalSettingsLinks: [],
+  agentSettingsSections: [],
   loginMethods: null,
   passwordSignIn: true,
   tokenopsOrgUnitFilter: null,
   topbarStart: null,
   sidebarBrand: null,
+  sidebarCard: null,
+  shellNotice: null,
+  agentPlacement: false,
+  userInvites: null,
+  accessSections: [],
   shellEnd: null,
   shellSplit: null,
   optimizationWorkspace: null,
@@ -441,6 +533,7 @@ export const OSS_SLOTS: Slots = {
   budgetsOrgRole: null,
   budgets: NO_BUDGETS,
   chatRefusal: null,
+  starterPack: null,
 }
 
 /** A layer's own sidebar item: any path its routes serve. */
@@ -470,20 +563,34 @@ export function resolveSlots(layers: readonly EditionLayer[]): Slots {
   const out: Slots = {
     ...OSS_SLOTS,
     granteeKinds: [],
+    agentTabs: [],
     connectorGranteeKinds: [],
     settingsSections: [],
     personalSettingsLinks: [],
+    agentSettingsSections: [],
+    accessSections: [],
     tours: [],
   }
   for (const layer of layers) {
     const s = layer.slots ?? {}
     if (s.granteeKinds) out.granteeKinds = [...out.granteeKinds, ...s.granteeKinds]
+    if (s.agentTabs) out.agentTabs = [...out.agentTabs, ...s.agentTabs]
     if (s.connectorGranteeKinds)
       out.connectorGranteeKinds = [...out.connectorGranteeKinds, ...s.connectorGranteeKinds]
-    if (s.settingsSections) out.settingsSections = [...out.settingsSections, ...s.settingsSections]
+    if (s.settingsSections) {
+      // A later layer's section with an earlier one's key takes its place, where it stood.
+      const own = s.settingsSections
+      out.settingsSections = [
+        ...out.settingsSections.map((x) => own.find((y) => y.key === x.key) ?? x),
+        ...own.filter((y) => !out.settingsSections.some((x) => x.key === y.key)),
+      ]
+    }
     if (s.personalSettingsLinks)
       out.personalSettingsLinks = [...out.personalSettingsLinks, ...s.personalSettingsLinks]
+    if (s.agentSettingsSections)
+      out.agentSettingsSections = [...out.agentSettingsSections, ...s.agentSettingsSections]
     if (s.tours) out.tours = [...out.tours, ...s.tours]
+    if (s.accessSections) out.accessSections = [...out.accessSections, ...s.accessSections]
     if (s.harnessOrgScope !== undefined) out.harnessOrgScope = s.harnessOrgScope
     if (s.loginMethods !== undefined) out.loginMethods = s.loginMethods
     if (s.passwordSignIn !== undefined) out.passwordSignIn = s.passwordSignIn
@@ -491,6 +598,10 @@ export function resolveSlots(layers: readonly EditionLayer[]): Slots {
     if (s.tokenopsOrgUnitFilter !== undefined) out.tokenopsOrgUnitFilter = s.tokenopsOrgUnitFilter
     if (s.topbarStart !== undefined) out.topbarStart = s.topbarStart
     if (s.sidebarBrand !== undefined) out.sidebarBrand = s.sidebarBrand
+    if (s.sidebarCard !== undefined) out.sidebarCard = s.sidebarCard
+    if (s.shellNotice !== undefined) out.shellNotice = s.shellNotice
+    if (s.agentPlacement !== undefined) out.agentPlacement = s.agentPlacement
+    if (s.userInvites !== undefined) out.userInvites = s.userInvites
     if (s.shellEnd !== undefined) out.shellEnd = s.shellEnd
     if (s.shellSplit !== undefined) out.shellSplit = s.shellSplit
     if (s.optimizationWorkspace !== undefined) out.optimizationWorkspace = s.optimizationWorkspace
@@ -498,6 +609,7 @@ export function resolveSlots(layers: readonly EditionLayer[]): Slots {
     if (s.budgetsOrgRole !== undefined) out.budgetsOrgRole = s.budgetsOrgRole
     if (s.budgets !== undefined) out.budgets = s.budgets
     if (s.chatRefusal !== undefined) out.chatRefusal = s.chatRefusal
+    if (s.starterPack !== undefined) out.starterPack = s.starterPack
   }
   return out
 }

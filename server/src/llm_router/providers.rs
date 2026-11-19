@@ -195,6 +195,14 @@ fn group_by_provider(
     custom_labels: &std::collections::HashSet<String>,
     custom_meta: &std::collections::HashMap<String, (uuid::Uuid, String)>,
 ) -> Vec<ProviderCatalog> {
+    // A built-in whose own listing has synced (any served row) is authoritative too:
+    // price-only names (`gemini-4-argon-lte-128k`, retired 1.5 seeds) are dropped. A
+    // built-in with no listing yet keeps the union so the dropdown is never empty.
+    let listed: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|r| r.served)
+        .map(|r| normalize_provider(&r.provider).to_owned())
+        .collect();
     let mut out: Vec<ProviderCatalog> = Vec::new();
     for row in rows {
         let provider = normalize_provider(&row.provider).to_owned();
@@ -205,7 +213,7 @@ fn group_by_provider(
         // A custom provider's own listing is the whole truth (see the module doc): drop a
         // model only a price book claims. Built-ins keep the union — that is what carries
         // Gemini, which is priced but whose listing shape the catalog sync cannot read.
-        if custom_labels.contains(&provider) && !row.served {
+        if (custom_labels.contains(&provider) || listed.contains(&provider)) && !row.served {
             continue;
         }
         let input = row.input_price_per_1m.and_then(|d| d.to_f64());
@@ -224,7 +232,12 @@ fn group_by_provider(
             effective_until: row.effective_until,
         };
         if let Some(group) = out.iter_mut().find(|g| g.provider == provider) {
-            group.models.push(entry);
+            // A model priced under both a legacy and a canonical name (`google` and `gemini`)
+            // lands in the same group twice; keep the first. `ORDER BY provider` puts the
+            // canonical `gemini` row ahead of `google`, so its price is the one shown.
+            if !group.models.iter().any(|m| m.model == entry.model) {
+                group.models.push(entry);
+            }
         } else {
             let (provider_id, display_name) = custom_meta
                 .get(&provider)
@@ -324,6 +337,26 @@ mod tests {
         );
     }
 
+    /// Q3-7: a model priced under both `gemini` and the legacy `google` is listed once, with
+    /// the `gemini` row's price (the query's order puts it first).
+    #[test]
+    fn model_priced_under_legacy_and_canonical_name_is_listed_once() {
+        let (labels, meta) = custom(&[]);
+        let mut legacy = priced("google", "gemini-2.0-flash", false);
+        legacy.input_price_per_1m = Some(Decimal::new(9, 0));
+        let rows = vec![
+            priced("gemini", "gemini-2.0-flash", false),
+            priced("gemini", "gemini-2.5-pro", false),
+            legacy,
+        ];
+        let groups = group_by_provider(rows, &labels, &meta);
+        assert_eq!(
+            models_of(&groups, "gemini"),
+            vec!["gemini-2.0-flash", "gemini-2.5-pro"]
+        );
+        assert_eq!(groups[0].models[0].input_price_per_1m, Some(1.0));
+    }
+
     /// A custom provider's served model stays even when nothing prices it — the common
     /// case for Azure, whose deployment nicknames no price book can match.
     #[test]
@@ -351,6 +384,21 @@ mod tests {
         assert_eq!(
             models_of(&group_by_provider(rows, &labels, &meta), "deepseek"),
             vec!["deepseek-chat"]
+        );
+    }
+
+    /// Once Gemini's ListModels has synced, price-only names are dropped.
+    #[test]
+    fn builtin_with_listing_drops_price_only_models() {
+        let (labels, meta) = custom(&[]);
+        let rows = vec![
+            unpriced("gemini", "gemini-4-argon"),
+            priced("gemini", "gemini-4-argon-lte-128k", false),
+            priced("gemini", "gemini-1.5-pro", false),
+        ];
+        assert_eq!(
+            models_of(&group_by_provider(rows, &labels, &meta), "gemini"),
+            vec!["gemini-4-argon"]
         );
     }
 

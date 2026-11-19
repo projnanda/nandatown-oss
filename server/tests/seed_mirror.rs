@@ -195,7 +195,7 @@ async fn start_registry_with_realm(realm: Option<String>) -> Shared {
 
 async fn oci_state(server: &common::TestServer) -> nasiko_oci::OciState {
     let storage = nasiko_oci::storage::S3Storage::from_env("nasiko-test-artifacts".into()).await;
-    nasiko_oci::OciState::new(server.db.clone(), Arc::new(storage))
+    nasiko_oci::OciState::new(server.db.clone(), Arc::new(storage), String::new())
 }
 
 fn settings(credential_host: &str, password: &str) -> MirrorSettings {
@@ -371,7 +371,7 @@ async fn credential_is_never_sent_to_a_token_realm_on_another_host() {
 /// Opt-in check against a **real** registry (skipped by default and in CI):
 ///
 /// ```sh
-/// SEED_MIRROR_LIVE_IMAGE=akhilfolium/infra-agent:latest \
+/// SEED_MIRROR_LIVE_IMAGE=<user>/<image>:<tag> \
 ///   cargo test -p nasiko-server --test seed_mirror -- --ignored live_registry
 /// # private registries also take:
 /// #   SEED_MIRROR_LIVE_HOST=<bare host, empty = Docker Hub>

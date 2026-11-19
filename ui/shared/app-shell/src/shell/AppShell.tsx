@@ -15,7 +15,7 @@ import { activeItem, NAV_GROUPS, NAV_ITEMS } from '@nasiko/app-core/shell/nav'
 import { StaleBuildNotice } from './StaleBuildNotice'
 import { ShellTopBar } from '@nasiko/app-core/shell/TopBar'
 import { SidebarPanelContext } from '@nasiko/app-core/shell/panelSlot'
-import { widthDefaultOpen, readSidebarCookie } from '@nasiko/app-core/shell/sidebarState'
+import { readSidebarCookie } from '@nasiko/app-core/shell/sidebarState'
 
 /** Chat, Settings and Account own their scrolling (their section column stays put): the page fills the viewport (plan §7.1, EN20). */
 const FULL_HEIGHT = /^\/(chat|settings|account)(\/|$)/
@@ -41,7 +41,9 @@ export function AppShell({
   const pathname = useRouterState({ select: (s) => s.location.pathname })
   const fullHeight = FULL_HEIGHT.test(pathname)
   // The top bar's start: the page's nav group and item, layer patches applied (as the sidebar does).
-  const active = activeItem(pathname, applyNav(NAV_ITEMS, use(EditionContext).edition.layers))
+  const { edition, slots } = use(EditionContext)
+  const active = activeItem(pathname, applyNav(NAV_ITEMS, edition.layers))
+  const Notice = slots.shellNotice
   const item = active
     ? {
         to: active.to,
@@ -51,26 +53,38 @@ export function AppShell({
     : null
   // Overview and New chat have no bar on desktop (user, 2026-10-08): nothing to place, nowhere to step.
   const bare = BARE.test(pathname)
-  // Controlled (v1c E1): the cookie wins; with none, the width default. Chat used to start as the icon rail so its
-  // history column fit beside the nav; its history is the sidebar's drill-in panel now, so it needs the open sidebar.
+  // Controlled (v1c E1): the cookie wins; with none, the icon rail (user request 2026-11-05: collapsed on sign-in).
   // Only a user toggle sets `choice`, and the sidebar writes the cookie then, so the default is never stored.
   const [choice, setChoice] = useState(readSidebarCookie)
-  const [widthDefault] = useState(widthDefaultOpen)
-  const open = choice ?? widthDefault
+  const open = choice ?? false
   // The drill-in slot (sidebarPanel.ts): the sidebar hands out `target`, a page's SidebarPanel portals into it.
   const [target, setTarget] = useState<HTMLElement | null>(null)
   const [panels, setPanels] = useState(0)
   const inset = (
-    <SidebarInset id="main" tabIndex={-1} className={cn('outline-none', fullHeight && 'min-h-0')}>
+    // min-w-0: a flex item never shrinks below its content, so one wide row (the trace switcher's toggles) pushed
+    // the whole page, top bar included, past the window by the sidebar's width; that row scrolls on its own (NAS-1609).
+    <SidebarInset
+      id="main"
+      tabIndex={-1}
+      className={cn('min-w-0 outline-none', fullHeight && 'min-h-0')}
+    >
       <StaleBuildNotice />
+      {Notice ? <Notice /> : null}
       {/* One bar above every page (TopBar.tsx); on phones it also holds the menu button (§4.2). */}
-      <ShellTopBar item={item} pathname={pathname} bare={bare}>
+      <ShellTopBar
+        item={item}
+        pathname={pathname}
+        bare={bare}
+        // Nandatown shows no assessment banner (AssessmentCta.tsx): it books a call with Nasiko's own team.
+        banner={null}
+      >
         {fullHeight ? (
           <div className="min-h-0 flex-1">
             <Outlet />
           </div>
         ) : (
-          <div className="mx-auto w-full max-w-page px-4 py-4">
+          // `--float-clearance`: room a layer's floating control asks the page to leave at its foot.
+          <div className="mx-auto w-full max-w-page px-4 pt-4 pb-[calc(1rem+var(--float-clearance,0px))]">
             <Outlet />
           </div>
         )}
@@ -82,7 +96,7 @@ export function AppShell({
       <SidebarProvider
         open={open}
         onOpenChange={setChoice}
-        // A bare page has no bar to clear: its sticky rows and anchor jumps go to the top.
+        // A bare page has no bar to clear: its sticky rows and anchor jumps go to the top, or under the banner.
         className={cn(fullHeight ? 'h-dvh' : 'min-h-screen', bare && 'md:[--topbar-h:0px]')}
       >
         {/* A button, not an `#main` link: a fragment navigation would add a history entry and make

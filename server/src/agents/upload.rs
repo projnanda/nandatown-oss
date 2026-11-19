@@ -19,12 +19,13 @@ use uuid::Uuid;
 
 use nasiko_runtime::DeploymentStatus;
 
+use crate::agent_scaling::{ParkingPolicy, save_parking_policy};
 use crate::auth::Claims;
 use crate::build::routes::extract_zip_from_file;
 use crate::build::{self, BuildStatus};
 use crate::state::AppState;
 
-use super::utils::{set_build_status, set_upload_status};
+use super::utils::{set_build_status, set_upload_status, store_build_logs};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -101,6 +102,15 @@ pub(crate) struct UploadAndDeployForm {
     /// existing agent's stored kind (`agent` for a new agent) — the CLI only
     /// sends it when `--coding-agent` (or an AgentCard `workloadKind`) applies.
     workload_kind: Option<String>,
+    /// `auto` (default: the platform parks the agent when idle) | `resident` (always
+    /// running). Omit to keep an existing agent's stored policy.
+    parking_policy: Option<String>,
+    /// `"true"`/`"false"` — human-in-the-loop approval for a coding agent's tool
+    /// use. Tri-state like `writable`: omit to take the default for the kind on a
+    /// new agent (ON for `acp_coding_agent`, OFF otherwise) and to keep an existing
+    /// agent's stored setting — the CLI only sends it when `--hitl`/`--no-hitl`
+    /// was passed.
+    hitl: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema, sqlx::FromRow)]
@@ -353,7 +363,7 @@ const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB
     request_body(content = UploadAndDeployForm, content_type = "multipart/form-data"),
     responses(
         (status = 202, description = "Build queued", body = UploadAndDeployResponse),
-        (status = 400, description = "Missing/invalid name, version_tag, or source zip"),
+        (status = 400, description = "Missing/invalid name, version_tag, parking_policy, or source zip"),
         (status = 413, description = "Upload exceeds 100 MiB limit"),
     ),
 )]
@@ -389,6 +399,14 @@ pub(crate) async fn upload_and_deploy(
     // `writable`: None = keep the stored kind (`agent` for a new agent), so a
     // plain re-upload never silently demotes a coding agent back to HTTP.
     let mut workload_kind: Option<String> = None;
+    // `auto`/`resident`. Tri-state like `writable`: None = keep the stored policy (`auto`
+    // for a new agent).
+    let mut parking_policy: Option<String> = None;
+    // Human-in-the-loop approval for a coding agent. Tri-state like `writable`:
+    // None = take the kind's default on a new agent (on for a coding agent, off
+    // otherwise) and keep the stored value on a re-upload. The CLI only sends it
+    // when `--hitl`/`--no-hitl` was passed.
+    let mut hitl: Option<bool> = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name().unwrap_or("") {
@@ -409,6 +427,16 @@ pub(crate) async fn upload_and_deploy(
             }
             "workload_kind" => {
                 workload_kind = field.text().await.ok().filter(|s| !s.is_empty());
+            }
+            "parking_policy" => parking_policy = field.text().await.ok(),
+            "hitl" => {
+                // Tri-state like `writable`: only an explicit true/false counts;
+                // anything else is "not specified".
+                hitl = match field.text().await.ok().as_deref() {
+                    Some("true") => Some(true),
+                    Some("false") => Some(false),
+                    _ => None,
+                };
             }
             "source" | "file" => {
                 use crate::multipart_util::{StreamUploadError, stream_field_to_fresh_temp_file};
@@ -500,6 +528,10 @@ pub(crate) async fn upload_and_deploy(
             }
         },
     };
+    let parking_policy = match ParkingPolicy::from_request_field(parking_policy.as_deref()) {
+        Ok(policy) => policy,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
 
     // Validate name charset (RUN-10): flows into the OCI image reference.
     if let Err(e) = crate::build::routes::validate_version_tag(&name) {
@@ -561,8 +593,28 @@ pub(crate) async fn upload_and_deploy(
         }
     };
 
-    let image_tag =
-        crate::agents::build_image_tag(&state.config.agent_image_registry, &name, &version_tag);
+    let image_tag = crate::agents::build_image_tag(
+        &state.config.agent_image_registry,
+        owner_id,
+        &name,
+        &version_tag,
+    );
+
+    // Validate image namespace before persisting
+    if let Err((code, msg)) = crate::agents::validate_image_ref(
+        &state.db,
+        &state.config.agent_image_registry,
+        &state.config.agent_image_registry_aliases,
+        &image_tag,
+        owner_id,
+        false, // Non-superusers validated here; superusers skip this path via deployer gate
+    )
+    .await
+    {
+        let _ = tokio::fs::remove_dir_all(zip_path.parent().unwrap_or(&zip_path)).await;
+        return (code, msg).into_response();
+    }
+
     // Empty → canonical default is applied by build_agent_spec (8000, matching the
     // agent images' EXPOSE); never default to 5000 here.
 
@@ -580,7 +632,17 @@ pub(crate) async fn upload_and_deploy(
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
-    let ports = if ports.is_empty() { vec![8000] } else { ports };
+    let ports = if ports.is_empty() {
+        vec![crate::agents::DEFAULT_AGENT_PORT]
+    } else {
+        ports
+    };
+
+    // Asked in the transaction that inserts, so a limit on agents is counted under its own lock.
+    if let Err(refusal) = state.agent_admission.admit(&mut tx, owner_id, &name).await {
+        let _ = tokio::fs::remove_dir_all(zip_path.parent().unwrap_or(&zip_path)).await;
+        return refusal.into_response();
+    }
 
     // Atomic INSERT ... ON CONFLICT against the (owner_id, name) partial unique
     // index (migration 015) — closes the SELECT-then-INSERT TOCTOU that let two
@@ -595,17 +657,26 @@ pub(crate) async fn upload_and_deploy(
     // back the effective values so the deploy uses the DB's truth. (There is
     // deliberately no way to clear a stored writable_path back to NULL here —
     // pass an explicit new path instead; clearing would move the mount.)
+    // HITL default for a NEW agent follows the resolved kind: on for a coding
+    // agent, off otherwise (mirrors `push`/`deploy`, whose CLI sends HITL on by
+    // default for `--coding-agent`). A caller-sent value ($9) always wins; None
+    // takes this default on insert and keeps the stored value on conflict. The
+    // kind is `COALESCE($8, 'agent')` for a new row, so a plain upload declaring
+    // `workloadKind: acp_coding_agent` in its card gets HITL too, not just `--coding-agent`.
+    let hitl_default_new = workload_kind.as_deref() == Some("acp_coding_agent");
     let (agent_id, writable, writable_path, workload_kind) = {
         match sqlx::query_as::<_, (Uuid, bool, Option<String>, String)>(
-            "INSERT INTO agents (name, owner_id, version, image, status, inbound_format, writable, writable_path, workload_kind) \
-             VALUES ($1, $2, $3, $4, 'deploying', $5, COALESCE($6, false), $7, COALESCE($8, 'agent')) \
+            "INSERT INTO agents (name, owner_id, version, image, status, inbound_format, writable, writable_path, workload_kind, hitl_enabled) \
+             VALUES ($1, $2, $3, $4, 'deploying', $5, COALESCE($6, false), $7, COALESCE($8, 'agent'), COALESCE($9, $10)) \
              ON CONFLICT (owner_id, name) WHERE deleted_at IS NULL \
              DO UPDATE SET version = EXCLUDED.version, image = EXCLUDED.image, \
                            inbound_format = EXCLUDED.inbound_format, \
                            writable = COALESCE($6, agents.writable), \
                            writable_path = COALESCE($7, agents.writable_path), \
                            workload_kind = COALESCE($8, agents.workload_kind), \
+                           hitl_enabled = COALESCE($9, agents.hitl_enabled), \
                            status = 'deploying', updated_at = now() \
+             WHERE agents.workload_kind <> 'harness' \
              RETURNING id, writable, writable_path, workload_kind",
         )
         .bind(&name)
@@ -616,10 +687,18 @@ pub(crate) async fn upload_and_deploy(
         .bind(writable)
         .bind(&writable_path)
         .bind(&workload_kind)
-        .fetch_one(&mut *tx)
+        .bind(hitl)
+        .bind(hitl_default_new)
+        .fetch_optional(&mut *tx)
         .await
         {
-            Ok(row) => row,
+            Ok(Some(row)) => row,
+            // The name is the caller's harness agent, which only the platform deploys.
+            Ok(None) => {
+                let _ = tokio::fs::remove_dir_all(zip_path.parent().unwrap_or(&zip_path)).await;
+                return (StatusCode::CONFLICT, crate::agents::HARNESS_AGENT_MANAGED)
+                    .into_response();
+            }
             Err(e) => {
                 tracing::error!(%e, agent_name = %name, "upload: register agent db error");
                 let _ = tokio::fs::remove_dir_all(zip_path.parent().unwrap_or(&zip_path)).await;
@@ -627,6 +706,14 @@ pub(crate) async fn upload_and_deploy(
             }
         }
     };
+    // Stored before the build is queued: the worker's deploy reads it from the row.
+    if let Some(policy) = parking_policy
+        && let Err(e) = save_parking_policy(&mut *tx, agent_id, policy).await
+    {
+        tracing::error!(%e, %agent_id, "upload: save parking policy db error");
+        let _ = tokio::fs::remove_dir_all(zip_path.parent().unwrap_or(&zip_path)).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
 
     // Reject a version already recorded in this agent's history — otherwise the
     // post-build write (below) silently overwrites that row via `ON CONFLICT`,
@@ -1002,6 +1089,8 @@ pub async fn execute_upload_and_deploy(
 
     let tmp_dir = std::env::temp_dir().join(format!("nasiko-agent-{build_id}"));
 
+    // The image build's captured output, filled once the build runs so the Builds tab can show it.
+    let mut build_logs = String::new();
     let result: Result<DeploymentStatus, String> = async {
         // Extract zip (with guards — re-run here so the worker is self-contained).
         let zp = zip_path.clone();
@@ -1027,10 +1116,11 @@ pub async fn execute_upload_and_deploy(
             .await
             .map_err(|e| format!("spawn_blocking tar: {e}"))?
             .map_err(|e| format!("tar source: {e}"))?;
-        runtime
+        build_logs = runtime
             .build(&tar_bytes, &image_tag)
             .await
-            .map_err(|e| format!("docker build: {e}"))?;
+            .map_err(|e| format!("docker build: {e}"))?
+            .logs;
 
         set_upload_status(
             db,
@@ -1045,16 +1135,16 @@ pub async fn execute_upload_and_deploy(
 
         // Read before the deploy env is built: a failed read must not rotate the running
         // agent's credentials or reset its state mode for a deploy that never happens.
-        let replica_bounds = scaling
-            .bounds()
+        let plan = scaling
+            .plan()
             .await
-            .map_err(|e| format!("read replica bounds: {e}"))?;
+            .map_err(|e| format!("read the deploy plan: {e}"))?;
         // Minted only now that the image exists: this rotates the agent's gateway and state
         // credentials, and a build that failed must leave the running pods' credentials alone.
         // Nothing below can fail before `scaling.deploy` (spec building and the pull
         // credential attach are infallible; the latter logs its errors), so the durable state
         // mode the build above may have reset needs no restoring on an early exit.
-        let mut env = crate::agents::deploy_env::build(
+        let env = crate::agents::deploy_env::build(
             state,
             agent_id,
             owner_id,
@@ -1062,14 +1152,6 @@ pub async fn execute_upload_and_deploy(
             crate::agents::deploy_env::StateModeOnDeploy::Reset,
         )
         .await;
-        // Server-level LLM defaults, injected here (not baked into the DB payload) so the API
-        // key is never persisted in cleartext (RUN-5). Caller env wins.
-        if let Some(key) = state.config.openai_api_key.clone() {
-            env.entry("OPENAI_API_KEY".to_owned()).or_insert(key);
-        }
-        if let Some(url) = state.config.openai_base_url.clone() {
-            env.entry("OPENAI_BASE_URL".to_owned()).or_insert(url);
-        }
 
         // Deploy container keyed on agent UUID (not name) — see build_agent_spec.
         let mut spec = crate::agents::build_agent_spec(
@@ -1079,7 +1161,7 @@ pub async fn execute_upload_and_deploy(
             ports,
             env,
             &state.config.agent_default_memory,
-            replica_bounds,
+            plan.for_kind(workload_kind),
             writable,
             writable_path.clone(),
             owner_id,
@@ -1131,6 +1213,7 @@ pub async fn execute_upload_and_deploy(
     match result {
         Ok(deploy_status) => {
             set_build_status(db, build_id, BuildStatus::Success).await;
+            store_build_logs(db, state.oci_storage.as_ref(), build_id, &build_logs).await;
             set_upload_status(
                 db,
                 &upload_id,
@@ -1164,6 +1247,8 @@ pub async fn execute_upload_and_deploy(
             tokio::spawn(super::utils::fetch_agent_card_with_retry(
                 db.clone(),
                 state.http_client.clone(),
+                state.runtime.clone(),
+                state.llm_backend.clone(),
                 agent_id,
                 agent_url.clone(),
             ));
@@ -1185,9 +1270,21 @@ pub async fn execute_upload_and_deploy(
         }
         Err(e) => {
             set_build_status(db, build_id, BuildStatus::Failed).await;
-            // `e` may embed raw docker/tar/IO error text — log it, but
-            // upload_status.error_message is read back by clients via
-            // GET /agents/uploads, so store a generic reason there.
+            // Persist what explains the failure on the build row: the build output when the image
+            // built (a later step failed), otherwise the error text, which carries the builder's
+            // own log for a build failure. `upload_status.error_message` stays a generic reason
+            // because clients read it via GET /agents/uploads; the detail lives in the build logs.
+            store_build_logs(
+                db,
+                state.oci_storage.as_ref(),
+                build_id,
+                if build_logs.trim().is_empty() {
+                    &e
+                } else {
+                    &build_logs
+                },
+            )
+            .await;
             set_upload_status(
                 db,
                 &upload_id,
@@ -1284,6 +1381,9 @@ pub async fn execute_clone_and_deploy(
     // variant.
     let mut claimed_version: Option<String> = None;
 
+    // The image build's captured output, filled once the build runs so the Builds tab can show it.
+    let mut build_logs = String::new();
+
     let result: Result<(DeploymentStatus, String), String> = async {
         // Read tar.gz bytes then extract on the blocking pool.
         let tp = tar_gz_path.clone();
@@ -1323,7 +1423,21 @@ pub async fn execute_clone_and_deploy(
                 }
             };
 
-            let new_tag = crate::agents::build_image_tag(agent_image_registry, &name, &ver);
+            let new_tag = crate::agents::build_image_tag(agent_image_registry, owner_id, &name, &ver);
+
+            // Validate image namespace
+            if let Err((_, msg)) = crate::agents::validate_image_ref(
+                db,
+                agent_image_registry,
+                &state.config.agent_image_registry_aliases,
+                &new_tag,
+                owner_id,
+                false,
+            )
+            .await
+            {
+                return Err(msg);
+            }
 
             // Atomically claim this version before any build/deploy work
             // starts, via the real `UNIQUE(agent_id, version)` constraint —
@@ -1381,10 +1495,11 @@ pub async fn execute_clone_and_deploy(
             .await
             .map_err(|e| format!("spawn_blocking tar: {e}"))?
             .map_err(|e| format!("tar source: {e}"))?;
-        runtime
+        build_logs = runtime
             .build(&tar_bytes, &image_tag)
             .await
-            .map_err(|e| format!("BUILD_FAILED:docker build: {e}"))?;
+            .map_err(|e| format!("BUILD_FAILED:docker build: {e}"))?
+            .logs;
 
         set_upload_status(
             db,
@@ -1399,16 +1514,16 @@ pub async fn execute_clone_and_deploy(
 
         // Read before the deploy env is built: a failed read must not rotate the running
         // agent's credentials or reset its state mode for a deploy that never happens.
-        let replica_bounds = scaling
-            .bounds()
+        let plan = scaling
+            .plan()
             .await
-            .map_err(|e| format!("BUILD_FAILED:read replica bounds: {e}"))?;
+            .map_err(|e| format!("BUILD_FAILED:read the deploy plan: {e}"))?;
         // Minted only now that the image exists: this rotates the agent's gateway and state
         // credentials, and a clone or build that failed must leave the running pods alone.
         // Nothing below can fail before `scaling.deploy` (spec building and the pull
         // credential attach are infallible; the latter logs its errors), so the durable state
         // mode the build above may have reset needs no restoring on an early exit.
-        let mut env = crate::agents::deploy_env::build(
+        let env = crate::agents::deploy_env::build(
             state,
             agent_id,
             owner_id,
@@ -1416,13 +1531,6 @@ pub async fn execute_clone_and_deploy(
             crate::agents::deploy_env::StateModeOnDeploy::Reset,
         )
         .await;
-        // Server-level LLM defaults, never persisted in the job payload. Caller env wins.
-        if let Some(key) = state.config.openai_api_key.clone() {
-            env.entry("OPENAI_API_KEY".to_owned()).or_insert(key);
-        }
-        if let Some(url) = state.config.openai_base_url.clone() {
-            env.entry("OPENAI_BASE_URL".to_owned()).or_insert(url);
-        }
 
         // Deploy container keyed on agent UUID.
         let mut spec = crate::agents::build_agent_spec(
@@ -1432,7 +1540,7 @@ pub async fn execute_clone_and_deploy(
             ports,
             env,
             &state.config.agent_default_memory,
-            replica_bounds,
+            plan,
             // GitHub-clone deploys don't expose a --writable flag yet.
             false,
             None,
@@ -1475,6 +1583,7 @@ pub async fn execute_clone_and_deploy(
     match result {
         Ok((deploy_status, _final_image_tag)) => {
             set_build_status(db, build_id, BuildStatus::Success).await;
+            store_build_logs(db, state.oci_storage.as_ref(), build_id, &build_logs).await;
             set_upload_status(
                 db,
                 &upload_id,
@@ -1509,6 +1618,8 @@ pub async fn execute_clone_and_deploy(
             tokio::spawn(super::utils::fetch_agent_card_with_retry(
                 db.clone(),
                 state.http_client.clone(),
+                state.runtime.clone(),
+                state.llm_backend.clone(),
                 agent_id,
                 agent_url.clone(),
             ));
@@ -1526,6 +1637,20 @@ pub async fn execute_clone_and_deploy(
         }
         Err(e) => {
             set_build_status(db, build_id, BuildStatus::Failed).await;
+            // Persist what explains the failure on the build row: the build output when the image
+            // built, otherwise the error text, which carries the builder's own log for a build
+            // failure (the `BUILD_FAILED:` prefix is stripped for the user-facing message below).
+            store_build_logs(
+                db,
+                state.oci_storage.as_ref(),
+                build_id,
+                if build_logs.trim().is_empty() {
+                    &e
+                } else {
+                    &build_logs
+                },
+            )
+            .await;
             // Free a version this attempt claimed via `reserve_version` but
             // never finished deploying, so the same version can be retried.
             // A no-op if nothing was ever claimed (e.g. rejected before a
@@ -2183,6 +2308,7 @@ pub(crate) struct UploadAgentsListResponse {
 fn agent_display_status(agent_status: Option<&str>) -> &'static str {
     match agent_status {
         Some("running") => "Active",
+        Some("parked") => "Parked",
         Some("deploying") | Some("pending") | Some("building") => "Deploying",
         Some("failed") => "Failed",
         Some("stopped") | Some("registered") => "Stopped",
@@ -2199,6 +2325,7 @@ fn agent_status_message(display_status: &str, version: Option<&str>) -> Option<S
         "Deploying" => Some("Agent is being deployed...".to_string()),
         "Failed" => Some("Deployment failed".to_string()),
         "Stopped" => Some("Agent is stopped".to_string()),
+        "Parked" => Some("Agent is parked; the first request starts it".to_string()),
         _ => None,
     }
 }

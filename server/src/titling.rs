@@ -7,7 +7,8 @@
 //! title is attached to.
 
 use nasiko_orchestrator::models::{ChatCompletionRequest, ChatMessage as LlmMessage};
-use nasiko_orchestrator::providers::{LLMProvider, ProviderError};
+use nasiko_orchestrator::providers::ProviderError;
+use uuid::Uuid;
 
 use crate::state::AppState;
 
@@ -22,8 +23,8 @@ pub const MAX_TITLE_CHARS: usize = 80;
 /// empty-prompt default (e.g. "New chat", "New view"), since that default is
 /// context-specific and this function's contract is "given real text, title
 /// it."
-pub async fn title_from_prompt(state: &AppState, prompt: &str) -> String {
-    match generate_title(state, prompt).await {
+pub async fn title_from_prompt(state: &AppState, user_id: Uuid, prompt: &str) -> String {
+    match generate_title(state, user_id, prompt).await {
         Ok(title) if !title.is_empty() => title,
         Ok(_) => truncate_title(prompt),
         Err(e) => {
@@ -34,8 +35,29 @@ pub async fn title_from_prompt(state: &AppState, prompt: &str) -> String {
 }
 
 /// Single non-streaming LLM call that summarizes `prompt` into a title.
-async fn generate_title(state: &AppState, prompt: &str) -> Result<String, ProviderError> {
-    let provider = LLMProvider::from_env(state.http_client.clone());
+async fn generate_title(
+    state: &AppState,
+    user_id: Uuid,
+    prompt: &str,
+) -> Result<String, ProviderError> {
+    // A user's saved OpenAI key is spent directly; otherwise the platform call goes
+    // through the in-process router, which picks the provider and records usage.
+    let provider = match nasiko_orchestrator::user_key::saved_openai_key(&state.db, user_id).await {
+        Some(key) => {
+            nasiko_orchestrator::providers::LLMProvider::from_env(state.http_client.clone())
+                .with_api_key(key)
+        }
+        None => nasiko_orchestrator::providers::LLMProvider::from_env(state.http_client.clone())
+            .with_backend(
+                std::sync::Arc::clone(&state.llm_backend),
+                nasiko_orchestrator::llm_backend::LlmCallContext {
+                    user_id,
+                    component: nasiko_orchestrator::llm_backend::PlatformComponent::Titling
+                        .to_string(),
+                    session_id: None,
+                },
+            ),
+    };
 
     let request = ChatCompletionRequest {
         // Reuse the cheap task model already configured for capability
@@ -72,7 +94,7 @@ async fn generate_title(state: &AppState, prompt: &str) -> Result<String, Provid
         ],
         stream: false,
         temperature: Some(0.2),
-        max_tokens: Some(16),
+        max_tokens: Some(1024),
         response_format: None,
         stream_options: None,
     };

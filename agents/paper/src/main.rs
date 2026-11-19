@@ -8,6 +8,35 @@ mod mcp;
 mod telemetry;
 mod tools;
 
+/// What a caller sees when this agent has no model key at all. At deploy the platform's LLM
+/// router puts the agent's gateway token in `OPENAI_API_KEY`, so an empty value means neither
+/// the router nor the agent's secrets supplied a key.
+const MISSING_KEY_MESSAGE: &str = "OPENAI_API_KEY is not set for this agent. Add it in the agent's secrets, or configure a platform key.";
+
+/// The error a failed model call reports. A rejected key (401/403) is named as one, without
+/// the provider's body, which goes to the log instead.
+fn llm_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        tracing::warn!(%status, body, "model provider rejected the API key");
+        return format!(
+            "The model provider rejected this agent's API key (HTTP {}).",
+            status.as_u16()
+        );
+    }
+    // The provider's (or the LLM router's) own `error.message` when the body carries one, so the
+    // user reads a sentence rather than a JSON dump; the raw body stays in the log.
+    let message = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_owned));
+    match message {
+        Some(message) => {
+            tracing::warn!(%status, body, "model call failed");
+            format!("LLM API {status}: {message}")
+        }
+        None => format!("LLM API {status}: {body}"),
+    }
+}
+
 struct PaperAgent {
     model: String,
     api_key: String,
@@ -74,11 +103,24 @@ impl PaperAgent {
             body.as_object_mut().unwrap().remove("tools");
         }
 
+        if self.api_key.is_empty() {
+            return Err(MISSING_KEY_MESSAGE.to_owned());
+        }
+
         let mut req = self
             .http
             .post(format!("{}/chat/completions", self.base_url))
             .bearer_auth(&self.api_key);
-        if let Some(tp) = parent_cx.and_then(telemetry::traceparent_for_context) {
+        // Propagate THIS span so the router's `gen_ai.chat` nests under ChatCompletion.
+        let own_cx: Option<opentelemetry::Context> = parent_cx.map(|_| {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            tracing::Span::current().context()
+        });
+        if let Some(tp) = own_cx
+            .as_ref()
+            .and_then(telemetry::traceparent_for_context)
+            .or_else(|| parent_cx.and_then(telemetry::traceparent_for_context))
+        {
             req = req.header("traceparent", tp);
         }
         let resp = req
@@ -90,7 +132,7 @@ impl PaperAgent {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            return Err(format!("LLM API {status}: {body}"));
+            return Err(llm_error_message(status, &body));
         }
 
         let response = resp

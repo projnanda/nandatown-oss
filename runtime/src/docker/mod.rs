@@ -1,3 +1,4 @@
+pub mod sandbox;
 mod stats;
 pub use stats::DockerStatsProvider;
 
@@ -31,8 +32,8 @@ use crate::{
     ContainerRuntime, ImageSource, SessionAttach, StdioHandle,
     error::{Result, RuntimeError},
     types::{
-        ContainerId, DeploymentSpec, DeploymentStatus, InstanceInfo, RuntimeState, WorkspaceEntry,
-        WorkspaceFile, WorkspaceRef, validate_build_inputs,
+        BuildReport, ContainerId, DeploymentSpec, DeploymentStatus, InstanceInfo, RuntimeState,
+        WorkspaceEntry, WorkspaceFile, WorkspaceRef, validate_build_inputs,
     },
 };
 
@@ -330,6 +331,27 @@ fn is_conflict(err: &bollard::errors::Error) -> bool {
     )
 }
 
+/// Prepend the build steps that ran before a mid-stream failure to the error, keeping its variant,
+/// so a failed build's log is the whole story (steps + reason), not just the final line. A no-op when
+/// nothing was captured yet.
+fn prepend_build_steps(logs: &str, err: RuntimeError) -> RuntimeError {
+    let steps = logs.trim_end();
+    if steps.is_empty() {
+        return err;
+    }
+    match err {
+        RuntimeError::Internal(m) => RuntimeError::Internal(format!("{steps}\n{m}")),
+        RuntimeError::ImageNotFound(m) => RuntimeError::ImageNotFound(format!("{steps}\n{m}")),
+        RuntimeError::BackendUnreachable(m) => {
+            RuntimeError::BackendUnreachable(format!("{steps}\n{m}"))
+        }
+        RuntimeError::ResourceConflict(m) => {
+            RuntimeError::ResourceConflict(format!("{steps}\n{m}"))
+        }
+        other => RuntimeError::Internal(format!("{steps}\n{other}")),
+    }
+}
+
 fn map_bollard_err(err: bollard::errors::Error) -> RuntimeError {
     warn!(error = %err, "bollard API error");
     match &err {
@@ -460,6 +482,21 @@ fn run_as_user(spec: &DeploymentSpec) -> Option<String> {
     spec.harden.then(|| "65534:65534".to_owned())
 }
 
+/// A named-volume mount of `volume`'s `subpath` at `target` (Docker's `volume-subpath`).
+/// Shared with the sandbox provider so both lay the workspace mount out identically.
+fn volume_subpath_mount(target: &str, volume: &str, subpath: &str) -> Mount {
+    Mount {
+        target: Some(target.to_owned()),
+        source: Some(volume.to_owned()),
+        typ: Some(MountTypeEnum::VOLUME),
+        volume_options: Some(MountVolumeOptions {
+            subpath: Some(subpath.to_owned()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Builds the `HostConfig` for a container. `spec.harden` or `spec.writable`
 /// both get **filesystem** hardening — read-only rootfs plus a `/tmp` tmpfs;
 /// only full `spec.harden` additionally drops capabilities and sets
@@ -487,16 +524,11 @@ fn build_host_config(
     // subdirectory itself is pre-created by `ensure_agent_memory_subdir` before
     // this container is created; Docker (unlike Kubernetes) does not create it.
     let mounts = spec.writable.then(|| {
-        vec![Mount {
-            target: Some(spec.writable_mount_path().to_owned()),
-            source: Some(agent_memory_volume.to_owned()),
-            typ: Some(MountTypeEnum::VOLUME),
-            volume_options: Some(MountVolumeOptions {
-                subpath: Some(agent_memory_subpath(spec)),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }]
+        vec![volume_subpath_mount(
+            spec.writable_mount_path(),
+            agent_memory_volume,
+            &agent_memory_subpath(spec),
+        )]
     });
     let base = HostConfig {
         port_bindings: Some(port_bindings),
@@ -512,6 +544,7 @@ fn build_host_config(
         // ordinary agent deploys (which never set it) are unaffected.
         network_mode: spec.network_override.clone(),
         mounts,
+        runtime: spec.overrides.runtime_class.clone(),
         ..Default::default()
     };
     if !spec.harden && !spec.writable {
@@ -596,6 +629,16 @@ fn parse_memory_bytes(s: &str) -> i64 {
     }
 }
 
+/// The container's non-empty IP address on the named network, if it is attached to it.
+/// Shared with the sandbox provider's `attach`.
+fn network_ip<'a>(ns: &'a bollard::models::NetworkSettings, network: &str) -> Option<&'a str> {
+    ns.networks
+        .as_ref()
+        .and_then(|nets| nets.get(network))
+        .and_then(|n| n.ip_address.as_deref())
+        .filter(|ip| !ip.is_empty())
+}
+
 /// Resolve the endpoint URL for a running container.
 ///
 /// When `network` is `Some(name)`, looks up the container's IP on that network
@@ -613,12 +656,7 @@ fn extract_endpoint(
 
     // Try the named network first: use container IP + lowest container port
     if let Some(net_name) = network {
-        let ip = ns
-            .networks
-            .as_ref()
-            .and_then(|nets| nets.get(net_name))
-            .and_then(|n| n.ip_address.as_deref())
-            .filter(|ip| !ip.is_empty());
+        let ip = network_ip(ns, net_name);
 
         if let Some(ip) = ip {
             // Pick the lowest container port from exposed bindings
@@ -686,6 +724,36 @@ fn extract_endpoint(
 /// "changed" on every deploy. Recording exactly what we asked for, and diffing
 /// against that, avoids the false positive.
 const ENV_VARS_LABEL: &str = "nasiko.com/env-vars";
+
+/// The [`WorkloadOverrides`](crate::WorkloadOverrides) a container was created with, as JSON,
+/// so a later deploy recreates it when its command or runtime changed. A container created before
+/// this label carries none, which reads as the defaults it was in fact created with.
+const OVERRIDES_LABEL: &str = "nasiko.com/workload-overrides";
+
+/// Whether the overrides recorded on a container ([`OVERRIDES_LABEL`]) differ from `wanted`.
+/// Only what Docker applies counts: the command and the runtime.
+fn overrides_changed(
+    config: Option<&bollard::models::ContainerConfig>,
+    wanted: &crate::WorkloadOverrides,
+) -> bool {
+    let recorded: crate::WorkloadOverrides = config
+        .and_then(|c| c.labels.as_ref())
+        .and_then(|l| l.get(OVERRIDES_LABEL))
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    recorded.command != wanted.command || recorded.runtime_class != wanted.runtime_class
+}
+
+/// The container's `Entrypoint` and `Cmd` for `command`: none of either for an empty one (the
+/// image's own), else `command` with an empty `Cmd`, so the image's `CMD` is dropped as
+/// Kubernetes drops it when a pod names a `command`.
+fn process_argv(command: &[String]) -> (Option<Vec<String>>, Option<Vec<String>>) {
+    if command.is_empty() {
+        (None, None)
+    } else {
+        (Some(command.to_vec()), Some(Vec::new()))
+    }
+}
 
 /// Read back the env vars recorded in [`ENV_VARS_LABEL`] on a running container.
 /// Returns `None` if the label is missing (pre-fix container) or fails to parse —
@@ -761,12 +829,19 @@ async fn create_and_start(
     // later deploy() can detect changes without being confused by image-baked-in vars
     // (e.g. PATH) that `inspect_container` reports as part of the merged env.
     let env_json = serde_json::to_string(&spec.env_vars).unwrap_or_default();
-    let labels = HashMap::from([(ENV_VARS_LABEL.to_owned(), env_json)]);
+    let overrides_json = serde_json::to_string(&spec.overrides).unwrap_or_default();
+    let labels = HashMap::from([
+        (ENV_VARS_LABEL.to_owned(), env_json),
+        (OVERRIDES_LABEL.to_owned(), overrides_json),
+    ]);
 
     let user = run_as_user(spec);
+    let (entrypoint, cmd) = process_argv(&spec.overrides.command);
 
     let config = Config {
         image: Some(spec.image.clone()),
+        entrypoint,
+        cmd,
         env: Some(env_vec),
         exposed_ports: Some(exposed_ports),
         host_config: Some(host_config),
@@ -1628,8 +1703,9 @@ impl ContainerRuntime for DockerRuntime {
                 // — recreating once is safe; silently keeping stale env is not.
                 let env_changed = stored_env_vars(existing.config.as_ref())
                     .is_none_or(|stored| stored != spec.env_vars);
+                let process_changed = overrides_changed(existing.config.as_ref(), &spec.overrides);
 
-                if existing_image == spec.image && !env_changed {
+                if existing_image == spec.image && !env_changed && !process_changed {
                     // Same image, same env: ensure the container is running (idempotent).
                     // `spec.force_pull` is NOT consulted here — this branch never touches
                     // the image cache at all. A caller that wants a fresh pull of a mutable
@@ -1655,7 +1731,8 @@ impl ContainerRuntime for DockerRuntime {
                         })?;
                     }
                 } else {
-                    // Different image or changed env/secrets: stop → remove → recreate.
+                    // Different image, changed env/secrets, or a changed command or runtime:
+                    // stop → remove → recreate.
                     // Same container name is reused, so nothing else in the system (which
                     // addresses the agent by ContainerId → container name) needs to know
                     // the container was recreated rather than left running.
@@ -2235,7 +2312,7 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     #[instrument(skip(self, tar_context), fields(image_tag))]
-    async fn build(&self, tar_context: &[u8], image_tag: &str) -> Result<String> {
+    async fn build(&self, tar_context: &[u8], image_tag: &str) -> Result<BuildReport> {
         validate_build_inputs(tar_context, image_tag)?;
 
         let options = BuildImageOptions {
@@ -2248,33 +2325,62 @@ impl ContainerRuntime for DockerRuntime {
         let body = tar_context.to_vec().into();
 
         let build_fut = async {
+            // Accumulate the daemon's step output so the control plane can show the
+            // user what the build did (success) or where it stopped (failure); every
+            // line is still traced for operators.
+            let mut logs = String::new();
             let mut stream = self.client.build_image(options, None, Some(body));
             while let Some(msg) = stream.next().await {
-                let info = msg.map_err(map_bollard_err)?;
-                if let Some(err) = info.error {
-                    let detail = info
-                        .error_detail
-                        .and_then(|d| d.message)
-                        .unwrap_or_default();
-                    let full = if detail.is_empty() {
-                        err
-                    } else {
-                        format!("{err}: {detail}")
-                    };
-                    return if full.contains("pull access denied")
-                        || full.contains("not found")
-                        || full.contains("does not exist")
-                    {
-                        Err(RuntimeError::ImageNotFound(full))
-                    } else {
-                        Err(RuntimeError::Internal(full))
-                    };
-                }
-                if let Some(line) = info.stream {
-                    tracing::debug!(target: "agent_runtime::build", "{}", line.trim_end());
+                match msg {
+                    Ok(info) => {
+                        if let Some(err) = info.error {
+                            let detail = info
+                                .error_detail
+                                .and_then(|d| d.message)
+                                .unwrap_or_default();
+                            let reason = if detail.is_empty() {
+                                err
+                            } else {
+                                format!("{err}: {detail}")
+                            };
+                            // Classify on the error text only, never on the step output below it:
+                            // a step that prints "not found" must not relabel an unrelated failure
+                            // as ImageNotFound (the reported summary is wrong, the log is fine).
+                            let not_found = reason.contains("pull access denied")
+                                || reason.contains("not found")
+                                || reason.contains("does not exist");
+                            // Carry the steps that ran before the failure alongside the reason, so
+                            // the error message is the whole build log (steps + reason), not just
+                            // the final line.
+                            let full = if logs.trim().is_empty() {
+                                reason
+                            } else {
+                                format!("{}\n{reason}", logs.trim_end())
+                            };
+                            return if not_found {
+                                Err(RuntimeError::ImageNotFound(full))
+                            } else {
+                                Err(RuntimeError::Internal(full))
+                            };
+                        }
+                        if let Some(line) = info.stream {
+                            let line = line.trim_end();
+                            tracing::debug!(target: "agent_runtime::build", "{line}");
+                            logs.push_str(line);
+                            logs.push('\n');
+                        }
+                    }
+                    // A mid-stream daemon failure (e.g. "COPY failed: …") arrives as a
+                    // stream Error, *not* in `info.error`. Carry the steps that already ran,
+                    // the same as the `info.error` path, or the user sees only the final
+                    // line with no build context (the whole point of capturing logs).
+                    Err(e) => return Err(prepend_build_steps(&logs, map_bollard_err(e))),
                 }
             }
-            Ok(image_tag.to_owned())
+            Ok(BuildReport {
+                image_tag: image_tag.to_owned(),
+                logs,
+            })
         };
 
         tokio::time::timeout(self.config.build_timeout, build_fut)
@@ -2307,6 +2413,8 @@ mod hardening_tests {
             writable_path: None,
             owner_id: uuid::Uuid::nil(),
             force_pull: false,
+            parkable: false,
+            overrides: Default::default(),
         }
     }
 
@@ -2334,6 +2442,71 @@ mod hardening_tests {
         assert_eq!(hc.tmpfs, None);
         assert_eq!(hc.cap_drop, None);
         assert_eq!(hc.security_opt, None);
+    }
+
+    #[test]
+    fn runtime_class_selects_the_container_runtime_and_defaults_to_none() {
+        let (bindings, _) = build_port_config(&[8080], "127.0.0.1");
+        let hc = build_host_config(&spec(false), bindings.clone(), "nasiko-agent-memory");
+        assert_eq!(hc.runtime, None);
+        let mut gvisor = spec(true);
+        gvisor.overrides.runtime_class = Some("runsc".to_owned());
+        let hc = build_host_config(&gvisor, bindings, "nasiko-agent-memory");
+        assert_eq!(hc.runtime.as_deref(), Some("runsc"));
+    }
+
+    #[test]
+    fn a_command_replaces_the_entrypoint_and_drops_the_images_cmd() {
+        assert_eq!(process_argv(&[]), (None, None));
+        let command = vec!["/usr/bin/tini".to_owned(), "--".to_owned()];
+        assert_eq!(
+            process_argv(&command),
+            (Some(command.clone()), Some(Vec::new()))
+        );
+    }
+
+    fn labelled(overrides: Option<&crate::WorkloadOverrides>) -> bollard::models::ContainerConfig {
+        let labels = overrides.map(|o| {
+            HashMap::from([(
+                OVERRIDES_LABEL.to_owned(),
+                serde_json::to_string(o).unwrap(),
+            )])
+        });
+        bollard::models::ContainerConfig {
+            labels,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_changed_command_or_runtime_recreates_the_container() {
+        let defaults = crate::WorkloadOverrides::default();
+        let supervisor = crate::WorkloadOverrides {
+            command: vec!["harness-supervisor".to_owned()],
+            ..crate::WorkloadOverrides::default()
+        };
+        let gvisor = crate::WorkloadOverrides {
+            runtime_class: Some("runsc".to_owned()),
+            ..crate::WorkloadOverrides::default()
+        };
+        // An unlabelled container was created with the defaults.
+        assert!(!overrides_changed(Some(&labelled(None)), &defaults));
+        assert!(overrides_changed(Some(&labelled(None)), &supervisor));
+        assert!(!overrides_changed(
+            Some(&labelled(Some(&supervisor))),
+            &supervisor
+        ));
+        assert!(overrides_changed(
+            Some(&labelled(Some(&supervisor))),
+            &gvisor
+        ));
+        // Scratch and shutdown are not Docker's to apply, so they never recreate.
+        let scratch = crate::WorkloadOverrides {
+            scratch_bytes: Some(1 << 30),
+            shutdown: crate::Shutdown::Prompt,
+            ..crate::WorkloadOverrides::default()
+        };
+        assert!(!overrides_changed(Some(&labelled(None)), &scratch));
     }
 }
 
@@ -2363,6 +2536,8 @@ mod writable_tests {
             writable_path: None,
             owner_id: TEST_OWNER,
             force_pull: false,
+            parkable: false,
+            overrides: Default::default(),
         }
     }
 
@@ -2511,7 +2686,7 @@ mod credential_scope_tests {
         assert!(credentials_match(None, "docker.io/library/redis:7"));
         assert!(credentials_match(
             Some("index.docker.io"),
-            "akhilfolium/infra-agent"
+            "example/infra-agent"
         ));
         assert!(!credentials_match(None, "ghcr.io/org/agent:v1"));
     }

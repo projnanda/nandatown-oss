@@ -74,6 +74,14 @@ pub async fn build(
     env
 }
 
+/// Removes every key only the platform may set, so a value the caller put under one of those
+/// names never reaches the agent.
+fn strip_reserved_keys(env: &mut HashMap<String, String>) {
+    for key in RESERVED_KEYS {
+        env.remove(key);
+    }
+}
+
 /// Sets all of the platform's keys on `env`: the credentials (`apply_credentials`) and the LLM
 /// router wiring (`apply_llm_wiring`).
 ///
@@ -87,7 +95,7 @@ pub async fn apply_platform_env(
     state_mode: StateModeOnDeploy,
 ) {
     apply_credentials(state, env, agent_id, state_mode).await;
-    apply_llm_wiring(state, env, agent_id, owner_id).await;
+    apply_llm_wiring(env, agent_id, owner_id);
 }
 
 /// Sets the platform's credential keys on `env`, replacing anything the caller put under those
@@ -103,21 +111,14 @@ pub async fn apply_credentials(
     agent_id: Uuid,
     state_mode: StateModeOnDeploy,
 ) {
-    for key in RESERVED_KEYS {
-        env.remove(key);
-    }
+    strip_reserved_keys(env);
     crate::mcp::wiring::inject_agent_gateway_token(&state.db, env, agent_id).await;
-    inject_agent_state(state, env, agent_id, state_mode).await;
+    inject_agent_state(state, &state.db, env, agent_id, state_mode).await;
 }
 
 /// Points the agent's LLM SDK at the LLM router, when one is configured.
-pub async fn apply_llm_wiring(
-    state: &AppState,
-    env: &mut HashMap<String, String>,
-    agent_id: Uuid,
-    owner_id: Uuid,
-) {
-    crate::llm_router::wiring::inject_agent_llm_env(&state.db, env, agent_id, Some(owner_id)).await;
+fn apply_llm_wiring(env: &mut HashMap<String, String>, agent_id: Uuid, owner_id: Uuid) {
+    crate::llm_router::wiring::inject_agent_llm_env(env, agent_id, Some(owner_id));
 }
 
 /// Gives the agent its state API address and credential, and, for a deploy that
@@ -128,6 +129,7 @@ pub async fn apply_llm_wiring(
 /// early errs toward `memory`, the conservative reading, if the deploy then fails.
 async fn inject_agent_state(
     state: &AppState,
+    mint_db: impl sqlx::PgExecutor<'_>,
     env: &mut HashMap<String, String>,
     agent_id: Uuid,
     state_mode: StateModeOnDeploy,
@@ -146,7 +148,7 @@ async fn inject_agent_state(
     {
         tracing::error!(%agent_id, error = %e, "failed to reset agent state mode on deploy");
     }
-    match crate::agent_state::mint_state_token(&state.db, agent_id).await {
+    match crate::agent_state::mint_state_token(mint_db, agent_id).await {
         Ok(token) => {
             env.insert(STATE_URL_VAR.into(), url);
             env.insert(STATE_TOKEN_VAR.into(), token);
@@ -181,6 +183,44 @@ mod tests {
             agent_state_url("https://cp.example.com/api/mcp/").as_deref(),
             Some("https://cp.example.com/api/agent-state")
         );
+    }
+
+    fn env_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    /// What a caller (an agent secret or an upload's `env`) might put under the platform's names.
+    fn hostile_caller_env() -> HashMap<String, String> {
+        env_of(&[
+            (GATEWAY_TOKEN_VAR, "ngt_forged"),
+            (STATE_URL_VAR, "http://attacker.test/api/agent-state"),
+            (STATE_TOKEN_VAR, "nst_forged"),
+            ("OPENAI_MODEL", "gpt-4.1"),
+            ("MY_SECRET", "kept"),
+        ])
+    }
+
+    #[test]
+    fn a_reserved_key_never_keeps_the_callers_value() {
+        let mut env = hostile_caller_env();
+        strip_reserved_keys(&mut env);
+        for key in RESERVED_KEYS {
+            assert!(
+                !env.contains_key(key),
+                "{key} must not come from the caller"
+            );
+        }
+    }
+
+    #[test]
+    fn keys_the_platform_does_not_reserve_stay_the_callers() {
+        let mut env = hostile_caller_env();
+        strip_reserved_keys(&mut env);
+        assert_eq!(env["OPENAI_MODEL"], "gpt-4.1");
+        assert_eq!(env["MY_SECRET"], "kept");
     }
 
     #[test]

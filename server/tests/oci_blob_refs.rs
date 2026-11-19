@@ -18,6 +18,7 @@ mod common;
 use serde_json::Value;
 use serial_test::serial;
 use sha2::{Digest, Sha256};
+use sqlx::Connection;
 use uuid::Uuid;
 
 async fn insert_user(db: &sqlx::PgPool, username: &str) -> Uuid {
@@ -35,14 +36,14 @@ async fn insert_user(db: &sqlx::PgPool, username: &str) -> Uuid {
 /// unlike the read-side `check_repo_access`, an unclaimed repo name does NOT
 /// grant delete access. Tests that DELETE a blob must claim the repo first.
 async fn insert_agent(db: &sqlx::PgPool, name: &str, owner_id: Uuid) {
-    sqlx::query(
-        "INSERT INTO agents (name, owner_id, version, image) VALUES ($1, $2, '1.0.0', 'img:1')",
-    )
-    .bind(name)
-    .bind(owner_id)
-    .execute(db)
-    .await
-    .expect("insert test agent");
+    let image = format!("nasiko/{}:1.0.0", name);
+    sqlx::query("INSERT INTO agents (name, owner_id, version, image) VALUES ($1, $2, '1.0.0', $3)")
+        .bind(name)
+        .bind(owner_id)
+        .bind(image)
+        .execute(db)
+        .await
+        .expect("insert test agent");
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -142,6 +143,7 @@ async fn manifest_push_records_blob_refs_for_config_and_layers() {
     let server = common::TestServer::start().await;
     let owner_id = insert_user(&server.db, "oci-refs-owner").await;
     let repo = format!("oci-refs-repo-{}", Uuid::new_v4());
+    insert_agent(&server.db, &repo, owner_id).await;
 
     let config_digest = push_blob(
         &server,
@@ -200,6 +202,7 @@ async fn delete_blob_shared_across_repos_preserves_other_repos_copy() {
     let repo_a = format!("oci-shared-repo-a-{}", Uuid::new_v4());
     let repo_b = format!("oci-shared-repo-b-{}", Uuid::new_v4());
     insert_agent(&server.db, &repo_a, owner_a).await;
+    insert_agent(&server.db, &repo_b, owner_b).await;
 
     // Both repos push a manifest referencing the IDENTICAL layer digest
     // (byte-identical layer content forces the digest collision).
@@ -382,6 +385,8 @@ async fn get_blob_confidentiality_denies_repo_that_never_referenced_digest() {
     let owner_b = insert_user(&server.db, "oci-confid-b").await;
     let repo_a = format!("oci-confid-repo-a-{}", Uuid::new_v4());
     let repo_b = format!("oci-confid-repo-b-{}", Uuid::new_v4());
+    insert_agent(&server.db, &repo_a, owner_a).await;
+    insert_agent(&server.db, &repo_b, owner_b).await;
 
     // A pushes a blob + manifest referencing it under repo A only.
     let secret_layer = push_blob(
@@ -472,6 +477,8 @@ async fn two_repos_pushing_identical_manifest_content_dont_clobber_each_other() 
     let owner_b = insert_user(&server.db, "oci-hijack-b").await;
     let repo_a = format!("oci-hijack-repo-a-{}", Uuid::new_v4());
     let repo_b = format!("oci-hijack-repo-b-{}", Uuid::new_v4());
+    insert_agent(&server.db, &repo_a, owner_a).await;
+    insert_agent(&server.db, &repo_b, owner_b).await;
 
     let config_digest = push_blob(
         &server,
@@ -789,6 +796,90 @@ async fn get_referrers_join_scoped_to_repository_not_just_digest() {
         1,
         "must return exactly one entry, not one per repository sharing the digest: {manifests:?}"
     );
+
+    server.cleanup().await;
+}
+
+/// `BLOB_LOCK_CLASS` in `oss/oci/src/ops/blobs.rs`: the class of every blob-digest advisory lock.
+const BLOB_LOCK_CLASS: i32 = 0x0C1_B10B;
+
+/// Claims of one digest run side by side, and a reclaim still holds them off. Every agent image
+/// claims the same base layers, so when a claim held the digest lock exclusively each push queued
+/// behind every other one (each holding a database connection): at 40 uploads a second the waiting
+/// claims took ~40 of the server's 50 connections.
+#[tokio::test]
+#[serial]
+async fn claims_of_a_shared_layer_wait_for_a_reclaim_but_not_for_each_other() {
+    let server = common::TestServer::start().await;
+    let owner_id = insert_user(&server.db, "oci-claims-owner").await;
+    let user_id = owner_id.to_string();
+    let repo = format!("oci-claims-repo-{}", Uuid::new_v4());
+    insert_agent(&server.db, &repo, owner_id).await;
+    let config = push_blob(
+        &server,
+        "nasiko",
+        &repo,
+        &user_id,
+        "oci-claims-owner",
+        b"shared-config",
+    )
+    .await;
+    let layer = push_blob(
+        &server,
+        "nasiko",
+        &repo,
+        &user_id,
+        "oci-claims-owner",
+        b"shared-layer",
+    )
+    .await;
+    let push = |reference: &'static str| {
+        push_manifest(
+            &server,
+            &repo,
+            reference,
+            &user_id,
+            "oci-claims-owner",
+            &config,
+            &layer,
+        )
+    };
+    let digest_lock = |mode: &str| format!("SELECT {mode}($1, hashtext($2))");
+    // A connection of its own: the test server's pool has one, which the push needs.
+    let mut holder = sqlx::PgConnection::connect_with(&server.db.connect_options())
+        .await
+        .unwrap();
+
+    // Another push is mid-claim on the shared layer.
+    let mut other_claim = holder.begin().await.unwrap();
+    sqlx::query(&digest_lock("pg_advisory_xact_lock_shared"))
+        .bind(BLOB_LOCK_CLASS)
+        .bind(&layer)
+        .execute(&mut *other_claim)
+        .await
+        .unwrap();
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(10), push("v1"))
+        .await
+        .expect("a claim must not wait for another claim of the same digest");
+    assert_eq!(resp.status(), 201);
+    other_claim.rollback().await.unwrap();
+
+    // A reclaim of the layer is in flight: the push waits for it, then goes through.
+    let mut reclaim = holder.begin().await.unwrap();
+    sqlx::query(&digest_lock("pg_advisory_xact_lock"))
+        .bind(BLOB_LOCK_CLASS)
+        .bind(&layer)
+        .execute(&mut *reclaim)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), push("v2"))
+            .await
+            .is_err(),
+        "a claim must wait while a reclaim holds the digest"
+    );
+    reclaim.rollback().await.unwrap();
+    assert_eq!(push("v3").await.status(), 201);
 
     server.cleanup().await;
 }

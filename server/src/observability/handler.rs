@@ -13,7 +13,8 @@ use tracing::instrument;
 use utoipa::IntoParams;
 
 use super::service::{
-    EnsureSessionOutcome, FinopsAccess, InsightsRequest, ObservabilityService, parse_iso_or_default,
+    EnsureSessionOutcome, FinopsAccess, FinopsUserAgentSpend, InsightsRequest,
+    ObservabilityService, parse_iso_or_default,
 };
 
 /// Request extension injected by EE middleware to scope FinOps queries to a
@@ -87,7 +88,7 @@ pub struct SessionListParams {
     /// Keyset cursor on `(created_at, session_id)` — the `end_cursor` of the
     /// previous page.
     pub cursor: Option<String>,
-    /// `failed` | `ok` | `running`. Filtered in SQL, so `matching_count` counts
+    /// `failed` | `ok` | `running` | `timed_out`. Filtered in SQL, so `matching_count` counts
     /// every match in the window rather than the rows on this page.
     pub status: Option<String>,
     /// Sort order. Only `created_at` (the default) is supported; see the
@@ -144,6 +145,9 @@ pub struct FinopsFilterParams {
     /// How many agents get their own series under `group_by=agent`
     /// (default 5, clamped 1-20). The rest fold into `other`.
     pub top: Option<i64>,
+    /// One user's usage only (a user UUID). An admin may name anyone; anyone else only
+    /// themselves (403 otherwise).
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -153,6 +157,9 @@ pub struct FinopsDayDrilldownParams {
     pub agent_id: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// One user's usage only (a user UUID). An admin may name anyone; anyone else only
+    /// themselves (403 otherwise).
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -163,6 +170,11 @@ pub struct FinopsSpendCalendarParams {
     pub agent_id: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// "agent" | "coding" | "acp" — restricts spend to one `trace_usage.source`.
+    pub source: Option<String>,
+    /// One user's usage only (a user UUID). An admin may name anyone; anyone else only
+    /// themselves (403 otherwise).
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -174,12 +186,15 @@ pub struct FinopsAttributionsParams {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub view: Option<String>,
-    /// "cost" | "tokens" | "operations" | "avg_latency" | "container_hours" | "name"
+    /// "cost" | "tokens" | "operations" | "avg_latency" | "container_hours" | "sandbox_minutes" | "name"
     pub sort_by: Option<String>,
     /// "asc" | "desc" (default "desc")
     pub sort_dir: Option<String>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// One user's usage only (a user UUID). An admin may name anyone; anyone else only
+    /// themselves (403 otherwise).
+    pub user_id: Option<String>,
 }
 
 /// Validates `range` is one of "24h"/"7d"/"30d" when present.
@@ -376,9 +391,9 @@ pub async fn get_session_details(
     {
         return obs_err(error);
     }
-    if !state.config.observability_enabled {
-        return observability_unconfigured();
-    }
+    // No `observability_enabled` gate: the detail is built from Postgres (`flows` +
+    // `trace_usage`) and Tempo only enriches it, skipped when it fails, so a server with no
+    // trace store still opens every session it lists.
     match svc(&state)
         .get_session_details(&session_id, &claims.sub, claims.is_superuser)
         .await
@@ -568,6 +583,7 @@ pub async fn get_span_details(
 pub async fn get_agent_stats(
     State(state): State<AppState>,
     claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
     Path(agent_id): Path<String>,
     Query(params): Query<AgentStatsParams>,
 ) -> impl IntoResponse {
@@ -585,8 +601,10 @@ pub async fn get_agent_stats(
     // Tempo's service.name is the agent name (the injector sets
     // OTEL_SERVICE_NAME to the container/agent name); accept a name or UUID
     // here (same contract as the logs endpoints) and query by name.
+    // The same rule as every FinOps read, so the card agrees with the dashboard filtered to it.
+    let users = usage_user_ids(&state, &claims, user_scope).await;
     match svc(&state)
-        .get_agent_stats(&tempo_ref, params.start_time.as_deref())
+        .get_agent_stats(&tempo_ref, params.start_time.as_deref(), users.as_deref())
         .await
     {
         Ok(resp) => Json(resp).into_response(),
@@ -638,9 +656,21 @@ pub async fn get_finops_dashboard(
             Err(r) => return r,
         };
 
-    let owns = owns_filtered_agent(&state, &claims, agent_name.as_deref(), params.my_agent).await;
-    let scope = finops_scope(&state, &claims, user_scope, owns).await;
+    let mut scope = match finops_scope(&state, &claims, user_scope, params.user_id.as_deref()).await
+    {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
     let owner_id = (params.my_agent && agent_name.is_none()).then_some(claims.sub.as_str());
+    // `my_agent` matches spend rows by agent name, and names are unique per owner only (every
+    // user's harness agent for a harness shares one). A caller who sees everyone's calls would add
+    // up another owner's same-named agent, so while a name is shared they get their own calls.
+    if owner_id.is_some()
+        && scope.user_ids.is_none()
+        && !super::routes::agent_names_owned_by_caller(&state, &claims).await
+    {
+        scope.user_ids = Some(vec![claims.user_uuid().unwrap_or(uuid::Uuid::nil())]);
+    }
     match svc(&state)
         .get_finops_dashboard(
             &claims.sub,
@@ -659,9 +689,50 @@ pub async fn get_finops_dashboard(
         )
         .await
     {
-        Ok(resp) => Json(resp).into_response(),
+        Ok(mut resp) => {
+            retain_visible_users(&state, &claims, scope.sees_everyone, &mut resp.data.users).await;
+            Json(resp).into_response()
+        }
         Err(e) => obs_err(e),
     }
+}
+
+/// Spend per user per agent under the dashboard's filters in `params`, for `user_ids` (`None`:
+/// everyone). A seam for an edition that groups people, which this crate knows nothing about:
+/// the caller decides whose usage, and this decides which agents and calls it may include,
+/// exactly as [`get_finops_dashboard`] does, so the two always agree.
+pub async fn finops_spend_by_user_agent(
+    state: &AppState,
+    claims: &Claims,
+    params: &FinopsFilterParams,
+    user_ids: Option<&[uuid::Uuid]>,
+) -> Result<FinopsUserAgentSpend, Response> {
+    validate_range(params.range.as_deref())?;
+    let agent_name = resolve_agent_filter(&state.db, params.agent_id.as_deref()).await?;
+    if let Some(name) = agent_name.as_deref()
+        && !super::routes::agent_name_fully_accessible(state, claims, name).await
+    {
+        return Err((StatusCode::NOT_FOUND, "agent not found").into_response());
+    }
+    let (start_time, end_time) =
+        resolve_range_params(&params.start_time, &params.end_time, &params.range)?;
+    let accessible_agent_ids = accessible_agent_ids(state, claims).await;
+    svc(state)
+        .get_finops_spend_by_user_agent(
+            &claims.sub,
+            start_time.as_deref(),
+            end_time.as_deref(),
+            agent_name.as_deref(),
+            params.model.as_deref(),
+            params.provider.as_deref(),
+            FinopsAccess {
+                user_ids,
+                accessible_agent_ids: accessible_agent_ids.as_deref(),
+                workflow_owner: None,
+            },
+        )
+        .await
+        .map_err(obs_err)
 }
 
 /// "range" (24h/7d/30d) overrides `start_time`/`end_time` when present,
@@ -732,7 +803,6 @@ pub async fn get_finops_spend_timeseries(
     {
         return (StatusCode::NOT_FOUND, "agent not found").into_response();
     }
-    let owns = owns_filtered_agent(&state, &claims, agent_name.as_deref(), false).await;
     // Only `agent` is a grouping; anything else is a caller error rather than
     // something to silently drop, which would return a fleet-wide chart under a
     // per-agent legend.
@@ -747,7 +817,10 @@ pub async fn get_finops_spend_timeseries(
                 .into_response();
         }
     };
-    let scope = finops_scope(&state, &claims, user_scope, owns).await;
+    let scope = match finops_scope(&state, &claims, user_scope, params.user_id.as_deref()).await {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
     let access = scope.access();
     match svc(&state)
         .get_finops_spend_timeseries(
@@ -792,6 +865,15 @@ pub async fn get_finops_spend_calendar(
     if let Err(r) = validate_range(params.range.as_deref()) {
         return r;
     }
+    if let Some(s) = params.source.as_deref()
+        && !matches!(s, "agent" | "coding" | "acp")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid source '{s}' — expected agent, coding, or acp"),
+        )
+            .into_response();
+    }
     let agent_name = match resolve_agent_filter(&state.db, params.agent_id.as_deref()).await {
         Ok(n) => n,
         Err(r) => return r,
@@ -801,8 +883,10 @@ pub async fn get_finops_spend_calendar(
     {
         return (StatusCode::NOT_FOUND, "agent not found").into_response();
     }
-    let owns = owns_filtered_agent(&state, &claims, agent_name.as_deref(), false).await;
-    let scope = finops_scope(&state, &claims, user_scope, owns).await;
+    let scope = match finops_scope(&state, &claims, user_scope, params.user_id.as_deref()).await {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
     let access = scope.access();
     match svc(&state)
         .get_finops_spend_calendar(
@@ -811,6 +895,7 @@ pub async fn get_finops_spend_calendar(
             agent_name.as_deref(),
             params.model.as_deref(),
             params.provider.as_deref(),
+            params.source.as_deref(),
             access,
         )
         .await
@@ -849,8 +934,10 @@ pub async fn get_finops_spend_calendar_day(
     {
         return (StatusCode::NOT_FOUND, "agent not found").into_response();
     }
-    let owns = owns_filtered_agent(&state, &claims, agent_name.as_deref(), false).await;
-    let scope = finops_scope(&state, &claims, user_scope, owns).await;
+    let scope = match finops_scope(&state, &claims, user_scope, params.user_id.as_deref()).await {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
     let access = scope.access();
     match svc(&state)
         .get_finops_spend_calendar_day(
@@ -910,8 +997,10 @@ pub async fn get_finops_attributions(
             Ok(v) => v,
             Err(r) => return r,
         };
-    let owns = owns_filtered_agent(&state, &claims, agent_name.as_deref(), false).await;
-    let scope = finops_scope(&state, &claims, user_scope, owns).await;
+    let scope = match finops_scope(&state, &claims, user_scope, params.user_id.as_deref()).await {
+        Ok(scope) => scope,
+        Err(refused) => return refused,
+    };
     let access = scope.access();
     match svc(&state)
         .get_finops_attributions(
@@ -950,10 +1039,14 @@ pub async fn get_finops_attributions(
 #[instrument(skip(state, body))]
 pub async fn get_finops_insights(
     State(state): State<AppState>,
-    _claims: Claims,
+    claims: Claims,
     Json(body): Json<InsightsRequest>,
 ) -> impl IntoResponse {
-    match svc(&state).get_finops_insights(&body).await {
+    let user_id = match claims.user_uuid() {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    match svc(&state).get_finops_insights(&body, user_id).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => obs_err(e),
     }
@@ -1004,6 +1097,8 @@ struct CallerScope {
     user_ids: Option<Vec<uuid::Uuid>>,
     accessible_agent_ids: Option<Vec<uuid::Uuid>>,
     workflow_owner: Option<uuid::Uuid>,
+    /// [`may_see_every_user`], looked up once for the request.
+    sees_everyone: bool,
 }
 
 impl CallerScope {
@@ -1016,38 +1111,109 @@ impl CallerScope {
     }
 }
 
-/// `owns`: the caller owns the agent being filtered on, which is its own reason to see that agent's
-/// full usage, not just their own calls to it (bug found 2026-10-22).
+/// `requested_user` (the `user_id` query param) narrows to one user's calls whatever else applies;
+/// see [`authorized_user_filter`] for who may name whom. Without it, [`user_ids_for`] decides.
 async fn finops_scope(
     state: &AppState,
     claims: &Claims,
     user_scope: Option<Extension<FinopsUserScope>>,
-    owns: bool,
-) -> CallerScope {
-    CallerScope {
-        user_ids: if owns {
-            None
-        } else {
-            user_scope.map(|Extension(s)| s.0)
-        },
+    requested_user: Option<&str>,
+) -> Result<CallerScope, Response> {
+    let sees_everyone = may_see_every_user(state, claims).await;
+    let user_ids = match requested_user {
+        Some(raw) => Some(vec![authorized_user_filter(claims, raw, sees_everyone)?]),
+        None => user_ids_for(claims, user_scope, sees_everyone),
+    };
+    Ok(CallerScope {
+        user_ids,
         accessible_agent_ids: accessible_agent_ids(state, claims).await,
         workflow_owner: (!claims.is_superuser)
             .then(|| claims.sub.parse().unwrap_or(uuid::Uuid::nil())),
-    }
+        sees_everyone,
+    })
 }
 
-/// Whether the caller owns the agent named by the filter; `unfiltered` answers when there is none
-/// (the dashboard's `my_agent`: browsing only your own agents).
-async fn owns_filtered_agent(
+/// The user a `user_id` filter names, if the caller may see that user's usage: anyone may name
+/// themselves; only a user manager (`sees_everyone`, see [`may_see_every_user`]) may name someone
+/// else. Not a UUID is a 400; someone else's, for anyone but an admin, a 403.
+#[allow(clippy::result_large_err)] // see validate_range
+fn authorized_user_filter(
+    claims: &Claims,
+    raw: &str,
+    sees_everyone: bool,
+) -> Result<uuid::Uuid, Response> {
+    let Ok(user) = raw.parse::<uuid::Uuid>() else {
+        return Err((StatusCode::BAD_REQUEST, "user_id must be a UUID").into_response());
+    };
+    if claims.sub == user.to_string() || sees_everyone {
+        return Ok(user);
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        "only an admin may view another user's usage",
+    )
+        .into_response())
+}
+
+/// Whether the caller sees every user's usage: a user manager (`AuthService::can_manage_users`, a
+/// superuser or an admin). One role lookup; a handler asks once and passes the answer along.
+async fn may_see_every_user(state: &AppState, claims: &Claims) -> bool {
+    state.auth.can_manage_users(&claims.clone().into()).await
+}
+
+/// Keeps the dashboard's per-user rows the caller may see: every row for a user manager, otherwise
+/// the users the edition lets them see (`AuthService::org_visible_user_ids`; OSS: nobody else) and
+/// themselves. Usage is already narrowed to the caller's own calls by [`user_ids_for`], so this is
+/// a second guard on who a row names, not the thing that keeps other people's calls out.
+async fn retain_visible_users(
     state: &AppState,
     claims: &Claims,
-    agent_name: Option<&str>,
-    unfiltered: bool,
-) -> bool {
-    match agent_name {
-        Some(name) => super::routes::agent_name_owned_by_caller(state, claims, name).await,
-        None => unfiltered,
+    sees_everyone: bool,
+    users: &mut Vec<super::service::UserFinopsRow>,
+) {
+    if sees_everyone {
+        return;
     }
+    let visible = state
+        .auth
+        .org_visible_user_ids(&claims.clone().into())
+        .await
+        .unwrap_or_default();
+    users.retain(|row| {
+        row.user_id
+            .as_deref()
+            .is_some_and(|id| id == claims.sub || visible.iter().any(|v| v == id))
+    });
+}
+
+/// Whose calls a usage read covers: `None` is everyone's. A scope set by earlier middleware
+/// ([`FinopsUserScope`]) wins, and an empty one matches nobody; without one, a user manager sees
+/// everyone and anyone else only their own calls.
+///
+/// Reaching an agent, and owning one, are deliberately not reasons to see other people's calls to
+/// it: a public agent's usage is the sum of many people's chats, and each of them sees only theirs.
+fn user_ids_for(
+    claims: &Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
+    sees_everyone: bool,
+) -> Option<Vec<uuid::Uuid>> {
+    if let Some(Extension(FinopsUserScope(users))) = user_scope {
+        return Some(users);
+    }
+    if sees_everyone {
+        return None;
+    }
+    // A subject that is not a UUID matches no one's calls rather than everyone's.
+    Some(vec![claims.user_uuid().unwrap_or(uuid::Uuid::nil())])
+}
+
+/// [`user_ids_for`] for a handler that needs nothing else from the caller's role.
+async fn usage_user_ids(
+    state: &AppState,
+    claims: &Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
+) -> Option<Vec<uuid::Uuid>> {
+    user_ids_for(claims, user_scope, may_see_every_user(state, claims).await)
 }
 
 async fn accessible_agent_ids(state: &AppState, claims: &Claims) -> Option<Vec<uuid::Uuid>> {
@@ -1237,18 +1403,7 @@ pub async fn get_finops_savings(
         return (StatusCode::NOT_FOUND, "agent not found").into_response();
     }
 
-    // Owning the filtered agent is its own reason to see its full savings, not just your own calls
-    // to it (bug found 2026-10-22: this endpoint never had the "your own calls" default at all, only
-    // `accessible_agent_ids` — now it does, so it needs the same exemption the other five got).
-    let owns_filtered_agent = match agent_uuid {
-        Some(id) => super::routes::agent_id_owned_by_caller(&state, &claims, id).await,
-        None => false,
-    };
-    let user_ids = if owns_filtered_agent {
-        None
-    } else {
-        user_scope.map(|Extension(s)| s.0)
-    };
+    let user_ids = usage_user_ids(&state, &claims, user_scope).await;
     let accessible = accessible_agent_ids(&state, &claims).await;
     let query = super::savings::SavingsQuery {
         start,
@@ -1275,6 +1430,92 @@ pub async fn get_finops_savings(
         .into_response(),
         Err(e) => {
             tracing::error!(%e, "finops savings query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
+        }
+    }
+}
+
+// ─── 6b. GET /finops/model-routing ───────────────────────────────────────────
+
+/// Query params for `/finops/model-routing`: the dashboard's window and dimension filters,
+/// spelled the same way, so a client carries its filter state across without translating it.
+#[derive(Debug, Deserialize)]
+pub struct ModelRoutingParams {
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub range: Option<String>,
+    pub agent_id: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+}
+
+/// How the LLM router chose the model over the window: calls per precedence level and per tier
+/// (NAS-1263). Scoped exactly as `/finops/savings` is — the caller's accessible agents, and only
+/// the calls [`usage_user_ids`] lets them see.
+#[utoipa::path(
+    get,
+    path = "/api/observability/finops/model-routing",
+    tag = "observability",
+    responses(
+        (status = 200, description = "Model-routing breakdown", body = crate::observability::model_routing::ModelRoutingResponse),
+        (status = 400, description = "Malformed range"),
+        (status = 401, description = "Missing or invalid session"),
+        (status = 404, description = "Agent filter names an agent the caller cannot see"),
+    ),
+)]
+#[instrument(skip(state, user_scope))]
+pub async fn get_model_routing(
+    State(state): State<AppState>,
+    claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
+    Query(params): Query<ModelRoutingParams>,
+) -> Response {
+    if let Err(r) = validate_range(params.range.as_deref()) {
+        return r;
+    }
+    let (start_time, end_time) =
+        match resolve_range_params(&params.start_time, &params.end_time, &params.range) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+    let start = parse_iso_or_default(start_time.as_deref(), 30);
+    let end = end_time
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+
+    let agent_uuid = match resolve_agent_uuid(&state.db, params.agent_id.as_deref()).await {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if let Some(id) = agent_uuid
+        && !crate::acl::can_access_agent(&state, &claims, id).await
+    {
+        return (StatusCode::NOT_FOUND, "agent not found").into_response();
+    }
+
+    let user_ids = usage_user_ids(&state, &claims, user_scope).await;
+    let accessible = accessible_agent_ids(&state, &claims).await;
+    let query = super::model_routing::ModelRoutingQuery {
+        start,
+        end,
+        agent_id: agent_uuid,
+        provider: params.provider.as_deref(),
+        model: params.model.as_deref(),
+        accessible_agent_ids: accessible.as_deref(),
+        user_ids: user_ids.as_deref(),
+    };
+
+    match super::model_routing::get_model_routing(&state.db, &query).await {
+        Ok(data) => Json(super::model_routing::ModelRoutingResponse {
+            data,
+            status_code: 200,
+            message: "ok".into(),
+        })
+        .into_response(),
+        Err(e) => {
+            tracing::error!(%e, "finops model-routing query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
@@ -1340,6 +1581,7 @@ async fn context_savings_query<'a>(
     claims: &Claims,
     params: &'a ContextSavingsParams,
     accessible: &'a Option<Vec<uuid::Uuid>>,
+    user_ids: &'a Option<Vec<uuid::Uuid>>,
 ) -> Result<super::context_savings::ContextSavingsQuery<'a>, Response> {
     validate_range(params.range.as_deref())?;
     let series = super::context_savings::Bucket::parse(params.series.as_deref())?;
@@ -1409,6 +1651,7 @@ async fn context_savings_query<'a>(
         caller_id,
         caller_is_superuser: claims.is_superuser,
         accessible_agent_ids: accessible.as_deref(),
+        user_ids: user_ids.as_deref(),
         series,
         limit,
         from,
@@ -1453,10 +1696,12 @@ fn context_failure(e: sqlx::Error, what: &str) -> Response {
 pub async fn get_context_savings(
     State(state): State<AppState>,
     claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
     Query(params): Query<ContextSavingsParams>,
 ) -> Response {
     let accessible = accessible_agent_ids(&state, &claims).await;
-    let query = match context_savings_query(&state, &claims, &params, &accessible).await {
+    let users = usage_user_ids(&state, &claims, user_scope).await;
+    let query = match context_savings_query(&state, &claims, &params, &accessible, &users).await {
         Ok(q) => q,
         Err(r) => return r,
     };
@@ -1477,10 +1722,12 @@ pub async fn get_context_savings(
 pub async fn get_context_savings_agents(
     State(state): State<AppState>,
     claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
     Query(params): Query<ContextSavingsParams>,
 ) -> Response {
     let accessible = accessible_agent_ids(&state, &claims).await;
-    let query = match context_savings_query(&state, &claims, &params, &accessible).await {
+    let users = usage_user_ids(&state, &claims, user_scope).await;
+    let query = match context_savings_query(&state, &claims, &params, &accessible, &users).await {
         Ok(q) => q,
         Err(r) => return r,
     };
@@ -1501,15 +1748,110 @@ pub async fn get_context_savings_agents(
 pub async fn get_context_savings_top_requests(
     State(state): State<AppState>,
     claims: Claims,
+    user_scope: Option<Extension<FinopsUserScope>>,
     Query(params): Query<ContextSavingsParams>,
 ) -> Response {
     let accessible = accessible_agent_ids(&state, &claims).await;
-    let query = match context_savings_query(&state, &claims, &params, &accessible).await {
+    let users = usage_user_ids(&state, &claims, user_scope).await;
+    let query = match context_savings_query(&state, &claims, &params, &accessible, &users).await {
         Ok(q) => q,
         Err(r) => return r,
     };
     match super::context_savings::get_top_requests(&state.db, &query).await {
         Ok(data) => context_envelope(data),
         Err(e) => context_failure(e, "context savings top requests"),
+    }
+}
+
+/// Every tool call of a session: recent rows from Postgres plus rows tiered to
+/// Lance (docs/LAKEHOUSE_TRD.md). No Tempo dependency, so it outlives trace retention.
+pub async fn get_session_tool_calls(
+    State(state): State<AppState>,
+    claims: Claims,
+    Path(session_id): Path<String>,
+) -> Response {
+    if let Err(error) = svc(&state)
+        .authorize_session_access(&session_id, &claims.sub, claims.is_superuser)
+        .await
+    {
+        return obs_err(error);
+    }
+    let cfg = nasiko_event_store::TieringConfig {
+        cold_path: state.config.cold_path.clone(),
+        storage_options: crate::state::cold_storage_options(&state.config),
+        ..Default::default()
+    };
+    let store = nasiko_event_store::EventStore::new(state.db.clone(), cfg);
+    let rows = match store.session_tool_calls_all(&session_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(%e, "session tool calls query failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    // Stored rows may carry a session an agent claimed on its spans (rows written
+    // before the materializer canonicalized it, or tiered with that value): keep
+    // only calls whose trace the server's own records tie to this session.
+    let mut trace_ids: Vec<String> = rows.iter().map(|r| r.trace_id.clone()).collect();
+    trace_ids.sort_unstable();
+    trace_ids.dedup();
+    let allowed = match super::session_resolver::traces_of_session(
+        &state.db,
+        &session_id,
+        &trace_ids,
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            tracing::error!(%e, "session tool calls authorization failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| allowed.contains(&r.trace_id))
+        .collect();
+    Json(serde_json::json!({
+        "session_id": session_id,
+        "tool_calls": rows.iter().map(|r| serde_json::json!({
+            "trace_id": r.trace_id,
+            "call_id": r.call_id,
+            "agent_name": r.agent_name,
+            "tool_name": r.tool_name,
+            "tool_kind": r.tool_kind,
+            "status": r.status,
+            "error": r.error,
+            "arguments": r.arguments,
+            "output": r.output,
+            "duration_ms": r.duration_ms,
+            "started_at": r.started_at,
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// Superuser-only: run one locked tiering pass now, through the server's own
+/// config (cold path, storage options). Same code path as the daily loop, so
+/// live tests see exactly what production tiering does. 409 if another
+/// process holds the `tiering_job` lock.
+pub(crate) async fn trigger_tiering(State(state): State<AppState>, claims: Claims) -> Response {
+    if !claims.is_superuser {
+        return (StatusCode::FORBIDDEN, "superuser only").into_response();
+    }
+    let store: nasiko_event_store::EventStore = state.event_store();
+    // Boxed: the tiering future is deep enough to overflow the layout query depth.
+    let run: std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>> =
+        Box::pin(async move { store.run_once(chrono::Utc::now()).await });
+    match run.await {
+        Ok(Some(report)) => {
+            Json(serde_json::json!({ "tiered": true, "report": format!("{report:?}") }))
+                .into_response()
+        }
+        Ok(None) => (StatusCode::CONFLICT, "tiering lock held by another process").into_response(),
+        Err(e) => {
+            tracing::error!(%e, "manual tiering run failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }

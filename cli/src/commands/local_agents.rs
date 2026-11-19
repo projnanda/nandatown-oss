@@ -48,17 +48,23 @@ pub struct ConnectOptions {
     /// Don't give the agent your MCP connectors through the Nasiko gateway
     #[arg(long, conflicts_with = "no_routing", help_heading = HELP_HEADING)]
     pub no_mcp: bool,
-    /// Report sessions to Nasiko observability — tokens, latency and cost; add --content for
-    /// prompt and response text (asked on a terminal, off otherwise)
+    /// A2A agents: the LLM providers whose calls to route (asked on a terminal; otherwise the
+    /// ones its env file already uses, else openai)
+    #[arg(long = "provider", value_enum, value_delimiter = ',', help_heading = HELP_HEADING)]
+    pub providers: Vec<integration::Provider>,
+    /// Report sessions to Nasiko observability: usage (tokens, cost, latency, models, tools and
+    /// subagents) always; chat history only to a cluster that keeps it, when asked or with --content
     #[arg(long, conflicts_with = "no_reporting", help_heading = HELP_HEADING)]
     pub reporting: bool,
     /// Don't report sessions
     #[arg(long, help_heading = HELP_HEADING)]
     pub no_reporting: bool,
-    /// Report sessions including prompt and response text (implies --reporting)
+    /// Also sync chat history (prompts, responses, tool output), where the cluster keeps it; a
+    /// cluster that doesn't gets usage only (implies --reporting)
     #[arg(long, conflicts_with_all = ["no_reporting", "no_content"], help_heading = HELP_HEADING)]
     pub content: bool,
-    /// Report tokens, latency and cost only — no prompt or response text (implies --reporting)
+    /// Sync usage only (tokens, cost, latency, models, tools and subagents), never chat history
+    /// (implies --reporting)
     #[arg(long, conflicts_with = "no_reporting", help_heading = HELP_HEADING)]
     pub no_content: bool,
     /// Reconnect even when the coding agent is still running
@@ -77,6 +83,7 @@ impl ConnectOptions {
             || self.no_routing
             || self.mcp
             || self.no_mcp
+            || !self.providers.is_empty()
             || self.reporting
             || self.no_reporting
             || self.content
@@ -592,7 +599,11 @@ pub fn connect(target: Option<&str>, options: &ConnectOptions) -> Result<()> {
             }
             vec![view.clone()]
         }
-        None if prompter.interactive() => pick_agents(&views, prompter.as_ref())?,
+        None if prompter.interactive() => pick_agents(
+            &views,
+            ReportingDestination::current().ok().as_ref(),
+            prompter.as_ref(),
+        )?,
         None => bail!(
             "name the coding agent to connect ({}), or run `{} connect` on a terminal to pick one",
             integration::known_agent_ids(),
@@ -683,7 +694,9 @@ fn refuse_routing_flags_without_routing(
     if options.mentions_routing() && targets.iter().all(|view| view.router.is_none()) {
         let names: Vec<&str> = targets.iter().map(|view| view.local.display_name).collect();
         bail!(
-            "{} supports session reporting only; --agent, --config and --no-mcp don't apply",
+            "Sorry, the LLM router doesn't support {0}: {0} supports session reporting only, so \
+             --agent, --config and --no-mcp don't apply. You can try Claude Code, Codex or OpenCode \
+             instead (nasiko connect claude|codex|opencode).",
             names.join(" and ")
         );
     }
@@ -837,59 +850,187 @@ fn offer_options() -> ConnectOptions {
     }
 }
 
-/// After `auth login`, `connect <url>` or `use`: offers session reporting for the detected
-/// agents that have none and weren't declined before. It is `connect --no-routing --reporting`
-/// for those agents — the same plan, agent choice and content question — but only once the
-/// user says yes: without a terminal it says how to turn reporting on, and a no is remembered
-/// so it isn't asked again. Agents it doesn't offer are told about, one line each, when their
-/// reporting doesn't reach this cluster or was declined. One agent's failure never stops the
-/// others.
+/// After `auth login`, `connect <url>` or `use`: offers session reporting, as `connect
+/// --no-routing --reporting` would, to the detected agents that have none (and weren't declined
+/// before) and to those whose reporting goes to another cluster or account. Nothing is turned on
+/// or moved unasked: on a terminal the user picks agents from a list with none selected, answers
+/// the content question, sees the plan and confirms it, and only then is asked whether to import
+/// past sessions. A new agent left unpicked is remembered so it isn't offered again. Without a
+/// terminal nothing changes; every agent the user should hear about gets one line saying how to
+/// set it up. One agent's failure never stops the others.
 pub fn offer_reporting() -> Result<()> {
     let views: Vec<AgentView> = load_views()?
         .into_iter()
         .filter(|view| view.local.detected && view.local.reporting_supported)
         .collect();
     let destination = ReportingDestination::current().ok();
-    for line in reporting_notices(&views, destination.as_ref()) {
+    let prompter = prompter(false);
+    let (offered, told) = split_offered(views, destination.as_ref());
+    for line in reporting_notices(&told, destination.as_ref()) {
         println!("{line}");
     }
-    let offered: Vec<AgentView> = views
-        .into_iter()
-        .filter(|view| !view.local.reporting_installed && !view.local.reporting_declined)
-        .collect();
     if offered.is_empty() {
         return Ok(());
     }
     let ids: Vec<&'static str> = offered.iter().map(|view| view.local.id).collect();
-    let turn_on = turn_on_reporting_hint(&ids);
-    let prompter = prompter(false);
-    match reporting_offer(offered, destination.as_ref(), prompter.as_ref())? {
-        Offer::NotAsked => term::print_info(&format!(
-            "Session reporting is off. Turn it on with: {}",
-            term::cyan(&turn_on)
-        )),
-        Offer::Declined => {
-            integration::record_declined(&ids)?;
+    let hint = turn_on_reporting_hint(&ids);
+    if !prompter.interactive() {
+        for line in reporting_notices(&offered, destination.as_ref()) {
+            println!("{line}");
+        }
+        if offered.iter().any(|view| !view.local.reporting_installed) {
             term::print_info(&format!(
-                "Session reporting left off; it won't be offered again. Turn it on any time with: {}",
-                term::cyan(&turn_on)
+                "Session reporting is off. Turn it on with: {}",
+                term::cyan(&hint)
             ));
         }
-        Offer::Accepted(mut plan) => {
-            verify_plan(
-                &mut plan,
-                &Lookups {
-                    config: &check_llm_config,
-                    look_up_agent: &coding_agent_router::look_up_owned_agent,
-                },
-            )?;
-            print_plan(&plan);
-            for (name, error) in apply_plan(&plan, &offer_options(), prompter.as_ref()) {
-                term::print_warning(&format!("{name}: {error}"));
-            }
-        }
+        return Ok(());
+    }
+    let (offer, declined) = login_offer(
+        offered,
+        destination.as_ref(),
+        prompter.as_ref(),
+        &fetch_llm_configs,
+    )?;
+    if !declined.is_empty() {
+        integration::record_declined(&declined)?;
+    }
+    let applied = match offer {
+        Offer::Accepted(plan) => apply_offered(plan, prompter.as_ref())?,
+        Offer::NotAsked | Offer::Declined => false,
+    };
+    if !applied {
+        term::print_info(&format!(
+            "Session reporting left as it is. Set it up any time with: {}",
+            term::cyan(&hint)
+        ));
+        return Ok(());
+    }
+    if reports_here(&load_views()?, destination.as_ref())
+        && prompter.confirm(IMPORT_QUESTION, true)?
+    {
+        integration::import_in_background()?;
     }
     Ok(())
+}
+
+/// Asked once reporting is set up, by the login offer and by `connect`.
+pub const IMPORT_QUESTION: &str = "Also send the sessions you ran before connecting? (newest first; already-sent ones are skipped)";
+
+/// Whether any of `views` has reporting installed that delivers to `destination`.
+fn reports_here(views: &[AgentView], destination: Option<&ReportingDestination>) -> bool {
+    destination.is_some()
+        && views.iter().any(|view| {
+            view.local.reporting_installed
+                && reporting_elsewhere(&view.local, destination).is_none()
+        })
+}
+
+/// Splits the agents for the offer: those it offers — no reporting and never declined, or
+/// reporting that goes to another cluster or account than `destination` — and the rest.
+fn split_offered(
+    views: Vec<AgentView>,
+    destination: Option<&ReportingDestination>,
+) -> (Vec<AgentView>, Vec<AgentView>) {
+    views.into_iter().partition(|view| {
+        let local = &view.local;
+        if local.reporting_installed {
+            reporting_elsewhere(local, destination).is_some()
+        } else {
+            !local.reporting_declined
+        }
+    })
+}
+
+/// Lets the user pick, from `offered` with none selected, the agents that should report here,
+/// and on a pick builds the plan `connect --no-routing --reporting` would apply to them, which
+/// keeps a moved agent's content setting and asks it for a new one. Also returns the agents
+/// without reporting that were left unpicked, to be remembered as declined.
+fn login_offer(
+    offered: Vec<AgentView>,
+    destination: Option<&ReportingDestination>,
+    prompter: &dyn Prompter,
+    load_configs: &dyn Fn() -> Result<Vec<Value>>,
+) -> Result<(Offer, Vec<&'static str>)> {
+    if !prompter.interactive() {
+        return Ok((Offer::NotAsked, Vec::new()));
+    }
+    let labels: Vec<String> = offered
+        .iter()
+        .map(|view| offer_label(view, destination))
+        .collect();
+    let to = destination.map_or("this cluster", |to| to.cluster_name.as_str());
+    term::print_note(&format!(
+        "Session reporting sends each coding session's usage ({}) to {to}, where it shows in \
+         Nasiko's sessions and cost views. It doesn't change how the agents work, and you'll see \
+         every change before it is applied.",
+        integration::USAGE
+    ));
+    let chosen = prompter.multi_select(
+        &format!(
+            "Which coding agents should report sessions to {to}? (space selects, enter confirms; select none to change nothing)"
+        ),
+        &labels,
+        &vec![false; offered.len()],
+    )?;
+    let mut picked = Vec::with_capacity(chosen.len());
+    let mut declined = Vec::new();
+    for (i, view) in offered.into_iter().enumerate() {
+        if chosen.contains(&i) {
+            picked.push(view);
+        } else if !view.local.reporting_installed {
+            declined.push(view.local.id);
+        }
+    }
+    if picked.is_empty() {
+        return Ok((Offer::Declined, declined));
+    }
+    let plan = build_plan(
+        picked,
+        &offer_options(),
+        destination,
+        prompter,
+        load_configs,
+    )?;
+    Ok((Offer::Accepted(plan), declined))
+}
+
+/// "Claude Code (claude) — reports sessions to staging; select to move it here", or "— no
+/// session reporting yet".
+fn offer_label(view: &AgentView, destination: Option<&ReportingDestination>) -> String {
+    let local = &view.local;
+    let state = match reporting_elsewhere(local, destination) {
+        Some((from, _)) if local.reporting_installed => {
+            format!("reports sessions to {from}; select to move it here")
+        }
+        _ => "no session reporting yet".to_string(),
+    };
+    format!("{} ({}) — {state}", local.display_name, local.id)
+}
+
+/// Verifies and shows a plan the offer built, then applies it once the user confirms, warning
+/// about each agent it failed for. Returns whether it was applied.
+fn apply_offered(mut plan: Plan, prompter: &dyn Prompter) -> Result<bool> {
+    verify_plan(
+        &mut plan,
+        &Lookups {
+            config: &check_llm_config,
+            look_up_agent: &coding_agent_router::look_up_owned_agent,
+        },
+    )?;
+    if !plan.agents.iter().any(AgentPlan::changes_anything) {
+        print_nothing_to_do(&plan);
+        return Ok(false);
+    }
+    print_plan(&plan);
+    if !prompter.confirm("Apply these changes?", true)? {
+        println!("Cancelled; nothing was changed.");
+        return Ok(false);
+    }
+    for (name, error) in apply_plan(&plan, &offer_options(), prompter) {
+        term::print_warning(&format!("{name}: {error}"));
+    }
+    Ok(true)
 }
 
 /// One line for each agent the offer skips but the user should hear about: reporting installed
@@ -938,34 +1079,6 @@ fn turn_on_reporting_hint(ids: &[&str]) -> String {
     }
 }
 
-/// Asks whether to report sessions from `targets` — defaulting to no, since nobody asked for
-/// it — and, on a yes, builds the reporting plan, which asks about prompt and response text.
-fn reporting_offer(
-    targets: Vec<AgentView>,
-    destination: Option<&ReportingDestination>,
-    prompter: &dyn Prompter,
-) -> Result<Offer> {
-    if !prompter.interactive() {
-        return Ok(Offer::NotAsked);
-    }
-    let names: Vec<&str> = targets.iter().map(|view| view.local.display_name).collect();
-    let question = format!(
-        "Report sessions from {} to Nasiko observability?",
-        readable_list(&names)
-    );
-    if !prompter.confirm(&question, false)? {
-        return Ok(Offer::Declined);
-    }
-    let plan = build_plan(
-        targets,
-        &offer_options(),
-        destination,
-        prompter,
-        &fetch_llm_configs,
-    )?;
-    Ok(Offer::Accepted(plan))
-}
-
 fn check_llm_config(reference: &str) -> Result<()> {
     let client = Client::from_active_cluster()?;
     crate::commands::llm_config::fetch_config_by_ref(&client, reference)
@@ -978,7 +1091,40 @@ fn check_llm_config(reference: &str) -> Result<()> {
         })
 }
 
-fn pick_agents(views: &[AgentView], prompter: &dyn Prompter) -> Result<Vec<AgentView>> {
+/// Whether `view` is connected to the cluster and account signed in now: routing that belongs to
+/// it, or reporting that delivers there. Without a known destination, any connection counts.
+fn connected_here(view: &AgentView, destination: Option<&ReportingDestination>) -> bool {
+    view.routing_error.is_some()
+        || view
+            .routing
+            .as_ref()
+            .is_some_and(|routing| destination.is_none() || owned_by(routing, destination))
+        || (view.local.reporting_installed
+            && reporting_elsewhere(&view.local, destination).is_none())
+}
+
+/// Where `view` is connected when that isn't here: the cluster its reporting delivers to, or
+/// else the one its routing belongs to.
+fn connected_elsewhere(
+    view: &AgentView,
+    destination: Option<&ReportingDestination>,
+) -> Option<String> {
+    if view.local.reporting_installed
+        && let Some((from, _)) = reporting_elsewhere(&view.local, destination)
+    {
+        return Some(from);
+    }
+    view.routing
+        .as_ref()
+        .filter(|routing| destination.is_some() && !owned_by(routing, destination))
+        .map(|routing| routing.cluster.clone())
+}
+
+fn pick_agents(
+    views: &[AgentView],
+    destination: Option<&ReportingDestination>,
+    prompter: &dyn Prompter,
+) -> Result<Vec<AgentView>> {
     println!("Local coding agents:");
     print_agent_table(views);
     println!();
@@ -993,17 +1139,28 @@ fn pick_agents(views: &[AgentView], prompter: &dyn Prompter) -> Result<Vec<Agent
         .iter()
         .map(|view| {
             let mut label = format!("{} ({})", view.local.display_name, view.local.id);
-            if view.is_connected() {
+            if connected_here(view, destination) {
                 label.push_str(" — already connected; select to change its setup");
+            } else if let Some(other) = connected_elsewhere(view, destination) {
+                // Connected to another cluster: offered like a new one, so a new cluster can take
+                // every agent, not only the ones never connected anywhere.
+                label.push_str(&format!(" — connected to {other}; select to move it here"));
             } else if view.router.is_none() {
-                label.push_str(" — session reporting only");
+                label
+                    .push_str(" — can report sessions only; its LLM calls can't go through Nasiko");
             }
             label
         })
         .collect();
-    let defaults: Vec<bool> = detected.iter().map(|view| !view.is_connected()).collect();
+    let defaults: Vec<bool> = detected
+        .iter()
+        .map(|view| !connected_here(view, destination))
+        .collect();
+    term::print_note(
+        "You'll be asked about each part of the setup next, and shown every change before anything is applied.",
+    );
     let chosen = prompter.multi_select(
-        "Which coding agents do you want to connect? (space selects, enter confirms)",
+        "Which coding agents should Nasiko set up? (space selects, enter confirms)",
         &labels,
         &defaults,
     )?;
@@ -1023,7 +1180,10 @@ fn ensure_logged_in(prompter: &dyn Prompter) -> Result<()> {
             return Err(error);
         }
         term::print_warning(&format!("{error:#}"));
-        if !prompter.confirm(&format!("Log in to {cluster} now?"), true)? {
+        if !prompter.confirm(
+            &format!("Log in to {cluster} now? (connecting coding agents needs a login)"),
+            true,
+        )? {
             bail!("a Nasiko login is required to connect coding agents");
         }
         auth::login_without_setup()?;
@@ -1094,16 +1254,18 @@ fn build_plan(
         && prompter.interactive()
         && options.config.is_none()
         && options.agent.is_none()
-        && !prompter.confirm(
-            &format!(
-                "Route LLM calls from {} through Nasiko?",
-                names(&agents, &new_routing)
-            ),
-            true,
-        )?
     {
-        for &i in &new_routing {
-            agents[i].routing = RoutingStep::Skip;
+        let who = names(&agents, &new_routing);
+        term::print_note(&format!(
+            "LLM routing sends the LLM calls of {who} to Nasiko instead of straight to the model \
+             provider. Nasiko answers them with an LLM config you pick next (its provider, model \
+             and key) and records their tokens and cost. Without it, they keep calling the \
+             provider directly with their own login."
+        ));
+        if !prompter.confirm(&format!("Route LLM calls from {who} through Nasiko?"), true)? {
+            for &i in &new_routing {
+                agents[i].routing = RoutingStep::Skip;
+            }
         }
     }
 
@@ -1147,13 +1309,13 @@ fn build_plan(
             }
             _ => true,
         });
-        choices.mcp = Some(prompter.confirm(
-            &format!(
-                "Give {} your MCP connectors through the Nasiko gateway?",
-                names(&agents, &routed)
-            ),
-            suggested,
-        )?);
+        let who = names(&agents, &routed);
+        term::print_note(&format!(
+            "MCP gateway: adds one MCP server, `nasiko`, to {who}. It offers the tools of the MCP \
+             connectors you can use on Nasiko; nothing else in their MCP setup changes."
+        ));
+        choices.mcp =
+            Some(prompter.confirm(&format!("Add the Nasiko MCP server to {who}?"), suggested)?);
     }
 
     // Reporting already installed — working or not — is checked on its own, so its saved
@@ -1172,26 +1334,20 @@ fn build_plan(
         } else if options.mentions_reporting() {
             true
         } else if prompter.interactive() {
-            prompter.confirm(
-                &format!(
-                    "Report sessions from {} to Nasiko observability?",
-                    names(&agents, &unreported)
-                ),
-                true,
-            )?
+            let who = names(&agents, &unreported);
+            let to = destination.map_or("this cluster", |to| to.cluster_name.as_str());
+            term::print_note(&format!(
+                "Session reporting installs a hook in {who} that sends each coding session's usage \
+                 ({}) to {to}, where it shows in Nasiko's sessions and cost views. It doesn't \
+                 change how they work.",
+                integration::USAGE
+            ));
+            prompter.confirm(&format!("Report sessions from {who} to {to}?"), true)?
         } else {
             false
         };
         if report {
-            let capture_content = match options.content_choice() {
-                Some(choice) => choice,
-                None if prompter.interactive() => prompter.confirm(
-                    "Include prompt and response text? (No sends only tokens, latency and cost)",
-                    true,
-                )?,
-                // A script asked for reporting, not for text: that takes --content.
-                None => false,
-            };
+            let capture_content = chat_history_choice(options, destination, prompter)?;
             for &i in &unreported {
                 agents[i].reporting = ReportingStep::Install {
                     capture_content,
@@ -1207,12 +1363,48 @@ fn build_plan(
     })
 }
 
+/// Whether reporting installed (or moved) to `destination` syncs chat history — prompts,
+/// responses, tool output — as well as usage. Only to a control plane that keeps it (its own
+/// answer, [`ReportingDestination::accepts_chat_history`]): there `--content`/`--no-content`
+/// decide, else a terminal is asked (default no) and a script gets usage only. One that doesn't
+/// never gets it, whatever the flags, and is said so instead; nor does one that couldn't be asked.
+fn chat_history_choice(
+    options: &ConnectOptions,
+    destination: Option<&ReportingDestination>,
+    prompter: &dyn Prompter,
+) -> Result<bool> {
+    let cluster = destination.map_or("this cluster", |here| here.cluster_name.as_str());
+    let keeps = destination.map_or(Some(false), |here| here.accepts_chat_history);
+    if keeps.is_none() {
+        term::print_warning(&integration::privacy_unknown(cluster));
+        return Ok(false);
+    }
+    if keeps == Some(false) {
+        if options.content {
+            term::print_warning(&integration::content_refused(cluster));
+        } else {
+            term::print_info(&integration::usage_only_notice(cluster));
+        }
+        return Ok(false);
+    }
+    match options.content_choice() {
+        Some(choice) => Ok(choice),
+        None if prompter.interactive() => {
+            term::print_warning(&integration::chat_history_warning(cluster));
+            prompter.confirm(&integration::chat_history_question(cluster), false)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Installed reporting stays as it is, unless it delivers to another cluster or account than
 /// the active one (moved when asked, or when the flags ask for reporting), its hook needs
 /// reinstalling (likewise), it runs under another agent than the LLM routing that is kept
 /// (likewise — one coding agent is one control-plane agent), or the flags ask for a different
 /// content setting. Whatever is reinstalled keeps the saved content setting unless `--content`
-/// or `--no-content` says otherwise, so prompt and response text is never turned on unasked.
+/// or `--no-content` says otherwise, so prompt and response text is never turned on unasked —
+/// and never kept for a hosted control plane: one saved with it is reinstalled without. When the
+/// control plane couldn't be asked, the saved setting stands (`--no-content` still turns it off).
 fn existing_reporting_step(
     agent: &AgentPlan,
     options: &ConnectOptions,
@@ -1223,29 +1415,49 @@ fn existing_reporting_step(
     if options.no_reporting {
         return Ok(ReportingStep::Keep);
     }
-    let capture_content = options.content_choice().unwrap_or(local.capture_content);
+    let here_keeps_chat_history = destination.map_or(Some(false), |here| here.accepts_chat_history);
     let asked = |question: String| -> Result<bool> {
         Ok(options.mentions_reporting()
             || (prompter.interactive() && prompter.confirm(&question, true)?))
+    };
+    if let Some((from, to)) = reporting_elsewhere(local, destination) {
+        let question = format!(
+            "{} reports its sessions to {from}. Report new sessions to {to} instead? (sessions already sent stay on {from})",
+            local.display_name
+        );
+        if !asked(question)? {
+            return Ok(ReportingStep::Keep);
+        }
+        // Asked like new reporting: an earlier yes was given for another cluster.
+        return Ok(ReportingStep::Install {
+            capture_content: chat_history_choice(options, destination, prompter)?,
+            moving_from: Some(from),
+        });
+    }
+    let cluster = destination.map_or("this cluster", |here| here.cluster_name.as_str());
+    let capture_content = match here_keeps_chat_history {
+        Some(true) => options.content_choice().unwrap_or(local.capture_content),
+        Some(false) => {
+            if options.content {
+                term::print_warning(&integration::content_refused(cluster));
+            }
+            false
+        }
+        // Unknown, not no: an outage or an expired login must not rewrite an earlier answer.
+        None => {
+            if options.content && !local.capture_content {
+                term::print_warning(&integration::content_unconfirmed(cluster));
+            }
+            local.capture_content && options.content_choice() != Some(false)
+        }
     };
     let install = |moving_from: Option<String>| ReportingStep::Install {
         capture_content,
         moving_from,
     };
-    if let Some((from, to)) = reporting_elsewhere(local, destination) {
-        let question = format!(
-            "{} reports sessions to {from}. Move reporting to {to}?",
-            local.display_name
-        );
-        return Ok(if asked(question)? {
-            install(Some(from))
-        } else {
-            ReportingStep::Keep
-        });
-    }
     if !local.reporting_active {
         let question = format!(
-            "{}'s session reporting hook {}. Reinstall it?",
+            "{}'s session reporting hook {}, so its sessions aren't being reported. Reinstall it?",
             local.display_name,
             stale_reason(local)
         );
@@ -1260,7 +1472,7 @@ fn existing_reporting_step(
         && let Some(routing_agent) = misaligned_routing_agent(agent, destination)
     {
         let question = format!(
-            "{} reports sessions under agent {}, but its LLM routing uses agent {routing_agent}. Report under {routing_agent}?",
+            "{} reports sessions under agent {}, but its LLM routing uses agent {routing_agent}. Report under {routing_agent}, so its sessions and LLM calls show as one agent?",
             local.display_name,
             local.reporting_agent_name.as_deref().unwrap_or("?")
         );
@@ -1374,19 +1586,22 @@ fn existing_routing_step(
     let broken = made_as_another_account(current, destination);
     let keep = if broken {
         format!(
-            "Keep it (agent {} on {}) — set up as another account, so its LLM calls fail for you",
+            "Keep it as it is (agent {} on {}) — set up as another account, so its LLM calls fail for you",
             current.agent_name, current.cluster
         )
     } else {
         format!(
-            "Keep it (agent {} on {})",
+            "Keep it as it is (agent {} on {}) — no change",
             current.agent_name, current.cluster
         )
     };
-    let items = vec![keep, "Reconnect with new settings".to_string()];
+    let items = vec![
+        keep,
+        "Set it up again — you'll pick an LLM config and the MCP server next".to_string(),
+    ];
     let choice = prompter.select(
         &format!(
-            "{} LLM routing is already connected.",
+            "{} already sends its LLM calls through Nasiko. What should happen to that?",
             view.local.display_name
         ),
         &items,
@@ -1437,21 +1652,24 @@ fn choose_llm_config(
                 llm_config_hint()
             ))
         ));
-        if prompter.confirm("Continue without LLM routing?", true)? {
+        if prompter.confirm(
+            "Continue without LLM routing? (the agents keep calling their model provider directly)",
+            true,
+        )? {
             return Ok(None);
         }
         bail!("an LLM config is required for LLM routing");
     }
     let mut items = Vec::new();
     if reconnecting {
-        items.push("Keep the routing agent's current LLM config".to_string());
+        items.push("Keep the LLM config it uses now".to_string());
     }
     let first_config = items.len();
     items.extend(configs.iter().map(config_label));
     items.push(if reconnecting {
-        "Don't change LLM routing (connected agents stay as they are)".to_string()
+        "Leave LLM routing as it is (connected agents stay as they are)".to_string()
     } else {
-        "Don't route LLM calls through Nasiko".to_string()
+        "Don't route — keep calling the model provider directly".to_string()
     });
     let default = if reconnecting {
         0
@@ -1461,7 +1679,11 @@ fn choose_llm_config(
             .position(|config| config.get("is_default").and_then(Value::as_bool) == Some(true))
             .unwrap_or(0)
     };
-    let choice = prompter.select("LLM config to route through:", &items, default)?;
+    let choice = prompter.select(
+        "Which LLM config should answer their LLM calls? (its provider and model are shown)",
+        &items,
+        default,
+    )?;
     if reconnecting && choice == 0 {
         return Ok(Some(keep_current));
     }
@@ -1519,7 +1741,7 @@ fn readable_list(items: &[&str]) -> String {
 }
 
 fn print_plan(plan: &Plan) {
-    println!("\nPlan:");
+    println!("\nWhat will change:");
     for agent in &plan.agents {
         println!("  {}", agent.view.local.display_name);
         if let Some(reason) = &agent.blocked {
@@ -1591,13 +1813,7 @@ fn print_routing_line(agent: &AgentPlan, plan: &Plan) {
 fn reporting_line(agent: &AgentPlan, plan: &Plan) -> String {
     let local = &agent.view.local;
     let destination = plan.destination.as_ref();
-    let content = |capture: bool| {
-        if capture {
-            "with prompt and response text"
-        } else {
-            "tokens, latency and cost only"
-        }
-    };
+    let content = integration::synced;
     let turn_on = format!(
         "{} connect {} --no-routing --reporting",
         cli_name(),
@@ -2004,6 +2220,259 @@ fn reporting_agent_name(agent: &AgentPlan) -> Result<Option<String>> {
     Ok((router.summary)()?.map(|summary| summary.agent_name))
 }
 
+// ─── connecting an A2A agent ─────────────────────────────────────────────────
+
+/// The running A2A agent `target` names (see [`integration::select_a2a_agent`]), with
+/// everything running here (registration reports the whole machine). `None` when it names no
+/// running agent, so `connect` keeps treating it as a control plane; a URL is looked up only
+/// when it is on this machine.
+pub fn running_a2a_agent(
+    target: &str,
+) -> Result<Option<(integration::A2aAgent, integration::RunningA2aAgents)>> {
+    if is_coding_agent(target) || (target.contains("://") && !is_loopback_url(target)) {
+        return Ok(None);
+    }
+    let running = integration::running_a2a_agents();
+    Ok(integration::select_a2a_agent(target, &running)?.map(|agent| (agent, running)))
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let host = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = match host.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => host,
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "0.0.0.0")
+}
+
+/// `nasiko connect <a2a agent>`: register it and route its LLM calls through Nasiko. The
+/// variables go into the file it reads at startup when that file can be determined from its
+/// process, after the user sees the change and agrees; otherwise they are shown to set.
+pub fn connect_a2a(
+    agent: &integration::A2aAgent,
+    running: &integration::RunningA2aAgents,
+    options: &ConnectOptions,
+) -> Result<()> {
+    let prompter = prompter(options.yes);
+    ensure_logged_in(prompter.as_ref())?;
+    let mut connection = integration::prepare_a2a_connection(agent, running)?;
+    let providers = choose_providers(prompter.as_ref(), options, &connection)?;
+    let with_mcp = match options.mcp_choice() {
+        Some(choice) => choice,
+        None => prompter.confirm(
+            &format!(
+                "Give {} your MCP tools through the Nasiko gateway? (its code opens the client; Nasiko shows how)",
+                connection.card_name
+            ),
+            false,
+        )?,
+    };
+    connection.choose(&providers, with_mcp);
+    let cli = cli_name();
+    let name = quoted(&connection.card_name);
+    let written = match &connection.target {
+        integration::EnvTarget::File(file) => {
+            let header = format!(
+                "LLM routing for {}, added by `{cli} connect {name}`. Undo: `{cli} disconnect {name}`",
+                connection.card_name
+            );
+            let text = integration::a2a_connected_text(&connection, file, &header)?;
+            print_planned_write(&connection, file);
+            let agreed = options.yes
+                || prompter.confirm(
+                    &format!("Write these variables to {}?", file.display()),
+                    true,
+                )?;
+            if agreed {
+                integration::save_a2a_connection(&connection, Some((file, &text)))?;
+                term::print_success(&format!("Wrote the Nasiko variables to {}", file.display()));
+                term::print_info(&format!(
+                    "{} now holds this agent's Nasiko key; keep it out of version control.",
+                    file.display()
+                ));
+            }
+            agreed
+        }
+        integration::EnvTarget::Unknown(_) => false,
+    };
+    if !written {
+        integration::save_a2a_connection(&connection, None)?;
+    }
+    print_next_steps(&connection, written);
+    Ok(())
+}
+
+/// The providers whose calls `connect` routes: `--provider`, else asked with the ones the
+/// agent's env file already uses ticked (OpenAI when it uses none).
+fn choose_providers(
+    prompter: &dyn Prompter,
+    options: &ConnectOptions,
+    connection: &integration::A2aConnection,
+) -> Result<Vec<integration::Provider>> {
+    if !options.providers.is_empty() {
+        return Ok(options.providers.clone());
+    }
+    let all = integration::Provider::ALL;
+    let in_use = &connection.providers_in_use;
+    let defaults: Vec<bool> = all
+        .iter()
+        .map(|provider| {
+            in_use.contains(provider)
+                || (in_use.is_empty() && *provider == integration::Provider::OpenAi)
+        })
+        .collect();
+    let labels: Vec<String> = all
+        .iter()
+        .map(|provider| provider.label().to_string())
+        .collect();
+    let chosen = prompter.multi_select(
+        &format!(
+            "Which LLM providers does {} call? Their calls go through Nasiko (space selects, enter confirms)",
+            connection.card_name
+        ),
+        &labels,
+        &defaults,
+    )?;
+    if chosen.is_empty() {
+        bail!("no provider chosen, so nothing to route; run connect again and select at least one");
+    }
+    Ok(chosen.into_iter().map(|index| all[index]).collect())
+}
+
+fn print_planned_write(connection: &integration::A2aConnection, file: &std::path::Path) {
+    if let Some(folder) = &connection.folder {
+        println!("Agent folder: {}", folder.display());
+    }
+    println!(
+        "{} {} will set (your own lines for these are kept, commented out):",
+        if file.exists() {
+            "Updating"
+        } else {
+            "Creating"
+        },
+        file.display()
+    );
+    for (key, value) in &connection.vars {
+        println!("  {key}={}", planned_value(key, value));
+    }
+}
+
+/// A variable's value as the preview shows it: the secrets (the LLM key, the MCP gateway
+/// credential and the URL that carries it) only named, since the preview is often on a
+/// shared screen. Shown to set by hand, they are printed in full.
+fn planned_value<'a>(key: &str, value: &'a str) -> &'a str {
+    match key {
+        _ if key.ends_with("_KEY") => "<this agent's Nasiko key>",
+        "MCP_GATEWAY_TOKEN" => "<this agent's MCP credential>",
+        "MCP_GATEWAY_CONNECT_URL" => "<the gateway URL with this agent's MCP credential>",
+        _ => value,
+    }
+}
+
+/// What the user still has to do, as a numbered list: set the variables when Nasiko didn't
+/// write them, restart the agent, and — only for MCP tools — change its code once.
+fn print_next_steps(connection: &integration::A2aConnection, written: bool) {
+    let agent = &connection.card_name;
+    println!("\n{}", term::bold("What you need to do:"));
+    let mut step = 0;
+    let mut next = || {
+        step += 1;
+        step
+    };
+    if !written {
+        let why = match &connection.target {
+            integration::EnvTarget::Unknown(reason) => format!(" (Nasiko didn't: {reason})"),
+            integration::EnvTarget::File(_) => String::new(),
+        };
+        println!("  {}. Add these to {agent}'s environment{why}:", next());
+        for (key, value) in &connection.vars {
+            println!("       {key}={value}");
+        }
+    }
+    println!(
+        "  {}. Restart {agent}. No code change for LLM routing; {} shows it on after the first call.",
+        next(),
+        term::cyan(&format!("{} status", cli_name()))
+    );
+    match &connection.mcp {
+        integration::McpSetup::Added => {
+            println!(
+                "  {}. Code change, once, for MCP tools: {}",
+                next(),
+                mcp_snippet(connection.framework)
+            );
+            println!(
+                "  {}. Pick its tools in Nasiko: Agents → {} → MCP.",
+                next(),
+                connection.name
+            );
+        }
+        integration::McpSetup::NotRequested => println!(
+            "\nMCP tools: not added. To add them: {}",
+            term::cyan(&format!(
+                "{} connect {} --mcp",
+                cli_name(),
+                quoted(&connection.name)
+            ))
+        ),
+        integration::McpSetup::Unavailable(reason) => term::print_warning(&format!(
+            "MCP tools not added: the gateway is unavailable ({reason})"
+        )),
+    }
+}
+
+/// How code on `framework` opens Nasiko's MCP gateway from the `MCP_GATEWAY_*` variables.
+fn mcp_snippet(framework: Option<integration::AgentFramework>) -> &'static str {
+    match framework {
+        Some(integration::AgentFramework::LangGraph) => {
+            "use langchain-mcp-adapters:
+
+    import os
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+    mcp = MultiServerMCPClient({\"nasiko\": {
+        \"transport\": \"streamable_http\",
+        \"url\": os.environ[\"MCP_GATEWAY_URL\"],
+        \"headers\": {\"Authorization\": f\"Bearer {os.environ['MCP_GATEWAY_TOKEN']}\"},
+    }})
+    tools = await mcp.get_tools()  # pass them to your graph's model or ToolNode
+"
+        }
+        Some(integration::AgentFramework::CrewAi) => {
+            "use CrewAI's own MCP support:
+
+    import os
+    from crewai.mcp import MCPServerHTTP
+
+    nasiko = MCPServerHTTP(
+        url=os.environ[\"MCP_GATEWAY_URL\"],
+        headers={\"Authorization\": f\"Bearer {os.environ['MCP_GATEWAY_TOKEN']}\"},
+    )
+    agent = Agent(..., mcps=[nasiko])
+"
+        }
+        None => {
+            "point any MCP client (streamable HTTP) at MCP_GATEWAY_URL with the header
+`Authorization: Bearer $MCP_GATEWAY_TOKEN`, or at MCP_GATEWAY_CONNECT_URL when it takes only a URL.
+"
+        }
+    }
+}
+
+/// `name` as a shell word: quoted when it has whitespace.
+fn quoted(name: &str) -> String {
+    if name.chars().any(char::is_whitespace) {
+        format!("\"{name}\"")
+    } else {
+        name.to_string()
+    }
+}
+
 // ─── disconnect ──────────────────────────────────────────────────────────────
 
 struct Removal {
@@ -2014,6 +2483,12 @@ struct Removal {
 
 /// `nasiko disconnect [agent]`: remove LLM routing (with the MCP gateway) and/or reporting.
 pub fn disconnect(target: Option<&str>, options: &DisconnectOptions) -> Result<()> {
+    if let Some(name) = target.filter(|name| !is_coding_agent(name))
+        && let Some(message) = integration::disconnect_a2a_agent(name)?
+    {
+        term::print_success(&format!("{message}. Restart {name} to apply."));
+        return Ok(());
+    }
     let prompter = prompter(options.yes);
     let views = load_views()?;
     let targets: Vec<AgentView> = match target {
@@ -2129,11 +2604,11 @@ fn choose_removal(
         )
     } else if prompter.interactive() && has_routing && has_reporting {
         let items = vec![
-            "LLM routing and MCP gateway".to_string(),
-            "Session reporting".to_string(),
+            "LLM routing and the Nasiko MCP server — its LLM calls go straight to the model provider again".to_string(),
+            "Session reporting — its sessions stop being sent to Nasiko".to_string(),
         ];
         let chosen = prompter.multi_select(
-            &format!("What should be removed from {name}?"),
+            &format!("What should be disconnected from {name}? (space selects, enter confirms)"),
             &items,
             &[true, true],
         )?;
@@ -2218,8 +2693,14 @@ pub fn status(target: Option<&str>) -> Result<()> {
     }
 }
 
+/// Whether `local`'s reporting syncs chat history: agreed to with this CLI, which only offers it
+/// for a control plane that keeps it (`capture_content` is that consent, `integration::local_agents`).
+fn syncs_chat_history(local: &LocalAgent) -> bool {
+    local.capture_content
+}
+
 /// Where an installed reporting hook lives and where it delivers — what `agents discover`
-/// used to show as its CONFIG column, plus the cluster a rebind would move it from.
+/// showed as its CONFIG column before coding agents moved to `status`, plus the cluster a rebind would move it from.
 fn print_reporting_details(local: &LocalAgent) {
     if !local.reporting_installed {
         return;
@@ -2227,14 +2708,10 @@ fn print_reporting_details(local: &LocalAgent) {
     println!("Reporting hook:    {}", local.hook_location);
     match &local.reporting_destination {
         Some(destination) => println!(
-            "Reporting to:      {} ({}){}",
+            "Reporting to:      {} ({}), {}",
             destination.cluster_name,
             destination.cluster_url,
-            if local.capture_content {
-                ""
-            } else {
-                ", tokens, latency and cost only"
-            }
+            integration::synced(syncs_chat_history(local))
         ),
         None => println!(
             "Reporting to:      no cluster recorded; reinstall with: {} connect {} --no-routing --reporting",
@@ -2249,8 +2726,9 @@ pub fn print_overview() -> Result<()> {
     let views = load_views()?;
     println!("Coding agents:");
     print_agent_table(&views);
-    let pending = integration::pending_event_count()?;
     let cli = cli_name();
+    integration::print_discovered_a2a_agents();
+    let pending = integration::pending_event_count()?;
     if pending > 0 {
         println!(
             "\nQueued session events: {pending} (deliver now: {})",
@@ -2262,6 +2740,8 @@ pub fn print_overview() -> Result<()> {
         term::cyan(&format!("{cli} connect [agent]")),
         term::cyan(&format!("{cli} status <agent>"))
     );
+    println!("Discover agents:            {cli} agents discover");
+    println!("Install session reporting:  {cli} connect <agent> --reporting");
     Ok(())
 }
 
@@ -2292,11 +2772,10 @@ fn agent_row(view: &AgentView) -> AgentRow {
         ),
     };
     let reporting = if view.local.reporting_active {
-        if view.local.capture_content {
-            "on".to_string()
-        } else {
-            "on (no content)".to_string()
-        }
+        format!(
+            "on ({})",
+            integration::synced(syncs_chat_history(&view.local))
+        )
     } else if view.local.reporting_installed {
         view.local.reporting_status.clone()
     } else {
@@ -2343,6 +2822,7 @@ mod tests {
     struct Scripted {
         confirms: RefCell<VecDeque<bool>>,
         selects: RefCell<VecDeque<usize>>,
+        picks: RefCell<VecDeque<(Vec<usize>, Vec<bool>)>>,
     }
 
     impl Scripted {
@@ -2350,7 +2830,16 @@ mod tests {
             Self {
                 confirms: RefCell::new(confirms.iter().copied().collect()),
                 selects: RefCell::new(selects.iter().copied().collect()),
+                picks: RefCell::new(VecDeque::new()),
             }
+        }
+
+        /// Answers the next multi-select with `chosen`, asserting what it suggested.
+        fn picking(self, chosen: &[usize], expected_defaults: &[bool]) -> Self {
+            self.picks
+                .borrow_mut()
+                .push_back((chosen.to_vec(), expected_defaults.to_vec()));
+            self
         }
     }
 
@@ -2374,9 +2863,18 @@ mod tests {
             &self,
             question: &str,
             _items: &[String],
-            _defaults: &[bool],
+            defaults: &[bool],
         ) -> Result<Vec<usize>> {
-            bail!("unexpected multi-select: {question}")
+            let (chosen, expected_defaults) = self
+                .picks
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("unexpected multi-select: {question}"))?;
+            assert_eq!(
+                defaults, expected_defaults,
+                "suggested picks for: {question}"
+            );
+            Ok(chosen)
         }
     }
 
@@ -2405,7 +2903,7 @@ mod tests {
             routing_error: None,
             routing: routed.then(|| RoutingSummary {
                 cluster: "prod".into(),
-                cluster_url: "https://cp.example".into(),
+                cluster_url: "http://localhost:8080".into(),
                 principal_id: Some("me".into()),
                 agent_id: format!("id-{id}"),
                 agent_name: format!("me-{id}"),
@@ -2418,8 +2916,10 @@ mod tests {
     fn here() -> ReportingDestination {
         ReportingDestination {
             cluster_name: "prod".into(),
-            cluster_url: "https://cp.example".into(),
+            cluster_url: "http://localhost:8080".into(),
             principal_id: "me".into(),
+            // A server that keeps chat history (an open-source one): the other fixtures differ.
+            accepts_chat_history: Some(true),
         }
     }
 
@@ -2644,6 +3144,240 @@ mod tests {
         view
     }
 
+    fn hosted() -> ReportingDestination {
+        ReportingDestination {
+            cluster_url: "https://nasiko.example".into(),
+            accepts_chat_history: Some(false),
+            ..here()
+        }
+    }
+
+    fn hosted_plan(target: AgentView, options: &ConnectOptions, prompter: &dyn Prompter) -> Plan {
+        build_plan(
+            vec![target],
+            options,
+            Some(&hosted()),
+            prompter,
+            &no_configs_expected,
+        )
+        .unwrap()
+    }
+
+    const TOKENS_ONLY: ReportingStep = ReportingStep::Install {
+        capture_content: false,
+        moving_from: None,
+    };
+
+    #[test]
+    fn an_enterprise_cluster_that_keeps_chat_history_asks_like_a_local_one() {
+        // Not localhost, but its server says it keeps chat history (an admin turned it on).
+        let enterprise = ReportingDestination {
+            cluster_url: "https://nasiko.acme.example".into(),
+            accepts_chat_history: Some(true),
+            ..here()
+        };
+        // Report? yes · sync chat history? yes.
+        let plan = build_plan(
+            vec![view("claude", false, false)],
+            &ConnectOptions {
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            Some(&enterprise),
+            &Scripted::new(&[true, true], &[]),
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.agents[0].reporting,
+            ReportingStep::Install {
+                capture_content: true,
+                moving_from: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_hosted_cluster_is_never_offered_chat_history() {
+        // Asked about reporting only: a chat-history question would be an unexpected confirm.
+        let asked = hosted_plan(
+            view("claude", false, false),
+            &ConnectOptions {
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            &Scripted::new(&[true], &[]),
+        );
+        assert_eq!(asked.agents[0].reporting, TOKENS_ONLY);
+
+        let content_flag = hosted_plan(
+            view("claude", false, false),
+            &ConnectOptions {
+                content: true,
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            &Unattended,
+        );
+        assert_eq!(content_flag.agents[0].reporting, TOKENS_ONLY);
+    }
+
+    #[test]
+    fn reporting_saved_with_chat_history_to_a_hosted_cluster_is_reinstalled_without_it() {
+        let mut saved = view("claude", false, true);
+        saved.local.capture_content = true;
+        saved.local.reporting_destination = Some(hosted());
+        let plan = hosted_plan(
+            saved,
+            &ConnectOptions {
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            &Unattended,
+        );
+        assert_eq!(plan.agents[0].reporting, TOKENS_ONLY);
+    }
+
+    /// The active cluster when its privacy answer couldn't be fetched (down, an expired login).
+    fn unreachable() -> ReportingDestination {
+        ReportingDestination {
+            accepts_chat_history: None,
+            ..here()
+        }
+    }
+
+    #[test]
+    fn a_cluster_that_cant_be_asked_keeps_the_saved_chat_history_setting() {
+        let mut saved = view("claude", false, true);
+        saved.local.capture_content = true;
+        saved.local.reporting_destination = Some(unreachable());
+        let plan = build_plan(
+            vec![saved.clone()],
+            &ConnectOptions {
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            Some(&unreachable()),
+            &Unattended,
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert_eq!(plan.agents[0].reporting, ReportingStep::Keep);
+
+        // `--no-content` still turns it off.
+        let off = build_plan(
+            vec![saved],
+            &ConnectOptions {
+                no_content: true,
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            Some(&unreachable()),
+            &Unattended,
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert_eq!(off.agents[0].reporting, TOKENS_ONLY);
+    }
+
+    #[test]
+    fn new_reporting_to_a_cluster_that_cant_be_asked_is_usage_only_unasked() {
+        // Report? yes · no chat-history question: it would be an unexpected confirm.
+        let plan = build_plan(
+            vec![view("claude", false, false)],
+            &ConnectOptions {
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            Some(&unreachable()),
+            &Scripted::new(&[true], &[]),
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert_eq!(plan.agents[0].reporting, TOKENS_ONLY);
+    }
+
+    #[test]
+    fn moving_reporting_from_a_hosted_cluster_to_localhost_asks_about_chat_history_again() {
+        // Saved with chat history while reporting to a hosted cluster (the old default), where it
+        // never applied: that yes doesn't carry over to localhost.
+        let mut from_hosted = view("claude", false, true);
+        from_hosted.local.capture_content = true;
+        from_hosted.local.reporting_destination = Some(hosted());
+
+        // Yes to the move, no to chat history.
+        let asked = plan_for(
+            vec![from_hosted.clone()],
+            &ConnectOptions {
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            &Scripted::new(&[true, false], &[]),
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert!(matches!(
+            asked.agents[0].reporting,
+            ReportingStep::Install {
+                capture_content: false,
+                moving_from: Some(_)
+            }
+        ));
+
+        let script = plan_for(
+            vec![from_hosted],
+            &ConnectOptions {
+                reporting: true,
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            &Unattended,
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert!(matches!(
+            script.agents[0].reporting,
+            ReportingStep::Install {
+                capture_content: false,
+                moving_from: Some(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn localhost_asks_about_chat_history_and_a_script_gets_tokens_only() {
+        let yes_to_both = plan_for(
+            vec![view("claude", false, false)],
+            &ConnectOptions {
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            &Scripted::new(&[true, true], &[]),
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert_eq!(
+            yes_to_both.agents[0].reporting,
+            ReportingStep::Install {
+                capture_content: true,
+                moving_from: None
+            }
+        );
+
+        let script = plan_for(
+            vec![view("claude", false, false)],
+            &ConnectOptions {
+                reporting: true,
+                no_routing: true,
+                ..ConnectOptions::default()
+            },
+            &Unattended,
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert_eq!(script.agents[0].reporting, TOKENS_ONLY);
+    }
+
     fn elsewhere() -> ReportingDestination {
         ReportingDestination {
             cluster_name: "staging".into(),
@@ -2668,7 +3402,8 @@ mod tests {
         assert_eq!(
             moved.agents[0].reporting,
             ReportingStep::Install {
-                capture_content: true,
+                // A script moving reporting gets usage only: chat history isn't asked for.
+                capture_content: false,
                 moving_from: Some("staging".into())
             }
         );
@@ -2686,14 +3421,14 @@ mod tests {
         .unwrap();
         assert_eq!(kept.agents[0].reporting, ReportingStep::Keep);
 
-        // On a terminal, it asks.
+        // On a terminal, it asks: move? yes · chat history? no.
         let asked = plan_for(
             vec![reporting_to("claude", Some(elsewhere()))],
             &ConnectOptions {
                 no_routing: true,
                 ..ConnectOptions::default()
             },
-            &Scripted::new(&[true], &[]),
+            &Scripted::new(&[true, false], &[]),
             &no_configs_expected,
         )
         .unwrap();
@@ -2879,7 +3614,7 @@ mod tests {
     fn connected(principal_id: Option<&str>, mcp_installed: bool) -> Option<RoutingSummary> {
         Some(RoutingSummary {
             cluster: "prod".into(),
-            cluster_url: "https://cp.example/".into(),
+            cluster_url: "http://localhost:8080/".into(),
             principal_id: principal_id.map(str::to_string),
             agent_id: "id-mine".into(),
             agent_name: "my-agent".into(),
@@ -3519,6 +4254,207 @@ mod tests {
         assert_eq!(maf_hint(), "nasiko maf");
     }
 
+    fn plan_of_offer(offer: Offer) -> Plan {
+        match offer {
+            Offer::Accepted(plan) => plan,
+            Offer::NotAsked => panic!("expected a plan, got NotAsked"),
+            Offer::Declined => panic!("expected a plan, got Declined"),
+        }
+    }
+
+    #[test]
+    fn after_logging_in_picked_agents_move_here_and_are_asked_about_chat_history() {
+        // Both saved with chat history elsewhere; moving here asks each again (yes, then no).
+        let targets = vec![
+            reporting_to("claude", Some(elsewhere())),
+            reporting_to("codex", Some(elsewhere())),
+        ];
+
+        let (offer, declined) = login_offer(
+            targets,
+            Some(&here()),
+            &Scripted::new(&[true, false], &[]).picking(&[0, 1], &[false, false]),
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert!(declined.is_empty());
+        let plan = plan_of_offer(offer);
+
+        let steps: Vec<&ReportingStep> = plan.agents.iter().map(|agent| &agent.reporting).collect();
+        assert_eq!(
+            steps,
+            [
+                &ReportingStep::Install {
+                    capture_content: true,
+                    moving_from: Some("staging".into())
+                },
+                &ReportingStep::Install {
+                    capture_content: false,
+                    moving_from: Some("staging".into())
+                },
+            ]
+        );
+        assert!(
+            plan.agents
+                .iter()
+                .all(|agent| matches!(agent.routing, RoutingStep::Skip | RoutingStep::Keep)),
+            "LLM routing is left alone"
+        );
+    }
+
+    #[test]
+    fn after_logging_in_sessions_are_imported_once_any_agent_reports_here() {
+        let not_installed = view("cursor", false, false);
+        let reporting_here = view("claude", false, true);
+        let staying_elsewhere = reporting_to("codex", Some(elsewhere()));
+
+        assert!(reports_here(
+            &[
+                not_installed.clone(),
+                reporting_here,
+                staying_elsewhere.clone()
+            ],
+            Some(&here())
+        ));
+        assert!(!reports_here(
+            &[not_installed, staying_elsewhere],
+            Some(&here())
+        ));
+        assert!(!reports_here(&[view("claude", false, true)], None));
+    }
+
+    #[test]
+    fn after_logging_in_picking_nothing_changes_nothing_and_remembers_new_agents() {
+        let (offer, declined) = login_offer(
+            vec![
+                reporting_to("claude", Some(elsewhere())),
+                view("cursor", false, false),
+            ],
+            Some(&here()),
+            &Scripted::new(&[], &[]).picking(&[], &[false, false]),
+            &no_configs_expected,
+        )
+        .unwrap();
+
+        assert!(matches!(offer, Offer::Declined));
+        assert_eq!(
+            declined,
+            ["cursor"],
+            "a move left unpicked is offered again"
+        );
+    }
+
+    #[test]
+    fn after_logging_in_a_picked_new_agent_is_asked_about_text() {
+        // pick claude · include text? no
+        let (offer, declined) = login_offer(
+            vec![view("claude", false, false), view("codex", true, false)],
+            Some(&here()),
+            &Scripted::new(&[false], &[]).picking(&[0], &[false, false]),
+            &no_configs_expected,
+        )
+        .unwrap();
+
+        assert_eq!(declined, ["codex"]);
+        let plan = plan_of_offer(offer);
+        assert_eq!(plan.agents.len(), 1);
+        assert_eq!(
+            plan.agents[0].routing,
+            RoutingStep::Skip,
+            "no routing is added"
+        );
+        assert_eq!(
+            plan.agents[0].reporting,
+            ReportingStep::Install {
+                capture_content: false,
+                moving_from: None
+            }
+        );
+    }
+
+    #[test]
+    fn after_logging_in_a_picked_agent_reports_under_the_agent_routing_already_uses() {
+        let (offer, _) = login_offer(
+            vec![view("claude", true, false)],
+            Some(&here()),
+            &Scripted::new(&[true], &[]).picking(&[0], &[false]),
+            &no_configs_expected,
+        )
+        .unwrap();
+        let mut plan = plan_of_offer(offer);
+        verify(&mut plan, &|_, _| Ok(true)).unwrap();
+        assert!(plan.agents[0].reports_under_routing_agent());
+    }
+
+    #[test]
+    fn without_a_terminal_nothing_is_offered_or_declined() {
+        let (offer, declined) = login_offer(
+            vec![view("claude", false, false)],
+            Some(&here()),
+            &Unattended,
+            &no_configs_expected,
+        )
+        .unwrap();
+        assert!(matches!(offer, Offer::NotAsked));
+        assert!(declined.is_empty());
+    }
+
+    #[test]
+    fn the_picker_tells_an_agent_connected_elsewhere_from_one_connected_here() {
+        // Reporting to another cluster: not connected here, so offered (and pre-ticked) as a
+        // move, named by where it reports now.
+        let staging = reporting_to("claude", Some(elsewhere()));
+        assert!(!connected_here(&staging, Some(&here())));
+        assert_eq!(
+            connected_elsewhere(&staging, Some(&here())).as_deref(),
+            Some("staging")
+        );
+        // Reporting here: connected, nothing elsewhere.
+        let local = reporting_to("codex", Some(here()));
+        assert!(connected_here(&local, Some(&here())));
+        assert_eq!(connected_elsewhere(&local, Some(&here())), None);
+        // Never connected: neither.
+        let fresh = view("opencode", false, false);
+        assert!(!connected_here(&fresh, Some(&here())));
+        assert_eq!(connected_elsewhere(&fresh, Some(&here())), None);
+    }
+
+    #[test]
+    fn without_a_known_destination_any_connection_counts_as_here() {
+        let staging = reporting_to("claude", Some(elsewhere()));
+        assert!(connected_here(&staging, None));
+        assert_eq!(connected_elsewhere(&staging, None), None);
+    }
+
+    #[test]
+    fn the_offer_covers_new_agents_and_reporting_that_goes_elsewhere() {
+        let mut declined = view("opencode", false, false);
+        declined.local.reporting_declined = true;
+        let views = vec![
+            view("claude", false, true),
+            reporting_to("codex", Some(elsewhere())),
+            view("cursor", false, false),
+            declined,
+        ];
+        let ids = |views: &[AgentView]| views.iter().map(|view| view.local.id).collect::<Vec<_>>();
+
+        let (offered, told) = split_offered(views, Some(&here()));
+        assert_eq!(ids(&offered), ["codex", "cursor"]);
+        assert_eq!(ids(&told), ["claude", "opencode"]);
+    }
+
+    #[test]
+    fn the_offer_labels_say_where_each_agent_reports_now() {
+        assert_eq!(
+            offer_label(&reporting_to("codex", Some(elsewhere())), Some(&here())),
+            "codex (codex) — reports sessions to staging; select to move it here"
+        );
+        assert_eq!(
+            offer_label(&view("cursor", false, false), Some(&here())),
+            "cursor (cursor) — no session reporting yet"
+        );
+    }
+
     #[test]
     fn the_offer_tells_about_reporting_that_misses_this_cluster_and_about_declines() {
         let reporting_here = view("claude", false, true);
@@ -3633,6 +4569,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("session reporting only"), "{error}");
+        // The test view's display name is its id; the real one is "Cursor".
+        assert!(
+            error.to_lowercase().contains("doesn't support cursor"),
+            "{error}"
+        );
+        assert!(error.contains("Claude Code, Codex or OpenCode"), "{error}");
         // Mixed with an agent that routes, they apply to that one.
         assert!(
             refuse_routing_flags_without_routing(
@@ -4032,39 +4974,16 @@ mod tests {
     // ── offered after logging in ──
 
     #[test]
-    fn without_a_terminal_reporting_is_not_offered() {
-        let offer = reporting_offer(
-            vec![view("claude", false, false)],
-            Some(&here()),
-            &Unattended,
-        )
-        .unwrap();
-        assert!(matches!(offer, Offer::NotAsked));
-    }
-
-    #[test]
-    fn a_no_to_the_offer_turns_nothing_on() {
-        let offer = reporting_offer(
-            vec![view("claude", false, false)],
-            Some(&here()),
-            &Scripted::new(&[false], &[]),
-        )
-        .unwrap();
-        assert!(matches!(offer, Offer::Declined));
-    }
-
-    #[test]
-    fn a_yes_plans_reporting_only_with_the_chosen_content_setting() {
-        // report? yes · include text? no
-        let offer = reporting_offer(
+    fn picking_agents_plans_reporting_only_with_the_chosen_content_setting() {
+        // pick both · include text? no
+        let (offer, _) = login_offer(
             vec![view("claude", true, false), view("codex", false, false)],
             Some(&here()),
-            &Scripted::new(&[true, false], &[]),
+            &Scripted::new(&[false], &[]).picking(&[0, 1], &[false, false]),
+            &no_configs_expected,
         )
         .unwrap();
-        let Offer::Accepted(plan) = offer else {
-            panic!("expected a plan");
-        };
+        let plan = plan_of_offer(offer);
         assert_eq!(
             plan.agents[0].routing,
             RoutingStep::Keep,
@@ -4087,21 +5006,6 @@ mod tests {
     }
 
     #[test]
-    fn a_yes_reports_under_the_agent_routing_already_uses() {
-        let offer = reporting_offer(
-            vec![view("claude", true, false)],
-            Some(&here()),
-            &Scripted::new(&[true, true], &[]),
-        )
-        .unwrap();
-        let Offer::Accepted(mut plan) = offer else {
-            panic!("expected a plan");
-        };
-        verify(&mut plan, &|_, _| Ok(true)).unwrap();
-        assert!(plan.agents[0].reports_under_routing_agent());
-    }
-
-    #[test]
     fn agent_names_read_naturally() {
         let agents: Vec<AgentPlan> = ["a", "b", "c"]
             .into_iter()
@@ -4110,5 +5014,56 @@ mod tests {
         assert_eq!(names(&agents, &[0]), "a");
         assert_eq!(names(&agents, &[0, 1]), "a and b");
         assert_eq!(names(&agents, &[0, 1, 2]), "a, b and c");
+    }
+
+    #[test]
+    fn the_write_preview_names_secrets_rather_than_showing_them() {
+        assert_eq!(
+            planned_value("OPENAI_API_KEY", "jwt"),
+            "<this agent's Nasiko key>"
+        );
+        assert_eq!(
+            planned_value("MCP_GATEWAY_TOKEN", "ngt_x"),
+            "<this agent's MCP credential>"
+        );
+        assert!(
+            !planned_value("MCP_GATEWAY_CONNECT_URL", "http://cp/api/mcp/s/ngt_x").contains("ngt_")
+        );
+        assert_eq!(
+            planned_value("OPENAI_BASE_URL", "http://cp/v1"),
+            "http://cp/v1"
+        );
+    }
+
+    #[test]
+    fn the_mcp_snippets_are_the_code_the_e2e_runs() {
+        // The e2e (`oss/scripts/a2a-discovery-e2e`) runs each snippet's code against a real
+        // gateway; this keeps what `connect` prints the same code.
+        for (framework, script) in [
+            (
+                integration::AgentFramework::LangGraph,
+                include_str!("../../../scripts/a2a-discovery-e2e/mcp_langgraph.py"),
+            ),
+            (
+                integration::AgentFramework::CrewAi,
+                include_str!("../../../scripts/a2a-discovery-e2e/mcp_crewai.py"),
+            ),
+        ] {
+            let printed: Vec<&str> = mcp_snippet(Some(framework))
+                .lines()
+                .map(str::trim)
+                .collect();
+            let ran = script
+                .split("# ── as printed by `nasiko connect` ──")
+                .nth(1)
+                .and_then(|rest| rest.split("# ──").next())
+                .expect("the e2e script marks the printed code");
+            for line in ran.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                assert!(
+                    printed.contains(&line),
+                    "{framework:?} snippet lacks: {line}"
+                );
+            }
+        }
     }
 }

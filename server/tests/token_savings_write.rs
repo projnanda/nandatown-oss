@@ -17,7 +17,7 @@ mod common;
 use std::sync::Arc;
 
 use nasiko_llm_router::usage::{UsageRecord, log_usage};
-use nasiko_pricing::PricingEngine;
+use nasiko_pricing::{NoUsageLedger, PricingEngine};
 use serde_json::json;
 use serial_test::serial;
 use sqlx::PgPool;
@@ -57,8 +57,12 @@ fn record(
         platform_paid: true,
         compress_metadata: None,
         brevity_metadata: None,
+        compact_tools_metadata: None,
+        routing_metadata: None,
         compress_bytes,
+        compact_tools_bytes: None,
         request_bytes,
+        failure: None,
     }
 }
 
@@ -120,17 +124,19 @@ async fn a_compressed_call_writes_both_the_usage_row_and_its_savings_row() {
     log_usage(
         server.db.clone(),
         &pricing,
+        &NoUsageLedger,
         record(user, agent, Some((40_000, 10_000)), Some(8_000)),
     )
     .await
     .unwrap();
 
-    let usage_rows: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM token_usage WHERE agent_id = $1")
-            .bind(agent)
-            .fetch_one(&server.db)
-            .await
-            .unwrap();
+    let usage_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM trace_usage WHERE agent_id = $1 AND priced_by = 'router'",
+    )
+    .bind(agent)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
     assert_eq!(usage_rows, 1, "the usage row must still be written");
 
     let rows = saved_rows(&server.db, agent).await;
@@ -148,16 +154,51 @@ async fn a_compressed_call_writes_both_the_usage_row_and_its_savings_row() {
         "payload compression cannot shorten what the model writes"
     );
     assert_eq!(r.method, "measured_bytes");
-    assert!(
-        !r.token_estimated,
-        "the ratio came from this call's own reported usage, so it is not an estimate"
-    );
+    // Calibrated on this call's own usage, but still an average over the whole request, so the
+    // tokens the compressed text was worth are an estimate.
+    assert!(r.token_estimated);
     // The llm-router holds the flow id, not the contextId; the read path resolves the latter.
     assert_eq!(
         r.flow_id.as_deref(),
         Some("0af7651916cd43dd8448eb211c80319c")
     );
     assert_eq!(r.session_id, None);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_compact_tools_call_writes_its_own_row_beside_compression() {
+    // One call, two layers: each writes its own row, priced the same way.
+    let server = common::TestServer::start().await;
+    let (user, agent) = seed_user_and_agent(&server.db).await;
+    let pricing = PricingEngine::offline();
+
+    log_usage(
+        server.db.clone(),
+        &pricing,
+        &NoUsageLedger,
+        UsageRecord {
+            compact_tools_bytes: Some((10_270, 7_430)),
+            ..record(user, agent, Some((40_000, 10_000)), Some(8_000))
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = saved_rows(&server.db, agent).await;
+    assert_eq!(rows.len(), 2, "one row per layer that saved");
+    let compact = rows
+        .iter()
+        .find(|r| r.layer == "compact_tools")
+        .expect("a compact_tools row: the layer check must admit it");
+    assert_eq!(compact.program, "tool_lists");
+    assert_eq!(compact.bytes_before, Some(10_270));
+    assert_eq!(compact.bytes_after, Some(7_430));
+    // 2 840 bytes at the calibrated 4.0 chars/token.
+    assert_eq!(compact.saved_input_tokens, 710);
+    assert_eq!(compact.saved_output_tokens, 0);
+    assert_eq!(compact.method, "measured_bytes");
+    assert!(rows.iter().any(|r| r.layer == "compress_payload"));
 }
 
 #[tokio::test]
@@ -172,17 +213,19 @@ async fn a_call_with_no_compression_writes_usage_but_no_savings_row() {
     log_usage(
         server.db.clone(),
         &pricing,
+        &NoUsageLedger,
         record(user, agent, None, Some(8_000)),
     )
     .await
     .unwrap();
 
-    let usage_rows: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM token_usage WHERE agent_id = $1")
-            .bind(agent)
-            .fetch_one(&server.db)
-            .await
-            .unwrap();
+    let usage_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM trace_usage WHERE agent_id = $1 AND priced_by = 'router'",
+    )
+    .bind(agent)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
     assert_eq!(usage_rows, 1);
     assert!(saved_rows(&server.db, agent).await.is_empty());
 }
@@ -199,6 +242,7 @@ async fn a_call_that_reported_no_request_size_still_saves_but_says_it_was_estima
     log_usage(
         server.db.clone(),
         &pricing,
+        &NoUsageLedger,
         record(user, agent, Some((40_000, 10_000)), None),
     )
     .await
@@ -222,18 +266,20 @@ async fn the_saving_is_priced_through_the_same_engine_that_priced_the_call() {
     log_usage(
         server.db.clone(),
         &pricing,
+        &NoUsageLedger,
         record(user, agent, Some((40_000, 10_000)), Some(8_000)),
     )
     .await
     .unwrap();
 
     let rows = saved_rows(&server.db, agent).await;
-    let cost: Option<f64> =
-        sqlx::query_scalar("SELECT cost_usd::FLOAT8 FROM token_usage WHERE agent_id = $1")
-            .bind(agent)
-            .fetch_one(&server.db)
-            .await
-            .unwrap();
+    let cost: Option<f64> = sqlx::query_scalar(
+        "SELECT cost_usd::FLOAT8 FROM trace_usage WHERE agent_id = $1 AND priced_by = 'router'",
+    )
+    .bind(agent)
+    .fetch_one(&server.db)
+    .await
+    .unwrap();
 
     // Both are finite and non-negative, and the saving is priced on the prompt side only, so it
     // cannot exceed what the whole call cost.

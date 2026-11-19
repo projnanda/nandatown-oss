@@ -17,6 +17,7 @@ tokio.workspace = true
 # `json` for JSONB columns (mcp_servers.headers, composio session snapshots).
 sqlx = { workspace = true, features = ["json"] }
 redis.workspace = true
+nasiko-redis = { workspace = true }
 reqwest.workspace = true
 
 # Serialization
@@ -48,6 +49,7 @@ nasiko-observability.workspace = true
 nasiko-orchestrator.workspace = true
 # HITL persistence: create_pending_auth_required (protocol.rs's AuthRequired path).
 nasiko-hitl.workspace = true
+nasiko-savings.workspace = true
 # FlowContext::from_traceparent — reused (not reimplemented) to parse the
 # trace_id out of a forwarded `traceparent` header for HITL context resolution.
 nasiko-flow.workspace = true
@@ -60,3 +62,5 @@ anyhow = { workspace = true }
 # HTTP mocking for provider (generic MCP + Composio) tests.
 mockito = { workspace = true }
 tempfile.workspace = true
+# Span-attribute assertions in `protocol.rs` tests (a capturing layer).
+tracing-subscriber.workspace = true

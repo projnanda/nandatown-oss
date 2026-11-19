@@ -142,10 +142,17 @@ class AssistantExecutor(AgentExecutor):
                     if part.get("kind") == "data":
                         agents = part.get("data", {}).get("agents", [])
 
+            # The registry lists public agents to a caller with no credentials,
+            # and gives each one's agent proxy path (`/api/agents/{id}`), never
+            # its internal address. Resolve that path against the control plane.
+            # The proxy checks a user session on every call, which this example
+            # agent does not carry, so a delegation is refused until agent-to-agent
+            # calls through the proxy are supported.
+            base = DISCOVERY_URL.rstrip("/")
             for agent in agents:
                 url = agent.get("url", "")
-                if "localhost" in url:
-                    agent["url"] = url.replace("localhost", "host.docker.internal")
+                if url.startswith("/"):
+                    agent["url"] = f"{base}{url}"
 
             return [a for a in agents if a.get("name") != "assistant-agent"]
 
@@ -196,9 +203,15 @@ If no agent fits, respond with []. Do NOT delegate to yourself (Assistant)."""},
                     # Platform agents speak A2A 1.0: method SendMessage, the
                     # A2A-Version header, ROLE_USER, and bare {"text": ...}
                     # parts (0.3's message/send gets -32601 Method not found).
+                    # Discovered URLs are the platform proxy's, which authenticates an
+                    # agent caller by its own MCP_GATEWAY_TOKEN; the instrumented httpx
+                    # forwards `traceparent`, which names the flow (and user) it acts for.
                     resp = await client.post(
                         f"{url}/",
-                        headers={"A2A-Version": "1.0"},
+                        headers={
+                            "A2A-Version": "1.0",
+                            "Authorization": f"Bearer {os.environ.get('MCP_GATEWAY_TOKEN', '')}",
+                        },
                         json={
                             "jsonrpc": "2.0",
                             "id": str(uuid.uuid4()),

@@ -1,5 +1,5 @@
 /**
- * The app's left sidebar (plans/feat-app-shell.md §3–§4): the header (OpenRuntime home link, collapse), the nav groups
+ * The app's left sidebar (plans/feat-app-shell.md §3–§4): the header (Open Runtime home link, collapse), the nav groups
  * from `nav.ts` or a page's drill-in panel (`SidebarPanel`: Chat's history, Settings' sections), and the footer
  * (status in local builds, account; account settings open from the account menu). Built on shadcn's sidebar primitive.
  */
@@ -26,6 +26,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ReactNode,
   type RefObject,
 } from 'react'
 import {
@@ -65,7 +66,7 @@ import { askForTour } from '@nasiko/app-core/tour'
 import { cn } from '@nasiko/ui/lib/utils'
 import { pickShared, withoutWindow } from '@nasiko/app-core/shell/context'
 import { copy } from '@nasiko/app-core/shell/copy'
-import { NasikoMark } from '@nasiko/ui/composites/NasikoMark'
+import { NasikoLockup, NasikoMark } from '@nasiko/ui/composites/NasikoMark'
 import {
   activeItem,
   backIndex,
@@ -114,6 +115,7 @@ export function AppSidebar({
   const { edition, slots } = use(EditionContext)
   const layers = edition.layers
   const Brand = slots.sidebarBrand
+  const SidebarCard = slots.sidebarCard
   const { setOpenMobile, isMobile, state } = useSidebar()
   const rail = state === 'collapsed' && !isMobile
   const { panels, setTarget } = use(SidebarPanelContext)
@@ -179,10 +181,9 @@ export function AppSidebar({
                     {/* A plain link: TanStack's Link would mark it aria-current on /, doubling the nav's Home item
                       (§3 rule 4: one current item). */}
 
-                    <NasikoMark className="size-4 shrink-0 text-logo" />
-                    <span className={cn(LABEL, 'flex min-w-0 flex-col leading-tight')}>
-                      <span className="truncate font-semibold">{copy.brand}</span>
-                    </span>
+                    {/* h-4: the mark stays the rail's 16 px size. `!` beats the button's `[&>svg]:size-4`, which would
+                      squeeze the whole lockup into a 16 px square. */}
+                    <NasikoLockup className="h-4! w-auto! shrink-0" />
                   </SidebarMenuButton>
                 )}
               </SidebarMenuItem>
@@ -190,9 +191,10 @@ export function AppSidebar({
             </>
           )}
         </SidebarMenu>
-        {/* In the rail a layer's brand row goes under the mark, which keeps expanding the sidebar. */}
+        {/* In the rail a layer's brand row goes under the mark, which keeps expanding the sidebar. A brand with
+            nothing to add there renders nothing, and leaves no gap. */}
         {rail && Brand ? (
-          <SidebarMenu>
+          <SidebarMenu className="has-[>li:empty]:hidden">
             <SidebarMenuItem>
               <Brand />
             </SidebarMenuItem>
@@ -219,6 +221,9 @@ export function AppSidebar({
           hidden={hidden}
           focusNextRef={focusNextRef}
           onPick={pick}
+          // A layer's card ends the scrolling list, hidden while a page's panel holds the sidebar: pinned above the
+          // footer it took the nav's room, so more of the nav had to scroll.
+          end={holds || !SidebarCard ? null : <SidebarCard />}
         />
       )}
       {/* The panel's slot stays mounted (only hidden) under Main menu: the page still knows the sidebar holds its
@@ -299,12 +304,15 @@ function NavGroups({
   hidden,
   focusNextRef,
   onPick,
+  end,
 }: {
   pathname: string
   badges?: NavBadges
   hidden?: readonly string[]
   focusNextRef: FocusNext
   onPick(): void
+  /** After the nav, in the same scrolling list (a layer's card). */
+  end?: ReactNode
 }) {
   // A layer's nav patches (EE: Lab → Weave fixtures) apply on top of the core's items.
   const items = applyNav(NAV_ITEMS, use(EditionContext).edition.layers).filter(
@@ -341,22 +349,22 @@ function NavGroups({
     return () => ro.disconnect()
   }, [measure])
   return (
-    <nav aria-label={copy.navLabel} className="flex min-h-0 flex-1 flex-col">
-      <SidebarContent
-        ref={scroller}
-        onScroll={measure}
-        className={cn(
-          // py-1 leaves room for the first and last rows' focus ring; the rail scrolls too (§4.2a).
-          'gap-0 py-1 group-data-[collapsible=icon]:overflow-auto',
-          edges.top && edges.bottom
-            ? '[mask-image:linear-gradient(to_bottom,transparent,black_16px,black_calc(100%-16px),transparent)]'
-            : edges.top
-              ? '[mask-image:linear-gradient(to_bottom,transparent,black_16px)]'
-              : edges.bottom
-                ? '[mask-image:linear-gradient(to_top,transparent,black_16px)]'
-                : undefined,
-        )}
-      >
+    <SidebarContent
+      ref={scroller}
+      onScroll={measure}
+      className={cn(
+        // py-1 leaves room for the first and last rows' focus ring; the rail scrolls too (§4.2a).
+        'gap-0 py-1 group-data-[collapsible=icon]:overflow-auto',
+        edges.top && edges.bottom
+          ? '[mask-image:linear-gradient(to_bottom,transparent,black_16px,black_calc(100%-16px),transparent)]'
+          : edges.top
+            ? '[mask-image:linear-gradient(to_bottom,transparent,black_16px)]'
+            : edges.bottom
+              ? '[mask-image:linear-gradient(to_top,transparent,black_16px)]'
+              : undefined,
+      )}
+    >
+      <nav aria-label={copy.navLabel}>
         {/* A group with no items (Lab, in a production build) has no header either, and the first group drawn has none:
             while the onboarding guide hides Home, Fleet opens the nav without a header or a leading hairline. */}
         {NAV_GROUPS.filter((g) => items.some((n) => n.group === g.id)).map((g, i) => (
@@ -423,8 +431,10 @@ function NavGroups({
             </SidebarMenu>
           </SidebarGroup>
         ))}
-      </SidebarContent>
-    </nav>
+      </nav>
+      {/* Pushed to the bottom while everything fits, as when it sat above the footer. */}
+      {end ? <div className="mt-auto">{end}</div> : null}
+    </SidebarContent>
   )
 }
 
