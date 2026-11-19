@@ -6,8 +6,9 @@ chat model, with specialized coding tools confined to a workspace directory.
 
 Follows the deployable-agent pattern of `agents/paper` (A2A server via `a2a-server`,
 `AgentExecutor` impl, `/jsonrpc` + agent-card HTTP endpoints), and routes all file/shell access
-through a pluggable `Sandbox` backend. Standalone crate (own `Cargo.lock`, not a workspace
-member) so `docker build`/`nasiko build` can compile it from just this directory.
+through a pluggable `Sandbox` backend. Standalone crate (its own `[workspace]`, not a
+member of the repository's workspace) so `docker build`/`nasiko build` can compile it from just
+this directory; dependencies resolve at build time, as no lockfile is published with it.
 
 ## Status
 
@@ -61,7 +62,7 @@ OPENAI_BASE_URL=https://...      # optional, OpenAI-compatible
 OPENAI_MODEL=gpt-4o-mini         # optional
 WORKSPACE_DIR=/path/to/project   # workspace root (default: current dir)
 SANDBOX_MODE=local               # default; 'remote' is Phase 2
-PORT=8000                        # default 8080
+PORT=8000                        # the default
 
 cargo run
 ```
@@ -86,4 +87,4 @@ curl -s localhost:8000/jsonrpc -d '{"jsonrpc":"2.0","id":"1","method":"message/s
 | `OPENAI_MODEL` | `gpt-4o-mini` | Model id |
 | `WORKSPACE_DIR` | `.` | Workspace root the tools are confined to |
 | `SANDBOX_MODE` | `local` | `local` (host workspace) or `remote` (Phase 2) |
-| `PORT` | `8080` | HTTP listen port |
+| `PORT` | `8000` | HTTP listen port |

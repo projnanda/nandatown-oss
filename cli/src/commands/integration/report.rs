@@ -138,7 +138,9 @@ fn capture_locked(
         ));
         return Ok(Captured::default());
     }
-    let progress = lock.progress()?;
+    let destination_key =
+        state::destination_key(&destination.cluster_url, destination.principal_id);
+    let progress = lock.progress(&destination_key)?;
     if progress.migrated_legacy_counts {
         mode.log(&format!(
             "session {} — migrated legacy progress; replaying complete turns once",
@@ -150,20 +152,29 @@ fn capture_locked(
         pending: pending.len(),
         ..Captured::default()
     };
+    // Chat history only with the consent this CLI records, given for a cluster that keeps it; a
+    // yes an older CLI saved under its default doesn't count. Everything else is usage.
+    let capture_content = agent_state.capture_content && agent_state.chat_history;
     for turn in &pending {
-        let record = QueueRecord::new(
-            destination.clone(),
-            sanitized(canonical_event(
-                agent_id,
-                &agent_state.agent_name,
-                snapshot,
-                turn,
-                agent_state.capture_content,
-            )),
-        );
+        let record = QueueRecord {
+            chat_history: capture_content,
+            ..QueueRecord::new(
+                destination.clone(),
+                sanitized(canonical_event(
+                    agent_id,
+                    &agent_state.agent_name,
+                    snapshot,
+                    turn,
+                    capture_content,
+                )),
+            )
+        };
         if let Err(error) = record.event.validate() {
             queue::reject_invalid(&record, &error)?;
-            lock.mark_captured(std::slice::from_ref(&record.event.turn.id))?;
+            lock.mark_captured(
+                &destination_key,
+                std::slice::from_ref(&record.event.turn.id),
+            )?;
             captured.rejected += 1;
             mode.log(&format!(
                 "session {} turn {} — quarantined invalid event: {error}",
@@ -173,7 +184,12 @@ fn capture_locked(
         }
         ordered_commit(
             || enqueue(&record),
-            || lock.mark_captured(std::slice::from_ref(&record.event.turn.id)),
+            || {
+                lock.mark_captured(
+                    &destination_key,
+                    std::slice::from_ref(&record.event.turn.id),
+                )
+            },
         )?;
         captured.queued.push(record.event.event_id.clone());
     }
@@ -404,14 +420,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_turn_with_nul_characters_is_queued_clean_instead_of_quarantined() {
+    /// Captures one turn (with NUL characters in its prompt and title) for an agent saved with chat
+    /// history on, bound to `cluster_url`; returns what was queued.
+    fn capture_with_content_on(consented: bool) -> Vec<CodingAgentEventV1> {
         let dir = tempfile::tempdir().unwrap();
         let lock =
             SessionLock::acquire(&dir.path().join("s.lock"), dir.path().join("s.json")).unwrap();
         let state = AgentState {
             agent_name: "claude-code".into(),
             capture_content: true,
+            chat_history: consented,
             hook_version: 3,
             binding: None,
         };
@@ -445,10 +463,28 @@ mod tests {
         .unwrap();
 
         assert_eq!((captured.queued.len(), captured.rejected), (1, 0));
-        let event = &queued.borrow()[0];
+        let queued = queued.into_inner();
+        assert_eq!(captured.queued[0], queued[0].event_id);
+        queued
+    }
+
+    #[test]
+    fn a_turn_with_nul_characters_is_queued_clean_instead_of_quarantined() {
+        let event = &capture_with_content_on(true)[0];
         assert_eq!(event.turn.prompt.as_deref(), Some("readthis"));
         assert_eq!(event.session.title.as_deref(), Some("t"));
-        assert_eq!(captured.queued[0], event.event_id);
+    }
+
+    #[test]
+    fn a_yes_saved_by_an_older_cli_captures_usage_only() {
+        let event = &capture_with_content_on(false)[0];
+        assert_eq!(event.capture_policy, CapturePolicy::MetadataOnly);
+        assert_eq!((&event.turn.prompt, &event.turn.response), (&None, &None));
+        assert_eq!(event.session.title, None);
+        assert!(
+            !event.turn.llm_calls.is_empty(),
+            "token usage is still reported"
+        );
     }
 
     #[test]
@@ -459,6 +495,7 @@ mod tests {
         let state = AgentState {
             agent_name: "codex".into(),
             capture_content: true,
+            chat_history: true,
             hook_version: 2,
             binding: None,
         };
@@ -518,6 +555,64 @@ mod tests {
     }
 
     #[test]
+    fn a_session_captured_for_one_control_plane_is_captured_again_for_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock =
+            SessionLock::acquire(&dir.path().join("s.lock"), dir.path().join("s.json")).unwrap();
+        let state = AgentState {
+            agent_name: "claude-code".into(),
+            capture_content: true,
+            chat_history: true,
+            hook_version: 4,
+            binding: None,
+        };
+        let server = |url: &str| QueueDestination {
+            cluster_name: "cluster".into(),
+            cluster_url: url.into(),
+            principal_id: uuid::Uuid::new_v4(),
+        };
+        let (server_1, server_2) = (server("https://one.example"), server("https://two.example"));
+        let snapshot = SessionSnapshot {
+            session_id: "session".into(),
+            title: None,
+            turns: vec![turn("a", true), turn("b", true)],
+            parent: None,
+        };
+        let queued = std::cell::RefCell::new(Vec::new());
+        let capture = |destination: &QueueDestination| {
+            capture_locked(
+                "claude",
+                &state,
+                destination,
+                &snapshot,
+                &lock,
+                CaptureMode::Import,
+                |record| {
+                    queued.borrow_mut().push((
+                        record.destination.cluster_url.clone(),
+                        record.event.turn.id.clone(),
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .queued
+            .len()
+        };
+
+        let counts = (capture(&server_1), capture(&server_2), capture(&server_2));
+
+        assert_eq!(counts, (2, 2, 0));
+        let to_server_2: Vec<String> = queued
+            .borrow()
+            .iter()
+            .filter(|(url, _)| url == "https://two.example")
+            .map(|(_, turn)| turn.clone())
+            .collect();
+        assert_eq!(to_server_2, ["a", "b"]);
+    }
+
+    #[test]
     fn captured_progress_filters_completed_turns() {
         let turns = [turn("a", true), turn("b", true)];
         assert_eq!(
@@ -546,6 +641,7 @@ mod tests {
         let state = super::super::state::AgentState {
             agent_name: "alice-claude-code".into(),
             capture_content: true,
+            chat_history: true,
             hook_version: 1,
             binding: Some(super::super::state::InstallationBinding {
                 cluster_name: "cluster-a".into(),
@@ -565,6 +661,7 @@ mod tests {
         let state = super::super::state::AgentState {
             agent_name: "alice-claude-code".into(),
             capture_content: true,
+            chat_history: true,
             hook_version: 1,
             binding: None,
         };

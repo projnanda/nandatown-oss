@@ -107,13 +107,34 @@ export function SendError({ error, inline = false }: { error: unknown; inline?: 
   ) : null
 }
 
+/**
+ * Files the composer turned away, one line each (§7.7). Not a `SendError`: nothing failed and
+ * nothing was sent — the rest of the message is still there to send.
+ */
+export function AttachNotes({ notes, inline = false }: { notes: string[]; inline?: boolean }) {
+  if (!notes.length) return null
+  return (
+    <ul
+      className={cn(inline ? 'mt-1.5 px-1' : CHAT_COLUMN, 'text-sm text-muted-foreground')}
+      data-testid="attach-notes"
+    >
+      {notes.map((n) => (
+        <li key={n}>{n}</li>
+      ))}
+    </ul>
+  )
+}
+
 export function NotRunningBanner({
   agentId,
   name,
+  byOwner = false,
   refetch,
 }: {
   agentId: string
   name: string
+  /** Stopped by its owner, who isn't this user: they can't start it, so the banner says who stopped it. */
+  byOwner?: boolean
   refetch(): void
 }) {
   // DS17: refetch status on focus and every STATUS_POLL_MS; the banner clears itself.
@@ -142,7 +163,7 @@ export function NotRunningBanner({
         </AgentLinkTo>
       }
     >
-      {copy.targetNotRunning(name)}
+      {byOwner ? copy.stoppedByOwner(name) : copy.targetNotRunning(name)}
     </TargetBanner>
   )
 }

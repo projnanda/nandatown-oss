@@ -71,6 +71,7 @@ import {
   type DisplayStatus,
 } from './status'
 import type { Agent } from './types'
+import { shownStatus } from './watch'
 
 type Tab = (typeof MINE_TABS)[number]
 
@@ -186,9 +187,11 @@ export function MyAgentsPage({
       {deletedNote}
       {rows.length === 0 ? (
         <>
-          <EmptyState icon={Bot} title={copy.noAgentsMine} action={<DeployAgentButton />}>
-            {copy.noAgentsMineHint}
-          </EmptyState>
+          <div data-tour="agents-empty">
+            <EmptyState icon={Bot} title={copy.noAgentsMine} action={<DeployAgentButton />}>
+              {copy.noAgentsMineHint}
+            </EmptyState>
+          </div>
           <div>
             <p className="mb-2 text-xs text-muted-foreground">{deployCopy.entry.orCli}</p>
             <FirstRunSteps />
@@ -198,6 +201,7 @@ export function MyAgentsPage({
         <>
           {attention.length ? (
             <section
+              data-tour="mine-needs"
               aria-label={copy.needsAttention}
               className="rounded-lg border border-warning/40 bg-warning/5"
             >
@@ -432,6 +436,7 @@ function AgentRow({
   linkState: () => HistoryState
 }) {
   const flow = useLifecycleFlow(agent.id)
+  const badge = shownStatus(display, flow.w.watch)
   const name = agent.display_name || agent.name
   const note = outcomeText(flow)
   const actions = actionsFor(display)
@@ -469,10 +474,10 @@ function AgentRow({
         </div>
       </TableCell>
       <TableCell>
-        {display === 'attention' ? (
+        {badge === 'attention' ? (
           <CrashReason agent={agent} />
         ) : (
-          <StatusBadge display={display} raw={agent.status} />
+          <StatusBadge display={badge} raw={agent.status} />
         )}
       </TableCell>
       <TableCell className={WIDE}>{agent.version}</TableCell>

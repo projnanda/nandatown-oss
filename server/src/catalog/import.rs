@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     extract::{Multipart, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::post,
 };
 use serde::{Deserialize, Serialize};
@@ -52,6 +52,14 @@ pub(crate) struct AgentMetadata {
     /// generated `search_vector` column indexes — an agent with no tags is
     /// findable by name and description only.
     tags: Vec<String>,
+    /// `writable` / `writablePath` from the card: deploy the agent with a
+    /// persistent, private `/workspace` volume (the `--writable` flag's effect),
+    /// which some agents (e.g. an opencode harness whose `$HOME` is `/workspace`)
+    /// need to start at all under the read-only root filesystem. Absent = false =
+    /// read-only, so a card that doesn't ask for it deploys exactly as before.
+    writable: bool,
+    /// Container mount target for that volume; `None` = the default `/workspace`.
+    writable_path: Option<String>,
 }
 
 pub(crate) fn read_agent_card(dir: &std::path::Path) -> Result<AgentMetadata, String> {
@@ -68,6 +76,20 @@ pub(crate) fn read_agent_card(dir: &std::path::Path) -> Result<AgentMetadata, St
 /// out of the pushed manifest — so an agent describes itself identically in the
 /// catalog however it was published.
 pub(crate) fn agent_metadata_from_card(card: &serde_json::Value) -> AgentMetadata {
+    // Optional deploy hint: a card that needs a persistent writable workspace sets
+    // `writable` (and optionally `writablePath`). Accept the snake-case spelling too, so
+    // a hand-written card isn't silently ignored. Absent = read-only (unchanged behavior).
+    let writable_path = card
+        .get("writablePath")
+        .or_else(|| card.get("writable_path"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    // A path implies writable, matching the CLI's `--writable-path` (agents/deploy.rs).
+    let writable = card
+        .get("writable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || writable_path.is_some();
     AgentMetadata {
         // Slugified, because this feeds `build_image_tag` and an OCI repository
         // name may not contain spaces or uppercase. A card naming itself
@@ -126,6 +148,8 @@ pub(crate) fn agent_metadata_from_card(card: &serde_json::Value) -> AgentMetadat
             }
             seen
         },
+        writable,
+        writable_path,
     }
 }
 
@@ -180,6 +204,38 @@ where
     })?
 }
 
+/// Run an import on its own task and wait for it. An import builds and deploys
+/// inside its request, for minutes, and a client that leaves part way (a closed
+/// tab, a reload) drops the request: on the request's own task the import would
+/// stop wherever it was, its agent left `deploying` for good. Here only the wait
+/// is dropped, and the import still ends `running` or `failed`.
+async fn detached(work: impl Future<Output = Response> + Send + 'static) -> Response {
+    tokio::spawn(work).await.unwrap_or_else(|e| {
+        tracing::error!(%e, "import: task failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+    })
+}
+
+/// The response body for an install whose image build failed: a plain-language reason the
+/// UI shows directly, plus the `build_id` so it can fetch the full log from
+/// `GET /api/builds/{id}/logs`. JSON (parsed by the client's error handler) rather than the
+/// bare `"internal error"` this path used to return, which told the user nothing.
+fn build_failed_body(build_id: Uuid) -> String {
+    serde_json::json!({
+        "error": "The agent's image failed to build. See the build logs for details.",
+        "build_id": build_id,
+    })
+    .to_string()
+}
+
+/// An import that stopped after registering its agent `deploying` leaves it `failed`.
+async fn mark_agent_failed(db: &sqlx::PgPool, agent_id: Uuid) {
+    let _ = sqlx::query("UPDATE agents SET status = 'failed', updated_at = now() WHERE id = $1")
+        .bind(agent_id)
+        .execute(db)
+        .await;
+}
+
 /// Find the caller's own agent by name, if any.
 ///
 /// Scoped to `owner_id` — agent names are only unique **per owner**, per migration
@@ -212,9 +268,21 @@ pub(crate) async fn build_and_deploy(
 ) -> Result<ImportResult, (StatusCode, String)> {
     let image_tag = crate::agents::build_image_tag(
         &state.config.agent_image_registry,
+        owner_id,
         &meta.name,
         &meta.version,
     );
+
+    // Validate image namespace
+    crate::agents::validate_image_ref(
+        &state.db,
+        &state.config.agent_image_registry,
+        &state.config.agent_image_registry_aliases,
+        &image_tag,
+        owner_id,
+        false, // Import is deployer-gated, but still validate non-superusers
+    )
+    .await?;
 
     // Verify Dockerfile exists
     if !source_dir.join("Dockerfile").exists() {
@@ -242,8 +310,11 @@ pub(crate) async fn build_and_deploy(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
         })?;
 
+    // `deploying` until it runs or fails, as every other deploy path writes it
+    // (agents/upload.rs): left at the column's `registered` default, the agent
+    // read as never deployed for the whole build.
     let agent_id: Uuid = if let Some(id) = existing_id {
-        sqlx::query("UPDATE agents SET version = $1, image = $2, updated_at = now() WHERE id = $3 AND owner_id = $4")
+        sqlx::query("UPDATE agents SET version = $1, image = $2, status = 'deploying', updated_at = now() WHERE id = $3 AND owner_id = $4")
             .bind(&meta.version)
             .bind(&image_tag)
             .bind(id)
@@ -256,9 +327,14 @@ pub(crate) async fn build_and_deploy(
             })?;
         id
     } else {
+        state
+            .agent_admission
+            .admit(&mut tx, owner_id, &meta.name)
+            .await
+            .map_err(|(status, body)| (status, body.0.to_string()))?;
         sqlx::query_scalar(
-            r#"INSERT INTO agents (name, display_name, description, owner_id, version, image, skills, capabilities, tags)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            r#"INSERT INTO agents (name, display_name, description, owner_id, version, image, skills, capabilities, tags, status)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'deploying')
                RETURNING id"#,
         )
         .bind(&meta.name)
@@ -364,42 +440,70 @@ pub(crate) async fn build_and_deploy(
     // TODO: migrate to new runtime API — build() now takes tar bytes, not a directory path.
     // For now, read the directory into a tar archive in-memory.
     let source_dir_owned = source_dir.to_path_buf();
-    let tar_bytes = run_blocking(move || crate::build::tar_directory(&source_dir_owned))
-        .await
-        .map_err(|e| {
-            tracing::error!(%e, %agent_id, %build_id, "build_and_deploy: tar source");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error".to_string(),
+    let built = match run_blocking(move || crate::build::tar_directory(&source_dir_owned)).await {
+        Ok(tar_bytes) => state
+            .runtime
+            .build(&tar_bytes, &image_tag)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    match built {
+        Err(log) => {
+            // The build log (Docker's step output / the BuildKit runner's log, or the
+            // single failing line) is the only record of *why* an install failed — persist
+            // it on the build row and hand it back so the user sees it instead of a bare
+            // 500. Without this the real reason reached nobody but the server log.
+            tracing::error!(%log, %agent_id, %build_id, "build_and_deploy: build failed");
+            let _ = sqlx::query(
+                "UPDATE agent_builds SET status = 'failed', updated_at = now() WHERE id = $1",
             )
-        })?;
-    if let Err(e) = state.runtime.build(&tar_bytes, &image_tag).await {
-        tracing::error!(%e, %agent_id, %build_id, "build_and_deploy: docker build failed");
-        let _ = sqlx::query("UPDATE agent_builds SET status = 'failed' WHERE id = $1")
             .bind(build_id)
             .execute(&state.db)
             .await;
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error".to_string(),
-        ));
+            crate::agents::utils::store_build_logs(
+                &state.db,
+                state.oci_storage.as_ref(),
+                build_id,
+                &log,
+            )
+            .await;
+            mark_agent_failed(&state.db, agent_id).await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                build_failed_body(build_id),
+            ));
+        }
+        Ok(report) => {
+            // Keep the successful build's output too, so the Builds view can show what ran.
+            let _ = sqlx::query(
+                "UPDATE agent_builds SET status = 'success', updated_at = now() WHERE id = $1",
+            )
+            .bind(build_id)
+            .execute(&state.db)
+            .await;
+            crate::agents::utils::store_build_logs(
+                &state.db,
+                state.oci_storage.as_ref(),
+                build_id,
+                &report.logs,
+            )
+            .await;
+        }
     }
 
-    // Mark build successful
-    let _ =
-        sqlx::query("UPDATE agent_builds SET status = 'success', updated_at = now() WHERE id = $1")
-            .bind(build_id)
-            .execute(&state.db)
-            .await;
-
     let scaling = state.agent_scaling.begin_deploy(agent_id).await;
-    let replica_bounds = scaling.bounds().await.map_err(|e| {
-        tracing::error!(%e, %agent_id, "build_and_deploy: read replica bounds");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal error".to_string(),
-        )
-    })?;
+    let plan = match scaling.plan().await {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::error!(%e, %agent_id, "build_and_deploy: read the deploy plan");
+            mark_agent_failed(&state.db, agent_id).await;
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            ));
+        }
+    };
     // Deploy container — UUID-keyed (see build_agent_spec) so import re-targets the
     // existing workload on re-import and can't collide cross-team on the name.
     // Seed from agent_env (per-agent secrets + platform OPENAI_*/PORT fallback) like
@@ -421,10 +525,12 @@ pub(crate) async fn build_and_deploy(
         vec![],
         env_vars,
         &state.config.agent_default_memory,
-        replica_bounds,
-        // Catalog import has no --writable equivalent yet.
-        false,
-        None,
+        plan,
+        // Honor the card's writable hint (default read-only): an agent that declares it
+        // needs a persistent /workspace (e.g. an opencode harness) installs working from
+        // one click, instead of deploying read-only and failing to start.
+        meta.writable,
+        meta.writable_path.clone(),
         owner_id,
     );
     crate::agents::attach_pull_credential(
@@ -472,12 +578,7 @@ pub(crate) async fn build_and_deploy(
         }
         Err(e) => {
             tracing::warn!(agent_id = %agent_id, %e, "deploy after build failed");
-            let _ = sqlx::query(
-                "UPDATE agents SET status = 'failed', updated_at = now() WHERE id = $1",
-            )
-            .bind(agent_id)
-            .execute(&state.db)
-            .await;
+            mark_agent_failed(&state.db, agent_id).await;
             None
         }
     };
@@ -515,8 +616,12 @@ pub(crate) async fn build_and_deploy(
 pub(crate) async fn import_upload(
     State(state): State<AppState>,
     claims: Claims,
-    mut multipart: Multipart,
-) -> impl IntoResponse {
+    multipart: Multipart,
+) -> Response {
+    detached(upload_import(state, claims, multipart)).await
+}
+
+async fn upload_import(state: AppState, claims: Claims, mut multipart: Multipart) -> Response {
     let owner_id = match claims.user_uuid() {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -601,7 +706,11 @@ pub(crate) async fn import_github(
     State(state): State<AppState>,
     claims: Claims,
     Json(req): Json<GithubImportRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    detached(github_import(state, claims, req)).await
+}
+
+async fn github_import(state: AppState, claims: Claims, req: GithubImportRequest) -> Response {
     let owner_id = match claims.user_uuid() {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -706,10 +815,10 @@ const SOURCE_MEDIA_TYPE: &str = "application/vnd.nasiko.agent.v1.tar+gzip";
 
 /// Registry hosts always allowed for import, independent of any env var or the
 /// settings-page registry — Nasiko's own registry works out of the box.
-const BUILTIN_ALLOWED_REGISTRY_HOSTS: &[&str] = &["registry.nasiko.dev"];
+const BUILTIN_ALLOWED_REGISTRY_HOSTS: &[&str] = &["registry.nasiko.com"];
 
 /// Extract the bare host from a configured registry URL such as
-/// `https://registry.nasiko.dev` or `registry.nasiko.dev:5000/path`: scheme and
+/// `https://registry.nasiko.com` or `registry.nasiko.com:5000/path`: scheme and
 /// path are stripped; any port is left for `validate_registry_host` to normalize.
 fn registry_url_host(url: &str) -> Option<String> {
     let s = url.trim();
@@ -794,8 +903,8 @@ fn validate_registry_host(host: &str, allowed: &[String]) -> Result<(), (StatusC
 }
 
 /// Import an agent from an OCI registry: a source-tarball layer is built and
-/// deployed like `/import/upload`; a plain container image is pulled and
-/// deployed directly.
+/// deployed like `/import/upload`; a plain container image is deployed
+/// directly, pulled by the runtime.
 #[utoipa::path(
     post,
     path = "/api/import/registry",
@@ -807,14 +916,17 @@ fn validate_registry_host(host: &str, allowed: &[String]) -> Result<(), (StatusC
         (status = 403, description = "Registry import disabled or host not allowed"),
         (status = 422, description = "Registry host not in the allowed list"),
         (status = 502, description = "Registry unreachable or returned an error"),
-        (status = 504, description = "docker pull timed out"),
     ),
 )]
 pub(crate) async fn import_registry(
     State(state): State<AppState>,
     claims: Claims,
     Json(req): Json<RegistryImportRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    detached(registry_import(state, claims, req)).await
+}
+
+async fn registry_import(state: AppState, claims: Claims, req: RegistryImportRequest) -> Response {
     let owner_id = match claims.user_uuid() {
         Ok(id) => id,
         Err(e) => return e.into_response(),
@@ -823,7 +935,7 @@ pub(crate) async fn import_registry(
     // Parse OCI reference: "registry.host/owner/name:tag"
     let (repo_with_host, tag) = split_reference_tag(&req.reference);
 
-    // Split host from repo path: "registry.nasiko.dev/nasiko/agent" → ("registry.nasiko.dev", "nasiko/agent")
+    // Split host from repo path: "registry.nasiko.com/nasiko/agent" → ("registry.nasiko.com", "nasiko/agent")
     let (host, repo) = match repo_with_host.split_once('/') {
         Some((h, r)) => (h, r.to_string()),
         None => {
@@ -996,39 +1108,11 @@ pub(crate) async fn import_registry(
             Err((code, msg)) => (code, msg).into_response(),
         }
     } else {
-        // Container image: pull via docker and deploy directly
-        let image_ref = format!(
-            "{}/{}",
-            registry_url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://"),
-            repo
-        );
-        let image_with_tag = format!("{}:{}", image_ref, tag);
-
-        // Use docker pull to fetch the image, bounded by a timeout so a hung/slow
-        // registry can't block the handler indefinitely (CAT-5; mirrors the
-        // git-clone path which already wraps in tokio::time::timeout).
-        const PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-        let pull_fut = tokio::process::Command::new("docker")
-            .args(["pull", &image_with_tag])
-            .output();
-
-        match tokio::time::timeout(PULL_TIMEOUT, pull_fut).await {
-            Err(_) => {
-                return (StatusCode::GATEWAY_TIMEOUT, "docker pull timed out").into_response();
-            }
-            Ok(Ok(output)) if !output.status.success() => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::error!(%stderr, %image_with_tag, "import_registry: docker pull failed");
-                return (StatusCode::BAD_GATEWAY, "docker pull failed").into_response();
-            }
-            Ok(Err(e)) => {
-                tracing::error!(%e, "import_registry: docker pull spawn error");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
-            }
-            Ok(Ok(_)) => {}
-        }
+        // Container image: deployed straight from the reference. The manifest
+        // fetched above proves it exists, and the runtime pulls it itself
+        // (Docker's daemon on create, Kubernetes' kubelet), so the server needs
+        // no `docker` binary of its own: a server image without one imports too.
+        let image_with_tag = format!("{host}/{repo}:{tag}");
 
         // Derive agent name from repo
         let agent_name = repo.rsplit('/').next().unwrap_or("agent").to_string();
@@ -1058,6 +1142,20 @@ pub(crate) async fn import_registry(
         };
 
         // Register agent in catalog — only update if this caller owns the existing entry.
+        let mut tx = match state.db.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(%e, %agent_name, %owner_id, "import_registry: begin tx");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            }
+        };
+        if let Err(refusal) = state
+            .agent_admission
+            .admit(&mut tx, owner_id, &agent_name)
+            .await
+        {
+            return refusal.into_response();
+        }
         let agent_id: Uuid = match sqlx::query_scalar(
             // Conflict target is the (owner_id, name) partial unique index
             // (migration 015); the owner is part of the key, so a conflict
@@ -1069,23 +1167,27 @@ pub(crate) async fn import_registry(
             // `skills`/`capabilities` are NOT NULL, so the insert side spells
             // out the same fallbacks the column defaults use — `DEFAULT` is not
             // an expression and cannot appear inside COALESCE.
+            //
+            // `deploying` until the pull and deploy settle, as `build_and_deploy` writes it.
             r#"INSERT INTO agents (name, display_name, owner_id, version, image,
-                                   description, skills, capabilities, tags)
+                                   description, skills, capabilities, tags, status)
                VALUES ($1, COALESCE($5, $1), $2, $3, $4, $6,
                        COALESCE($7, '[]'::jsonb),
                        COALESCE($8, '{"streaming": false, "chat_agent": false,
                                       "pushNotifications": false,
                                       "stateTransitionHistory": false}'::jsonb),
-                       COALESCE($9, '{}'::text[]))
+                       COALESCE($9, '{}'::text[]), 'deploying')
                ON CONFLICT (owner_id, name) WHERE deleted_at IS NULL DO UPDATE
                  SET version = EXCLUDED.version,
                      image = EXCLUDED.image,
+                     status = 'deploying',
                      display_name = COALESCE($5, agents.display_name),
                      description = COALESCE($6, agents.description),
                      skills = COALESCE($7, agents.skills),
                      capabilities = COALESCE($8, agents.capabilities),
                      tags = COALESCE($9, agents.tags),
                      updated_at = now()
+                 WHERE agents.workload_kind <> 'harness'
                RETURNING id"#,
         )
         .bind(&agent_name)
@@ -1100,14 +1202,14 @@ pub(crate) async fn import_registry(
         .bind(skills)
         .bind(capabilities)
         .bind(tags)
-        .fetch_optional(&state.db)
+        .fetch_optional(&mut *tx)
         .await
         {
             Ok(Some(id)) => id,
             Ok(None) => {
                 return (
                     StatusCode::CONFLICT,
-                    "agent name already in use by another owner",
+                    "agent name already in use by another owner, or by a harness agent",
                 )
                     .into_response();
             }
@@ -1116,12 +1218,17 @@ pub(crate) async fn import_registry(
                 return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
             }
         };
+        if let Err(e) = tx.commit().await {
+            tracing::error!(%e, %agent_id, "import_registry: commit tx");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
 
         let scaling = state.agent_scaling.begin_deploy(agent_id).await;
-        let replica_bounds = match scaling.bounds().await {
-            Ok(bounds) => bounds,
+        let plan = match scaling.plan().await {
+            Ok(plan) => plan,
             Err(e) => {
-                tracing::error!(%e, %agent_id, "import_registry: read replica bounds");
+                tracing::error!(%e, %agent_id, "import_registry: read the deploy plan");
+                mark_agent_failed(&state.db, agent_id).await;
                 return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
             }
         };
@@ -1138,6 +1245,12 @@ pub(crate) async fn import_registry(
             crate::agents::deploy_env::StateModeOnDeploy::Reset,
         )
         .await;
+        // Honor the writable hint from the card the publisher embedded in the manifest
+        // (default read-only), the same as the source path above.
+        let (writable, writable_path) = match &described {
+            Some(m) => (m.writable, m.writable_path.clone()),
+            None => (false, None),
+        };
         let mut spec = crate::agents::build_agent_spec(
             agent_id,
             &agent_name,
@@ -1145,10 +1258,9 @@ pub(crate) async fn import_registry(
             vec![],
             env_vars,
             &state.config.agent_default_memory,
-            replica_bounds,
-            // Catalog import has no --writable equivalent yet.
-            false,
-            None,
+            plan,
+            writable,
+            writable_path,
             owner_id,
         );
         crate::agents::attach_pull_credential(
@@ -1177,12 +1289,7 @@ pub(crate) async fn import_registry(
             }
             Err(e) => {
                 tracing::warn!(agent_id = %agent_id, %e, "deploy after pull failed");
-                let _ = sqlx::query(
-                    "UPDATE agents SET status = 'failed', updated_at = now() WHERE id = $1",
-                )
-                .bind(agent_id)
-                .execute(&state.db)
-                .await;
+                mark_agent_failed(&state.db, agent_id).await;
                 None
             }
         };
@@ -1275,6 +1382,30 @@ mod tests {
     }
 
     #[test]
+    fn writable_hint_is_read_off_the_card_and_defaults_off() {
+        // Default: a card that says nothing deploys read-only, as before.
+        let plain = agent_metadata_from_card(&serde_json::json!({"name": "a"}));
+        assert!(!plain.writable);
+        assert_eq!(plain.writable_path, None);
+
+        // Explicit opt-in.
+        let yes = agent_metadata_from_card(&serde_json::json!({"name": "a", "writable": true}));
+        assert!(yes.writable);
+        assert_eq!(yes.writable_path, None);
+
+        // Explicit opt-out stays off.
+        assert!(!agent_metadata_from_card(&serde_json::json!({"writable": false})).writable);
+
+        // A path implies writable and is carried through; snake_case is accepted too.
+        let path = agent_metadata_from_card(&serde_json::json!({"writablePath": "/data"}));
+        assert!(path.writable);
+        assert_eq!(path.writable_path.as_deref(), Some("/data"));
+        let snake = agent_metadata_from_card(&serde_json::json!({"writable_path": "/data"}));
+        assert!(snake.writable);
+        assert_eq!(snake.writable_path.as_deref(), Some("/data"));
+    }
+
+    #[test]
     fn a_manifest_with_no_usable_card_yields_none() {
         // Each of these must leave the import running with whatever metadata it
         // already had, never fail it.
@@ -1296,16 +1427,16 @@ mod tests {
     #[test]
     fn registry_url_host_strips_scheme_and_path() {
         assert_eq!(
-            registry_url_host("https://registry.nasiko.dev"),
-            Some("registry.nasiko.dev".to_string())
+            registry_url_host("https://registry.nasiko.com"),
+            Some("registry.nasiko.com".to_string())
         );
         assert_eq!(
-            registry_url_host("http://registry.nasiko.dev/nasiko/foo"),
-            Some("registry.nasiko.dev".to_string())
+            registry_url_host("http://registry.nasiko.com/nasiko/foo"),
+            Some("registry.nasiko.com".to_string())
         );
         assert_eq!(
-            registry_url_host("registry.nasiko.dev:5000/foo"),
-            Some("registry.nasiko.dev:5000".to_string())
+            registry_url_host("registry.nasiko.com:5000/foo"),
+            Some("registry.nasiko.com:5000".to_string())
         );
         assert_eq!(registry_url_host("   "), None);
         assert_eq!(registry_url_host(""), None);
@@ -1319,8 +1450,8 @@ mod tests {
             .iter()
             .map(|h| (*h).to_string())
             .collect();
-        assert!(validate_registry_host("registry.nasiko.dev", &allowed).is_ok());
-        assert!(validate_registry_host("registry.nasiko.dev:443", &allowed).is_ok());
+        assert!(validate_registry_host("registry.nasiko.com", &allowed).is_ok());
+        assert!(validate_registry_host("registry.nasiko.com:443", &allowed).is_ok());
         assert!(validate_registry_host("evil.example.com", &allowed).is_err());
     }
 
@@ -1426,15 +1557,15 @@ mod tests {
 
     #[test]
     fn reference_tag_defaults_to_latest() {
-        let (repo, tag) = split_reference_tag("registry.nasiko.dev/nasiko/a");
-        assert_eq!(repo, "registry.nasiko.dev/nasiko/a");
+        let (repo, tag) = split_reference_tag("registry.nasiko.com/nasiko/a");
+        assert_eq!(repo, "registry.nasiko.com/nasiko/a");
         assert_eq!(tag, "latest");
     }
 
     #[test]
     fn reference_tag_is_split_after_the_last_slash() {
-        let (repo, tag) = split_reference_tag("registry.nasiko.dev/nasiko/a:1.0.1");
-        assert_eq!(repo, "registry.nasiko.dev/nasiko/a");
+        let (repo, tag) = split_reference_tag("registry.nasiko.com/nasiko/a:1.0.1");
+        assert_eq!(repo, "registry.nasiko.com/nasiko/a");
         assert_eq!(tag, "1.0.1");
     }
 

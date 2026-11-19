@@ -98,6 +98,7 @@ async fn queue_upload(
 ) -> Result<(Uuid, Uuid), McpError> {
     let image_tag = crate::agents::build_image_tag(
         &state.config.agent_image_registry,
+        owner_id,
         &format!("mcp-{name}"),
         &version_tag,
     );
@@ -115,15 +116,35 @@ async fn queue_upload(
     .await?;
 
     let build_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO mcp_connector_builds (connector_id, owner_id, version_tag, github_url, source_key) \
-         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        "INSERT INTO mcp_connector_builds (connector_id, owner_id, version_tag, github_url, source_key, image_tag) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(connector_id)
     .bind(owner_id)
     .bind(&version_tag)
     .bind(&github_url)
     .bind(&source_key)
+    .bind(&image_tag)
     .fetch_one(&mut *tx)
+    .await?;
+
+    // Independent of the connector/build rows above: survives
+    // `delete_mcp_connector_or_mark_failed` deleting both of them on a
+    // first-time build failure, so the CLI/UI can still learn why (mirrors
+    // agents' `upload_status`, keyed the same way: `upload_id` = this build's id).
+    // In the same transaction as the two inserts above (not best-effort): a
+    // mid-transaction error leaves `tx` aborted in Postgres, so swallowing it
+    // here would only surface as a confusing failure on the commit below.
+    sqlx::query(
+        "INSERT INTO mcp_upload_status (upload_id, connector_id, connector_name, owner_id, status, source) \
+         VALUES ($1, $2, $3, $4, 'pending', $5)",
+    )
+    .bind(build_id.to_string())
+    .bind(connector_id)
+    .bind(&name)
+    .bind(owner_id)
+    .bind(if github_url.is_some() { "github" } else { "zip" })
+    .execute(&mut *tx)
     .await?;
 
     // Encrypted at rest in build_jobs.payload — decrypted only inside the
@@ -195,6 +216,56 @@ pub async fn get_build_status(
         "build_status": connector.build_status,
         "error_msg": row.1,
         "image_tag": connector.container_image_tag,
+    }))
+}
+
+/// `GET /api/mcp/connectors/uploads/{upload_id}` — the durable counterpart to
+/// [`get_build_status`]: keyed by `upload_id` (the build's own id as text,
+/// same as `upload_status.upload_id` for agents), so it keeps answering after
+/// a first-time build failure deletes the connector/build rows
+/// (`delete_mcp_connector_or_mark_failed`). Ownership-checked against
+/// `mcp_upload_status.owner_id` directly, since the connector it names may no
+/// longer exist to check ownership against.
+#[derive(sqlx::FromRow)]
+struct McpUploadStatusRow {
+    connector_id: Option<Uuid>,
+    connector_name: String,
+    status: String,
+    owner_id: Uuid,
+    error_message: Option<String>,
+}
+
+pub async fn get_upload_status(
+    db: &PgPool,
+    caller: Uuid,
+    is_admin: bool,
+    upload_id: &str,
+) -> Result<serde_json::Value, McpError> {
+    let row: Option<McpUploadStatusRow> = sqlx::query_as(
+        "SELECT connector_id, connector_name, status, owner_id, error_message \
+         FROM mcp_upload_status WHERE upload_id = $1",
+    )
+    .bind(upload_id)
+    .fetch_optional(db)
+    .await?;
+
+    let Some(row) = row else {
+        return Err(McpError::NotFound(format!(
+            "upload '{upload_id}' not found"
+        )));
+    };
+    if !is_admin && row.owner_id != caller {
+        return Err(McpError::Forbidden(
+            "this upload does not belong to you".into(),
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "upload_id": upload_id,
+        "connector_id": row.connector_id,
+        "connector_name": row.connector_name,
+        "status": row.status,
+        "error_message": row.error_message,
     }))
 }
 
@@ -306,6 +377,21 @@ const READINESS_RETRIES: u32 = 30;
 const READINESS_BACKOFF: Duration = Duration::from_secs(3);
 const READINESS_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What [`deploy_and_verify_uploaded_connector`] needs from the app state. The build
+/// worker and the EE carry's startup pass each build one.
+pub struct UploadedConnectorDeploySettings {
+    pub runtime: Arc<dyn ContainerRuntime>,
+    pub db: PgPool,
+    pub http_client: reqwest::Client,
+    pub mcp_servers_network: String,
+    pub upload_default_port: u16,
+    pub agent_runtime: String,
+    pub agent_image_registry: String,
+    pub max_replicas: u32,
+    pub llm: nasiko_orchestrator::providers::LLMProvider,
+    pub description_model: String,
+}
+
 /// Executes one MCP-server build+deploy job end to end. Mirrors
 /// `agents::upload::execute_upload_and_deploy` structurally — read that
 /// function first if anything here is ambiguous, this is its sibling.
@@ -351,7 +437,7 @@ pub async fn execute_mcp_server_build(
     build_secrets_env.insert("NASIKO_INTERNAL_TOKEN".to_string(), internal_token.clone());
     persist_internal_token(&db, connector_id, &internal_token).await;
 
-    let build_and_deploy: Result<String, String> = async {
+    let build_and_deploy: Result<(), String> = async {
         // 2. Acquire source into tmp_dir.
         match &source {
             BuildSource::Zip(zip_path) => {
@@ -403,39 +489,7 @@ pub async fn execute_mcp_server_build(
             .await
             .map_err(|e| format!("docker build: {e}"))?;
 
-        // 6-7. Deploy.
-        let mut spec = build_mcp_server_spec(
-            connector_id,
-            image_tag.clone(),
-            build_secrets_env.clone(),
-            upload_default_port,
-            mcp_servers_network.clone(),
-            max_replicas,
-        );
-        // Mint the K8s image-pull Secret exactly as the agent upload path does
-        // (upload.rs:596). No-ops under Docker (short-circuits when
-        // agent_runtime != "kubernetes").
-        crate::agents::attach_pull_credential(
-            &db,
-            &agent_runtime,
-            &agent_image_registry,
-            &mut spec,
-            connector_id,
-        )
-        .await;
-        runtime
-            .deploy(&spec)
-            .await
-            .map_err(|e| format!("deploy: {e}"))?;
-
-        // 8. Resolve the internal endpoint. The platform's own path convention
-        // for uploaded servers: the Streamable HTTP endpoint must be at `/mcp`
-        // (documented to users at upload time).
-        let endpoint = runtime
-            .endpoint(&ContainerId::from_uuid(connector_id))
-            .await
-            .map_err(|e| format!("resolve endpoint: {e}"))?;
-        Ok(format!("{endpoint}/mcp"))
+        Ok(())
     }
     .await;
 
@@ -448,14 +502,112 @@ pub async fn execute_mcp_server_build(
         let _ = tokio::fs::remove_dir_all(zip_dir).await;
     }
 
-    let mcp_url = match build_and_deploy {
-        Ok(url) => url,
+    if let Err(e) = build_and_deploy {
+        tracing::error!(build_id = %build_id, connector_id = %connector_id, %e, "mcp server build failed");
+        fail_mcp_connector(&db, build_id, connector_id, &e).await;
+        return;
+    }
+
+    // 6-10. Deploy, wait for readiness, sync tools on success, or clean up and
+    // mark failed on readiness failure. Extracted so the carry can redeploy
+    // without re-running the build.
+    let settings = UploadedConnectorDeploySettings {
+        runtime,
+        db,
+        http_client,
+        mcp_servers_network,
+        upload_default_port,
+        agent_runtime,
+        agent_image_registry,
+        max_replicas,
+        llm,
+        description_model,
+    };
+
+    deploy_and_verify_uploaded_connector(
+        &settings,
+        connector_id,
+        name,
+        image_tag,
+        build_secrets_env,
+        build_id,
+    )
+    .await;
+}
+
+/// Deploys an already-built MCP server image, waits for readiness, syncs tools
+/// on success, or destroys the container and marks the build failed on
+/// readiness failure. Returns true if the deployment succeeded and the server
+/// is ready, false otherwise.
+///
+/// Separated from [`execute_mcp_server_build`] so the carry can redeploy an
+/// uploaded connector without re-running the build (the image already exists).
+/// The build worker calls this after building the image; the carry startup pass
+/// calls it with a new build row and the carried env.
+pub async fn deploy_and_verify_uploaded_connector(
+    settings: &UploadedConnectorDeploySettings,
+    connector_id: Uuid,
+    name: String,
+    image_tag: String,
+    build_secrets_env: HashMap<String, String>,
+    build_id: Uuid,
+) -> bool {
+    // 6-7. Deploy.
+    let mut spec = build_mcp_server_spec(
+        connector_id,
+        image_tag.clone(),
+        build_secrets_env,
+        settings.upload_default_port,
+        settings.mcp_servers_network.clone(),
+        settings.max_replicas,
+    );
+    // Mint the K8s image-pull Secret exactly as the agent upload path does
+    // (upload.rs:596). No-ops under Docker (short-circuits when
+    // agent_runtime != "kubernetes").
+    crate::agents::attach_pull_credential(
+        &settings.db,
+        &settings.agent_runtime,
+        &settings.agent_image_registry,
+        &mut spec,
+        connector_id,
+    )
+    .await;
+
+    if let Err(e) = settings.runtime.deploy(&spec).await {
+        tracing::error!(build_id = %build_id, connector_id = %connector_id, %e, "mcp server build failed");
+        fail_mcp_connector(
+            &settings.db,
+            build_id,
+            connector_id,
+            &format!("deploy: {e}"),
+        )
+        .await;
+        return false;
+    }
+
+    // 8. Resolve the internal endpoint. The platform's own path convention
+    // for uploaded servers: the Streamable HTTP endpoint must be at `/mcp`
+    // (documented to users at upload time).
+    let endpoint = match settings
+        .runtime
+        .endpoint(&ContainerId::from_uuid(connector_id))
+        .await
+    {
+        Ok(ep) => ep,
         Err(e) => {
             tracing::error!(build_id = %build_id, connector_id = %connector_id, %e, "mcp server build failed");
-            fail_mcp_connector(&db, build_id, connector_id, &e).await;
-            return;
+            fail_mcp_connector(
+                &settings.db,
+                build_id,
+                connector_id,
+                &format!("resolve endpoint: {e}"),
+            )
+            .await;
+            return false;
         }
     };
+
+    let mcp_url = format!("{endpoint}/mcp");
 
     // 9. Live readiness check — not fetch_agent_card_with_retry (A2A-specific).
     // trusted: true is exactly the case Step 7 built: this URL was resolved by
@@ -474,7 +626,7 @@ pub async fn execute_mcp_server_build(
     };
     // The guarded client is never selected here (trusted is always true for
     // this one-off config), so a plain unconfigured client is fine as its slot.
-    let provider = GenericMcpProvider::new(reqwest::Client::new(), http_client);
+    let provider = GenericMcpProvider::new(reqwest::Client::new(), settings.http_client.clone());
 
     let tools =
         wait_for_readiness(&provider, &server_cfg, READINESS_RETRIES, READINESS_BACKOFF).await;
@@ -484,37 +636,43 @@ pub async fn execute_mcp_server_build(
             "SELECT description FROM mcp_connectors WHERE id = $1",
         )
         .bind(connector_id)
-        .fetch_one(&db)
+        .fetch_one(&settings.db)
         .await
         .unwrap_or(None)
         .is_none();
 
-        mark_running(&db, build_id, connector_id, &mcp_url, &image_tag).await;
+        mark_running(&settings.db, build_id, connector_id, &mcp_url, &image_tag).await;
         sync_tools(
-            &db,
+            &settings.db,
             connector_id,
             &name,
             &tools,
-            &llm,
-            &description_model,
+            &settings.llm,
+            &settings.description_model,
             need_server_description,
         )
         .await;
         tracing::info!(build_id = %build_id, connector_id = %connector_id, tool_count = tools.len(), "mcp server build succeeded");
+        true
     } else {
         // A failed build must never leave an orphaned container running —
         // mirrors the RUN-4 cleanup guarantee already established for agents.
-        if let Err(e) = runtime.destroy(&ContainerId::from_uuid(connector_id)).await {
+        if let Err(e) = settings
+            .runtime
+            .destroy(&ContainerId::from_uuid(connector_id))
+            .await
+        {
             tracing::warn!(connector_id = %connector_id, %e, "failed to destroy container after readiness check exhausted retries");
         }
         tracing::error!(build_id = %build_id, connector_id = %connector_id, "mcp server readiness check failed after {READINESS_RETRIES} retries");
         fail_mcp_connector(
-            &db,
+            &settings.db,
             build_id,
             connector_id,
             "readiness check failed after exhausting retries",
         )
         .await;
+        false
     }
 }
 
@@ -674,6 +832,8 @@ fn build_mcp_server_spec(
         writable_path: None,
         owner_id: Uuid::nil(),
         force_pull: false,
+        parkable: false,
+        overrides: Default::default(),
     }
 }
 
@@ -715,6 +875,29 @@ async fn mark_building(db: &PgPool, build_id: Uuid, connector_id: Uuid) {
     .await
     {
         tracing::error!(build_id = %build_id, %e, "failed to mark build building");
+    }
+    set_mcp_upload_status(db, build_id, "building", None).await;
+}
+
+/// Updates the connector-independent `mcp_upload_status` row alongside the
+/// connector/build rows at every transition — see that table's own doc
+/// comment (0101_mcp_upload_status.sql) for why it exists.
+async fn set_mcp_upload_status(
+    db: &PgPool,
+    build_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+) {
+    if let Err(e) = sqlx::query(
+        "UPDATE mcp_upload_status SET status = $2, error_message = $3 WHERE upload_id = $1",
+    )
+    .bind(build_id.to_string())
+    .bind(status)
+    .bind(error_message)
+    .execute(db)
+    .await
+    {
+        tracing::error!(%build_id, %e, "failed to update mcp_upload_status");
     }
 }
 
@@ -769,6 +952,7 @@ async fn mark_running(db: &PgPool, build_id: Uuid, connector_id: Uuid, url: &str
     {
         tracing::error!(build_id = %build_id, %e, "failed to mark build success");
     }
+    set_mcp_upload_status(db, build_id, "success", None).await;
 }
 
 /// Marks the build row terminally failed, then defers to
@@ -786,6 +970,19 @@ pub async fn fail_mcp_connector_terminal(db: &PgPool, connector_id: Uuid) {
     {
         tracing::error!(connector_id = %connector_id, %e, "failed to mark build terminally failed");
     }
+    // No `build_id` in scope here (unlike `fail_mcp_connector`) — `mcp_upload_status`
+    // also carries `connector_id`, so update by that instead of looking one up.
+    if let Err(e) = sqlx::query(
+        "UPDATE mcp_upload_status SET status = 'failed', \
+         error_message = COALESCE(error_message, 'build job did not complete') \
+         WHERE connector_id = $1 AND status IN ('pending', 'building')",
+    )
+    .bind(connector_id)
+    .execute(db)
+    .await
+    {
+        tracing::error!(connector_id = %connector_id, %e, "failed to mark mcp_upload_status terminally failed");
+    }
     delete_mcp_connector_or_mark_failed(db, connector_id).await;
 }
 
@@ -802,6 +999,7 @@ async fn fail_mcp_connector(db: &PgPool, build_id: Uuid, connector_id: Uuid, err
     {
         tracing::error!(build_id = %build_id, %e, "failed to mark build failed");
     }
+    set_mcp_upload_status(db, build_id, "failed", Some(error_msg)).await;
     delete_mcp_connector_or_mark_failed(db, connector_id).await;
 }
 

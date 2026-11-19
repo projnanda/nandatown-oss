@@ -15,8 +15,23 @@ export type ChatTargetMode = { chatMode: 'direct'; agentId: string } | { chatMod
  * v1b §2.2). A routed dispatch sends no `agent_id`, so the server runs the orchestrator.
  */
 export function dispatchBody(
-  opts: { rpcId: string; messageId: string; sessionId: string; text: string } & ChatTargetMode,
+  opts: {
+    rpcId: string
+    messageId: string
+    sessionId: string
+    text: string
+    /**
+     * Attachments, by the id their upload returned (§7.7). Named rather than inlined: the server
+     * reads the bytes from storage (`a2a_dispatch.rs::inbound_file_parts`), which is what keeps a
+     * 50 MB file out of a JSON-RPC body axum caps at 2 MiB.
+     */
+    fileIds?: readonly string[]
+  } & ChatTargetMode,
 ) {
+  const target =
+    opts.chatMode === 'direct'
+      ? { agent_id: opts.agentId, session_id: opts.sessionId }
+      : { session_id: opts.sessionId }
   return {
     jsonrpc: '2.0',
     id: opts.rpcId,
@@ -28,10 +43,9 @@ export function dispatchBody(
         role: 'ROLE_USER',
         parts: [{ text: opts.text }],
       },
-      metadata:
-        opts.chatMode === 'direct'
-          ? { agent_id: opts.agentId, session_id: opts.sessionId }
-          : { session_id: opts.sessionId },
+      // Omitted entirely when there are none: an unattached turn's body is byte-identical to
+      // what it was before attachments existed.
+      metadata: opts.fileIds?.length ? { ...target, file_ids: [...opts.fileIds] } : target,
     },
   }
 }
@@ -67,6 +81,9 @@ function usageBody(s: TurnState): SaveMessageBody['usage'] | undefined {
   const out: NonNullable<SaveMessageBody['usage']> = {}
   if (u?.input_tokens !== undefined) out.input_tokens = u.input_tokens
   if (u?.output_tokens !== undefined) out.output_tokens = u.output_tokens
+  // Saved so a reloaded reply counts its cached prompt tokens, as the live stream does.
+  if (u?.cache_read_tokens !== undefined) out.cache_read_tokens = u.cache_read_tokens
+  if (u?.cache_creation_tokens !== undefined) out.cache_creation_tokens = u.cache_creation_tokens
   if (u?.model) out.model = u.model
   if (u?.duration_ms !== undefined) out.duration_ms = Math.round(u.duration_ms)
   if (u?.cost_usd !== undefined) out.cost_usd = u.cost_usd

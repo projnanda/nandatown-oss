@@ -48,6 +48,12 @@ pub struct NewFlow<'a> {
     pub session_id: Option<&'a str>,
 }
 
+/// The session a flow belongs to: the named conversation, or the flow itself when the caller
+/// names none (a single-run session — the same rule as the 0085 backfill).
+pub fn session_or_self<'a>(session_id: Option<&'a str>, flow_id: &'a str) -> &'a str {
+    session_id.unwrap_or(flow_id)
+}
+
 /// Whether `flow_id` already exists and belongs to someone other than `user_id`.
 ///
 /// Callers run this before touching any per-flow state (the flow guard's Redis counters), so a
@@ -88,7 +94,7 @@ pub async fn open_flow(db: &sqlx::PgPool, flow: NewFlow<'_>) -> Result<(), OpenF
     .bind(flow.root_agent_name)
     .bind(flow.title)
     .bind(flow.metadata)
-    .bind(flow.session_id)
+    .bind(session_or_self(flow.session_id, flow.flow_id))
     .fetch_optional(db)
     .await
     .map_err(OpenFlowError::Db)?;
@@ -120,6 +126,31 @@ pub async fn record_participant(db: &sqlx::PgPool, flow_id: &str, agent_id: Uuid
             error = %e, %flow_id, %agent_id,
             "flow participant record failed — this agent's MCP/LLM calls in this flow will be denied"
         );
+    }
+}
+
+/// Withdraw a turn the session refused (busy, superseded, or failed to start): drop the agent's
+/// participant row so the flow no longer counts as one of the session's turns, and fail the flow
+/// when it is still running with no other participant. Best effort: a failed write only leaves
+/// the flow as it was.
+pub async fn abandon_rejected(db: &sqlx::PgPool, flow_id: &str, agent_id: Uuid) {
+    let dropped = sqlx::query("DELETE FROM flow_participants WHERE flow_id = $1 AND agent_id = $2")
+        .bind(flow_id)
+        .bind(agent_id)
+        .execute(db)
+        .await;
+    let failed = sqlx::query(
+        "UPDATE flows SET status = 'failed', error_message = 'turn rejected', completed_at = now()
+          WHERE flow_id = $1 AND status = 'running'
+            AND NOT EXISTS (SELECT 1 FROM flow_participants WHERE flow_id = $1)",
+    )
+    .bind(flow_id)
+    .execute(db)
+    .await;
+    for result in [dropped, failed] {
+        if let Err(e) = result {
+            tracing::warn!(error = %e, %flow_id, "abandoning a rejected turn's flow failed");
+        }
     }
 }
 
@@ -224,11 +255,14 @@ async fn get_flow(
         Err(e) => return e.into_response(),
     };
 
-    let flow = sqlx::query_as::<_, Flow>("SELECT * FROM flows WHERE flow_id = $1 AND user_id = $2")
-        .bind(&flow_id)
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await;
+    let flow = sqlx::query_as::<_, Flow>(
+        "SELECT * FROM flows WHERE flow_id = $1 AND ($2 OR user_id = $3)",
+    )
+    .bind(&flow_id)
+    .bind(claims.is_superuser)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await;
 
     match flow {
         Ok(Some(f)) => {
@@ -261,6 +295,8 @@ struct CreateFlowRequest {
     root_agent_name: Option<String>,
     title: Option<String>,
     metadata: Option<serde_json::Value>,
+    /// Session this flow belongs to; defaults to the flow itself (single-run session).
+    session_id: Option<String>,
 }
 
 async fn create_flow(
@@ -275,9 +311,53 @@ async fn create_flow(
 
     let meta = body.metadata.unwrap_or(serde_json::json!({}));
 
+    // A named session must not belong to someone else: it would attach this flow's traces
+    // and cost to another user's session view.
+    if let Some(sid) = body.session_id.as_deref() {
+        let foreign: Result<bool, sqlx::Error> = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM chat_sessions WHERE session_id = $1 AND user_id <> $2) \
+                 OR EXISTS (SELECT 1 FROM flows WHERE session_id = $1 AND user_id <> $2)",
+        )
+        .bind(sid)
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await;
+        match foreign {
+            Ok(false) => {}
+            Ok(true) => {
+                return (StatusCode::FORBIDDEN, "session belongs to another user").into_response();
+            }
+            Err(e) => {
+                tracing::error!(%e, %user_id, "create_flow: session ownership check failed");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            }
+        }
+    }
+
+    // The flow id doubles as a trace id. Claiming one that already carries another user's
+    // usage would authorize this caller against that user's trace through the new mapping.
+    let trace_taken: Result<bool, sqlx::Error> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM trace_usage WHERE trace_id = $1 AND user_id IS DISTINCT FROM $2) \
+             OR EXISTS (SELECT 1 FROM tool_calls WHERE trace_id = $1 AND user_id IS DISTINCT FROM $2)",
+    )
+    .bind(&body.flow_id)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await;
+    match trace_taken {
+        Ok(false) => {}
+        Ok(true) => {
+            return (StatusCode::FORBIDDEN, "trace belongs to another user").into_response();
+        }
+        Err(e) => {
+            tracing::error!(%e, %user_id, "create_flow: trace ownership check failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    }
+
     let result = sqlx::query_as::<_, Flow>(
-        r#"INSERT INTO flows (flow_id, user_id, root_agent_id, root_agent_name, title, metadata)
-           VALUES ($1, $2, $3, $4, $5, $6)
+        r#"INSERT INTO flows (flow_id, user_id, root_agent_id, root_agent_name, title, metadata, session_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            RETURNING *"#,
     )
     .bind(&body.flow_id)
@@ -286,6 +366,7 @@ async fn create_flow(
     .bind(&body.root_agent_name)
     .bind(&body.title)
     .bind(sqlx::types::Json(meta))
+    .bind(session_or_self(body.session_id.as_deref(), &body.flow_id))
     .fetch_one(&state.db)
     .await;
 
@@ -361,6 +442,20 @@ async fn complete_flow(
     }
 }
 
+/// Whether the caller owns the flow, or is a superuser (who may open anyone's, as
+/// `authorize_session` lets them open anyone's session).
+async fn can_see_flow(state: &AppState, claims: &Claims, user_id: Uuid, flow_id: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM flows WHERE flow_id = $1 AND ($2 OR user_id = $3))",
+    )
+    .bind(flow_id)
+    .bind(claims.is_superuser)
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .unwrap_or(false)
+}
+
 async fn list_steps(
     State(state): State<AppState>,
     claims: Claims,
@@ -371,17 +466,7 @@ async fn list_steps(
         Err(e) => return e.into_response(),
     };
 
-    // Verify ownership
-    let owns = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM flows WHERE flow_id = $1 AND user_id = $2)",
-    )
-    .bind(&flow_id)
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(false);
-
-    if !owns {
+    if !can_see_flow(&state, &claims, user_id, &flow_id).await {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -421,17 +506,7 @@ async fn add_step(
         Err(e) => return e.into_response(),
     };
 
-    // Verify ownership
-    let owns = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM flows WHERE flow_id = $1 AND user_id = $2)",
-    )
-    .bind(&flow_id)
-    .bind(user_id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(false);
-
-    if !owns {
+    if !can_see_flow(&state, &claims, user_id, &flow_id).await {
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -464,5 +539,20 @@ async fn add_step(
             tracing::error!(%e, %user_id, %flow_id, "add_step: db error");
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_or_self;
+
+    #[test]
+    fn named_session_wins() {
+        assert_eq!(session_or_self(Some("ctx-1"), "flow-1"), "ctx-1");
+    }
+
+    #[test]
+    fn missing_session_falls_back_to_flow() {
+        assert_eq!(session_or_self(None, "flow-1"), "flow-1");
     }
 }

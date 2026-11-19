@@ -1,6 +1,7 @@
 /**
  * The CLI guide (`/cli`, the sidebar's help rows): install from this server, the first steps against this cluster and
- * a card per task with its command.
+ * a card per task with its command. The first steps are the setup guide's (onboarding/HarnessStep.tsx): install, then
+ * connect, which signs in itself (through SSO where the server has it) and then asks which coding agents to connect.
  */
 import {
   Bot,
@@ -15,6 +16,7 @@ import { TopBar } from '@nasiko/app-core/shell/TopBar'
 import { CopyButton } from '@nasiko/ui/composites/copy-button'
 import { PageHeader } from '@nasiko/ui/composites/page-header'
 import { Card } from '@nasiko/ui/primitives/card'
+import { connectCommand } from './commands'
 import { copy, TASKS } from './copy'
 
 const ICONS = {
@@ -26,16 +28,10 @@ const ICONS = {
   observe: ChartNoAxesColumn,
 } as const
 
-/** This server's address for `nandatown connect`, or a placeholder where the page isn't served over http(s). */
-const clusterUrl = () =>
-  /^https?:$/.test(window.location.protocol) ? window.location.origin : 'https://<your-cluster>'
-
 export function CliGuidePage() {
   const steps = [
-    { label: copy.start.install, command: copy.install.unixCommand(clusterUrl()) },
-    { label: copy.start.connect, command: `nandatown connect ${clusterUrl()}` },
-    { label: copy.start.signIn, command: 'nandatown auth login' },
-    { label: copy.start.deploy, command: 'nandatown upload' },
+    { label: copy.start.install, command: copy.install.unixCommand },
+    { label: copy.start.connect, command: connectCommand() },
   ]
   return (
     <div className="mx-auto flex w-full max-w-4xl flex-col gap-8">
@@ -58,8 +54,8 @@ export function CliGuidePage() {
         </h2>
         <p className="text-sm text-muted-foreground">{copy.install.line}</p>
         {[
-          { label: copy.install.unix, command: copy.install.unixCommand(clusterUrl()) },
-          { label: copy.install.windows, command: copy.install.windowsCommand(clusterUrl()) },
+          { label: copy.install.unix, command: copy.install.unixCommand },
+          { label: copy.install.windows, command: copy.install.windowsCommand },
         ].map((c) => (
           <div key={c.label} className="flex flex-col gap-1.5">
             <span className="text-xs font-medium text-muted-foreground">{c.label}</span>

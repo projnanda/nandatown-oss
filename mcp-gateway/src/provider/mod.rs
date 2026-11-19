@@ -19,7 +19,7 @@ pub mod composio;
 pub mod generic;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -103,6 +103,10 @@ pub trait ToolProvider: Send + Sync {
         scopes: Option<&[String]>,
     ) -> Result<AuthConfigCreated>;
 
+    /// Whether `auth_config_id` exists in the project this provider's key belongs to.
+    /// `false` after a key from a different project is saved.
+    async fn auth_config_exists(&self, auth_config_id: &str) -> Result<bool>;
+
     /// Initiate a user OAuth connection (Tool Router link). Returns the browser
     /// redirect URL + status.
     async fn initiate_connection(
@@ -157,25 +161,74 @@ pub trait ToolProvider: Send + Sync {
 
 // ─── Registry ───────────────────────────────────────────────────────────────
 
+/// The live Composio backend and the key it authenticates with.
+#[derive(Clone)]
+pub struct ComposioBackend {
+    pub provider: Arc<dyn ToolProvider>,
+    pub api_key: Option<String>,
+}
+
+/// A swappable handle to the Composio backend, shared by every clone of
+/// `McpState`, so a key saved in the admin UI takes effect without a restart.
+#[derive(Clone, Default)]
+pub struct ComposioSlot(Arc<RwLock<Option<ComposioBackend>>>);
+
+impl ComposioSlot {
+    pub fn new(provider: Arc<dyn ToolProvider>, api_key: Option<String>) -> Self {
+        Self(Arc::new(RwLock::new(Some(ComposioBackend {
+            provider,
+            api_key,
+        }))))
+    }
+
+    /// The current provider, or `None` while no key is configured.
+    pub fn get(&self) -> Option<Arc<dyn ToolProvider>> {
+        self.read().as_ref().map(|b| Arc::clone(&b.provider))
+    }
+
+    /// The current provider and its key, read together so a concurrent swap can't pair
+    /// one key's provider with the other key.
+    pub fn backend(&self) -> Option<ComposioBackend> {
+        self.read().clone()
+    }
+
+    /// The key the current provider authenticates with.
+    pub fn api_key(&self) -> Option<String> {
+        self.read().as_ref().and_then(|b| b.api_key.clone())
+    }
+
+    pub fn replace(&self, backend: Option<ComposioBackend>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = backend;
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Option<ComposioBackend>> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Bundle of tool backends held in `McpState`.
 #[derive(Clone)]
 pub struct Providers {
-    /// Composio Tool Router client — `None` when `COMPOSIO_API_KEY` is unset
+    /// Composio Tool Router client — empty when no Composio key is configured
     /// (generic MCP servers still work). Behind `Arc<dyn>` so EE / tests can swap it.
-    pub composio: Option<Arc<dyn ToolProvider>>,
+    pub composio: ComposioSlot,
     /// Shared MCP transport for all backends.
     pub mcp: GenericMcpProvider,
 }
 
 impl Providers {
     pub fn new(http: reqwest::Client, config: &McpConfig) -> Self {
-        let composio = config.composio_api_key.as_ref().map(|key| {
-            Arc::new(ComposioProvider::new(
-                http.clone(),
-                key.clone(),
-                config.composio_base_url.clone(),
-            )) as Arc<dyn ToolProvider>
-        });
+        let composio = match config.composio_api_key.as_ref() {
+            Some(key) => ComposioSlot::new(
+                Arc::new(ComposioProvider::new(
+                    http.clone(),
+                    key.clone(),
+                    config.composio_base_url.clone(),
+                )),
+                Some(key.clone()),
+            ),
+            None => ComposioSlot::default(),
+        };
         // The generic transport talks to user-registered backend URLs by default,
         // so it uses an SSRF/DNS-rebinding-guarded client (rejects private/internal
         // targets at resolution time) rather than the platform's shared client,
@@ -184,18 +237,19 @@ impl Providers {
         // platform's own client, already passed in for the Composio provider
         // above) is reused as the `plain` client for `trusted == true` backends —
         // i.e. uploaded-build MCP-server connectors, whose address the platform
-        // itself resolved, not a user.
+        // itself resolved, not a user. Only Composio keeps a connection pool.
         Self {
             composio,
-            mcp: GenericMcpProvider::new(crate::net::guarded_http_client(), http),
+            mcp: GenericMcpProvider::new(crate::net::guarded_http_client_no_reuse(), http)
+                .with_composio_client(crate::net::guarded_http_client()),
         }
     }
 
     /// The Composio provider, or a `NotConfigured` error when no API key is set.
-    pub fn require_composio(&self) -> Result<&Arc<dyn ToolProvider>> {
-        self.composio.as_ref().ok_or_else(|| {
+    pub fn require_composio(&self) -> Result<Arc<dyn ToolProvider>> {
+        self.composio.get().ok_or_else(|| {
             crate::error::McpError::NotConfigured(
-                "Composio integration is disabled (COMPOSIO_API_KEY not set)".to_string(),
+                "Composio integration is disabled (no Composio API key configured)".to_string(),
             )
         })
     }

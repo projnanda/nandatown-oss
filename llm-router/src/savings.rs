@@ -42,6 +42,7 @@ pub(crate) struct CalibrationInputs {
 ///
 /// A struct rather than eight positional parameters, so the call site reads as data and a
 /// transposed `provider`/`model` pair cannot compile.
+#[derive(Clone)]
 pub(crate) struct CallContext<'a> {
     pub user_id: Uuid,
     pub agent_id: Option<Uuid>,
@@ -54,10 +55,13 @@ pub(crate) struct CallContext<'a> {
     pub calibration: CalibrationInputs,
 }
 
-/// Chars per token for this call, and whether it had to be assumed.
+/// Chars per token for this call, and whether the saved-token figure it yields is an estimate.
 ///
-/// `(ratio, estimated)`. `estimated == false` means the ratio came from this call's own bytes and
-/// reported tokens, so the saved-token figure is as exact as the provider's own count.
+/// `(ratio, estimated)`. Always an estimate: even a ratio calibrated on this call's own bytes and
+/// reported tokens is an average over the whole request, and the text compression removes rarely
+/// tokenizes at that average. Re-counting the TokenOps test run's compressed tool results with
+/// the provider's tokenizer put this figure 0.24x to 1.94x off per result (1.37x over on JSON in
+/// aggregate), so a row must never claim to be measured.
 pub(crate) fn chars_per_token(inputs: CalibrationInputs) -> (f64, bool) {
     let calibrated = match (inputs.request_bytes, inputs.input_tokens) {
         (Some(bytes), Some(tokens)) if bytes > 0 && tokens > 0 => {
@@ -66,7 +70,7 @@ pub(crate) fn chars_per_token(inputs: CalibrationInputs) -> (f64, bool) {
         _ => None,
     };
     match calibrated {
-        Some(ratio) if PLAUSIBLE_CHARS_PER_TOKEN.contains(&ratio) => (ratio, false),
+        Some(ratio) if PLAUSIBLE_CHARS_PER_TOKEN.contains(&ratio) => (ratio, true),
         _ => (DEFAULT_CHARS_PER_TOKEN, true),
     }
 }
@@ -97,14 +101,39 @@ pub(crate) fn compress_payload_row(
     bytes_out: usize,
     ctx: CallContext<'_>,
 ) -> Option<SavingsRow> {
+    // Compression never grows the payload, so anything but a shrink means it did nothing.
     if bytes_out >= bytes_in {
         return None;
     }
+    bytes_row(Layer::CompressPayload, bytes_in, bytes_out, ctx)
+}
+
+/// Build the `compact_tools` row, signed, or `None` when the two forms are within a token.
+///
+/// `native_bytes` is the serialized native `tools`; `compact_bytes` is the signatures plus the
+/// call-format instruction sent in their place, so the instruction's own cost is netted out. A few
+/// small tools can come out larger compacted, and that is reported as a negative row, not dropped.
+pub(crate) fn compact_tools_row(
+    native_bytes: usize,
+    compact_bytes: usize,
+    ctx: CallContext<'_>,
+) -> Option<SavingsRow> {
+    bytes_row(Layer::CompactTools, native_bytes, compact_bytes, ctx)
+}
+
+/// A row for a layer that changed this call's prompt by a measured number of bytes; negative when
+/// it grew.
+fn bytes_row(
+    layer: Layer,
+    bytes_in: usize,
+    bytes_out: usize,
+    ctx: CallContext<'_>,
+) -> Option<SavingsRow> {
     let (ratio, token_estimated) = chars_per_token(ctx.calibration);
-    // Truncate, never round. Rounding sends half the sub-token savings upward, and a ledger that
-    // rounds up systematically claims tokens it cannot account for — every bias in this file is
-    // deliberately pointed at under-claiming.
-    let saved_tokens = ((bytes_in - bytes_out) as f64 / ratio).floor() as i64;
+    // Truncate toward zero, never round. Rounding sends half the sub-token difference outward, and
+    // a ledger that rounds systematically claims tokens it cannot account for — every bias in this
+    // file is deliberately pointed at under-claiming, in either direction.
+    let saved_tokens = ((bytes_in as f64 - bytes_out as f64) / ratio) as i64;
     if saved_tokens == 0 {
         return None;
     }
@@ -118,11 +147,11 @@ pub(crate) fn compress_payload_row(
         session_id: None,
         provider: Some(ctx.provider),
         model: Some(ctx.model),
-        layer: Layer::CompressPayload,
+        layer,
         bytes_before: Some(bytes_in as i64),
         bytes_after: Some(bytes_out as i64),
         saved_input_tokens: saved_tokens,
-        // IP-1 shrinks what the model reads; it cannot shorten what the model writes.
+        // Both layers shrink what the model reads; neither can shorten what the model writes.
         saved_output_tokens: 0,
         saved_cost_usd: saved_tokens as f64
             * effective_input_rate(ctx.cost, ctx.prompt_side_tokens),
@@ -187,8 +216,8 @@ mod tests {
 
         assert_eq!(ratio, 3.0);
         assert!(
-            !estimated,
-            "a calibrated ratio must not be flagged estimated"
+            estimated,
+            "a calibrated ratio is still an average, so its figure is an estimate"
         );
     }
 
@@ -273,7 +302,8 @@ mod tests {
             "IP-1 cannot shorten what the model writes"
         );
         assert_eq!(r.method, Method::MeasuredBytes);
-        assert!(!r.token_estimated);
+        // The bytes are measured; the tokens they are worth are not.
+        assert!(r.token_estimated);
         assert!(r.saved_cost_usd > 0.0);
     }
 
@@ -308,6 +338,36 @@ mod tests {
 
         assert_eq!(r.saved_input_tokens, 1_500); // 6000 / 4.0
         assert!(r.token_estimated);
+    }
+
+    #[test]
+    fn compact_tools_writes_its_own_layer_at_the_same_rate() {
+        let c = cost();
+        let r = compact_tools_row(10_270, 7_430, ctx(calibrated(), &c))
+            .expect("smaller signatures are a saving");
+
+        assert_eq!(r.layer, Layer::CompactTools);
+        assert_eq!(r.bytes_before, Some(10_270));
+        assert_eq!(r.bytes_after, Some(7_430));
+        // 2840 bytes at a calibrated 4.0 chars/token.
+        assert_eq!(r.saved_input_tokens, 710);
+        assert_eq!(r.saved_output_tokens, 0);
+        assert!(r.token_estimated);
+        assert!((r.saved_cost_usd - 710.0 * 0.000_11).abs() < 1e-12);
+    }
+
+    #[test]
+    fn compact_signatures_larger_than_the_schemas_write_a_negative_row() {
+        // A few tiny tools: the call-format instruction outweighs what the signatures saved. That
+        // is a real cost of the layer, reported rather than clamped away.
+        let c = cost();
+        let r = compact_tools_row(300, 900, ctx(calibrated(), &c))
+            .expect("a larger compact form is a cost, not a zero");
+        // -600 bytes at a calibrated 4.0 chars/token.
+        assert_eq!(r.saved_input_tokens, -150);
+        assert!(r.saved_cost_usd < 0.0);
+        // Within a token either way is still no row.
+        assert!(compact_tools_row(1_000, 1_003, ctx(calibrated(), &c)).is_none());
     }
 
     #[test]

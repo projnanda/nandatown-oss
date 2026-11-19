@@ -97,6 +97,9 @@ pub struct ContextSavingsQuery<'a> {
     /// Restricts every aggregate to agents the caller may see. `None` means unrestricted
     /// (superuser); an empty slice means the caller can see nothing.
     pub accessible_agent_ids: Option<&'a [Uuid]>,
+    /// Restricts every aggregate to these people's requests. `None` means everyone's (a user
+    /// manager); anyone else gets only their own, whatever agent the request went to.
+    pub user_ids: Option<&'a [Uuid]>,
     pub series: Option<Bucket>,
     pub limit: i64,
     /// Narrows `top-requests` to one chart bar's interval.
@@ -179,7 +182,7 @@ pub struct TopRequest {
 ///
 /// `eff_agent_id` rather than `cr.agent_id`: an orchestrator-routed chat selects history before
 /// routing picks an agent, so the row's own column is NULL and the agent is resolved through
-/// `session_traces`. Filtering on the raw column would drop every routed chat from the page.
+/// `flows`. Filtering on the raw column would drop every routed chat from the page.
 fn push_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, q: &'a ContextSavingsQuery<'a>) {
     qb.push(" WHERE cr.created_at >= ")
         .push_bind(q.start)
@@ -199,6 +202,23 @@ fn push_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, q: &'a ContextSavingsQu
             .push_bind(q.caller_id)
             .push("))");
     }
+    push_user_filter(qb, q, "cr.user_id");
+}
+
+/// Narrows a query to the people in `q.user_ids` on `column`, the request's user, so no count, total
+/// or row on the page includes anyone else's requests. Nothing to add when `user_ids` is `None`.
+fn push_user_filter<'a>(
+    qb: &mut QueryBuilder<'a, Postgres>,
+    q: &'a ContextSavingsQuery<'a>,
+    column: &str,
+) {
+    if let Some(users) = q.user_ids {
+        qb.push(" AND ")
+            .push(column)
+            .push(" = ANY(")
+            .push_bind(users)
+            .push(")");
+    }
 }
 
 /// `context_reports` with its agent resolved. Every query here starts from this shape, so
@@ -210,21 +230,21 @@ fn push_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, q: &'a ContextSavingsQu
 ///
 /// 1. `context_reports.agent_id` — set at write time by the direct-agent proxy path, which knows
 ///    its target before it reads history.
-/// 2. `session_traces.agent_id` — set when a turn is dispatched *at* a named agent.
+/// 2. `flows.root_agent_id` — set when a flow is dispatched at a named agent.
 /// 3. `token_usage.agent_id` — the agents the turn actually billed against.
 ///
-/// (3) exists because the orchestrator writes its own `session_traces` row with a NULL agent and
+/// (3) exists because the orchestrator writes its own flow row with a NULL root_agent_id and
 /// the name `'orchestrator'`, so (2) resolves to nothing for the main chat path and every routed
 /// turn fell out of the per-agent views. The LLM calls a turn makes are the surviving evidence of
 /// where it went. A turn the orchestrator answered itself has no agent in any of the three, which
 /// is correct — it belongs in the totals and in no per-agent row.
-const REPORTS_FROM: &str = "FROM context_reports cr \
+const REPORTS_FROM: &str = "FROM context_reports_spend cr \
      LEFT JOIN LATERAL ( \
-         SELECT st.agent_id FROM session_traces st \
-          WHERE st.trace_id = cr.trace_id AND st.agent_id IS NOT NULL LIMIT 1 \
+         SELECT f.root_agent_id AS agent_id FROM flows f \
+          WHERE f.flow_id = cr.trace_id AND f.root_agent_id IS NOT NULL LIMIT 1 \
      ) st ON true \
      LEFT JOIN LATERAL ( \
-         SELECT tu.agent_id FROM token_usage tu \
+         SELECT tu.agent_id FROM (SELECT trace_id AS session_id, started_at AS created_at, agent_id FROM trace_first_calls) tu \
           WHERE tu.session_id = cr.trace_id AND tu.agent_id IS NOT NULL \
           ORDER BY tu.created_at ASC LIMIT 1 \
      ) tua ON true \
@@ -239,7 +259,7 @@ const REPORTS_FROM: &str = "FROM context_reports cr \
 /// dates.
 const PRICE_JOIN: &str = "LEFT JOIN LATERAL ( \
          SELECT (mp.input_price_per_1m / 1000000.0)::FLOAT8 AS rate \
-           FROM token_usage tu \
+           FROM (SELECT trace_id AS session_id, started_at AS created_at, provider, model FROM trace_first_calls) tu \
            JOIN model_pricing mp \
              ON mp.provider = tu.provider AND mp.model = tu.model \
             AND mp.effective_from <= cr.created_at \
@@ -263,14 +283,15 @@ struct TotalsRow {
 
 async fn totals(db: &PgPool, q: &ContextSavingsQuery<'_>) -> Result<TotalsRow, sqlx::Error> {
     let mut qb = QueryBuilder::new(
-        "SELECT COUNT(*)::BIGINT AS reports, \
-                COUNT(*) FILTER (WHERE price.rate IS NOT NULL)::BIGINT AS priced_reports, \
+        "SELECT COALESCE(SUM(cr.reports), 0)::BIGINT AS reports, \
+                COALESCE(SUM(CASE WHEN cr.frozen_priced IS NOT NULL THEN cr.frozen_priced \
+                     WHEN price.rate IS NOT NULL THEN 1 ELSE 0 END), 0)::BIGINT AS priced_reports, \
                 COALESCE(SUM(cr.pool_tokens), 0)::BIGINT AS pool_tokens, \
                 COALESCE(SUM(cr.kept_tokens), 0)::BIGINT AS sent_tokens, \
                 COALESCE(SUM(cr.pool_messages - cr.kept_messages), 0)::BIGINT AS messages_dropped, \
                 COALESCE(SUM(cr.compressed_bytes_saved), 0)::BIGINT AS compressed_bytes, \
-                COALESCE(SUM(cr.pool_tokens * price.rate), 0)::FLOAT8 AS pool_cost, \
-                COALESCE(SUM(cr.kept_tokens * price.rate), 0)::FLOAT8 AS sent_cost ",
+                COALESCE(SUM(COALESCE(cr.frozen_pool_cost, cr.pool_tokens * price.rate)), 0)::FLOAT8 AS pool_cost, \
+                COALESCE(SUM(COALESCE(cr.frozen_sent_cost, cr.kept_tokens * price.rate)), 0)::FLOAT8 AS sent_cost ",
     );
     qb.push(REPORTS_FROM);
     qb.push(PRICE_JOIN);
@@ -287,9 +308,9 @@ async fn recorded_since(
     // Unfiltered — a superuser with no agent picked — is the common case and needs none of the
     // agent resolution below. A plain MIN walks the window index once instead of resolving an agent
     // for every report ever written.
-    if q.agent_id.is_none() && q.accessible_agent_ids.is_none() {
+    if q.agent_id.is_none() && q.accessible_agent_ids.is_none() && q.user_ids.is_none() {
         return sqlx::query_scalar(
-            "SELECT MIN(created_at) FROM context_reports WHERE created_at < $1",
+            "SELECT MIN(created_at) FROM context_reports_spend WHERE created_at < $1",
         )
         .bind(q.end)
         .fetch_one(db)
@@ -311,6 +332,7 @@ async fn recorded_since(
             .push_bind(q.caller_id)
             .push("))");
     }
+    push_user_filter(&mut qb, q, "cr.user_id");
     qb.build_query_scalar().fetch_one(db).await
 }
 
@@ -353,6 +375,7 @@ async fn eligible_requests(
             .push_bind(q.caller_id)
             .push("))");
     }
+    push_user_filter(&mut qb, q, "s.user_id");
     qb.build_query_scalar().fetch_one(db).await
 }
 
@@ -393,7 +416,7 @@ async fn series(
     let mut qb = QueryBuilder::new("SELECT date_trunc('");
     qb.push(bucket.trunc()).push(
         "', cr.created_at) AS bucket_start, \
-                COUNT(*)::BIGINT AS reports, \
+                COALESCE(SUM(cr.reports), 0)::BIGINT AS reports, \
                 COALESCE(SUM(cr.pool_tokens), 0)::BIGINT AS pool_tokens, \
                 COALESCE(SUM(cr.kept_tokens), 0)::BIGINT AS sent_tokens ",
     );
@@ -425,6 +448,7 @@ async fn series(
             .push_bind(q.caller_id)
             .push("))");
     }
+    push_user_filter(&mut eb, q, "s.user_id");
     eb.push(" GROUP BY bucket_start");
     let eligible: Vec<EligibleBucketRow> = match eligible_from {
         Some(_) => eb.build_query_as().fetch_all(db).await?,
@@ -505,7 +529,7 @@ pub async fn get_by_agent(
     let mut qb = QueryBuilder::new(
         "SELECT eff.agent_id AS agent_id, \
                 COALESCE(a.display_name, a.name) AS name, \
-                COUNT(*)::BIGINT AS reports, \
+                COALESCE(SUM(cr.reports), 0)::BIGINT AS reports, \
                 COALESCE(SUM(cr.pool_tokens), 0)::BIGINT AS pool_tokens, \
                 COALESCE(SUM(cr.kept_tokens), 0)::BIGINT AS sent_tokens, \
                 bool_or(a.compress_enabled) AS compress_enabled ",
@@ -536,11 +560,13 @@ pub async fn get_by_agent(
            JOIN chat_sessions s ON s.session_id = m.session_id \
           WHERE m.role = 'user' AND m.timestamp >= $1 AND m.timestamp < $2 \
             AND s.agent_id = ANY($3) \
+            AND ($4::uuid[] IS NULL OR s.user_id = ANY($4)) \
           GROUP BY s.agent_id",
     )
     .bind(q.start)
     .bind(q.end)
     .bind(&ids)
+    .bind(q.user_ids)
     .fetch_all(db)
     .await?;
 
@@ -587,7 +613,8 @@ pub async fn get_top_requests(
                 cr.pool_tokens, cr.kept_tokens AS sent_tokens, \
                 a.compress_enabled, cr.created_at AS started_at ",
     );
-    qb.push(REPORTS_FROM);
+    // Row-level list: only hot rows have a trace to open.
+    qb.push(REPORTS_FROM.replace("FROM context_reports_spend cr", "FROM context_reports cr"));
     qb.push(
         " JOIN agents a ON a.id = eff.agent_id AND a.deleted_at IS NULL \
           LEFT JOIN chat_sessions cs ON cs.session_id = cr.session_id ",
@@ -645,6 +672,7 @@ mod tests {
             caller_id: caller,
             caller_is_superuser: superuser,
             accessible_agent_ids: None,
+            user_ids: None,
             series: None,
             limit: 10,
             from: None,
@@ -720,11 +748,11 @@ mod tests {
     #[test]
     fn the_agent_resolution_chain_has_all_three_sources() {
         assert!(REPORTS_FROM.contains("COALESCE(cr.agent_id, st.agent_id, tua.agent_id)"));
-        // `token_usage` is the one that recovers orchestrator-routed turns: the orchestrator writes
-        // its own `session_traces` row with a NULL agent, so without this they resolve to nothing.
-        assert!(REPORTS_FROM.contains("FROM token_usage tu"));
+        // The trace's calls (`trace_first_calls`, hot or tiered) recover orchestrator-routed turns: the orchestrator writes
+        // its own flow row with a NULL root_agent_id, so without this they resolve to nothing.
+        assert!(REPORTS_FROM.contains("FROM trace_first_calls) tu"));
         // A NULL in an earlier source must not win the LIMIT 1 and mask a later one.
-        assert!(REPORTS_FROM.contains("st.agent_id IS NOT NULL"));
+        assert!(REPORTS_FROM.contains("f.root_agent_id IS NOT NULL"));
         assert!(REPORTS_FROM.contains("tu.agent_id IS NOT NULL"));
     }
 

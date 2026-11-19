@@ -8,7 +8,8 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::agent_scaling::{AgentDeploy, ReplicaBounds};
+use crate::agent_scaling::{AgentDeploy, DeployPlan, ReplicaBounds};
+use crate::agent_wake::AgentWake;
 use crate::auth::Claims;
 use crate::catalog::agent_secrets;
 use crate::state::AppState;
@@ -93,6 +94,11 @@ async fn deploy(
         && !crate::acl::can_manage_agent(&state, &claims, agent_id).await
     {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(agent_id) = resolved_agent_id
+        && let Some(refusal) = refuse_harness_agent(&state, agent_id).await
+    {
+        return refusal;
     }
 
     // Read before the deploy env is built, which may reset `state_mode` (see `AgentScaling::begin_deploy`).
@@ -201,18 +207,35 @@ async fn deploy(
         crate::agents::set_port_env(&mut env, ports[0]);
     }
 
-    let bounds = match deploy_bounds(scaling.as_deref(), req.replicas, writable).await {
-        Ok(bounds) => bounds,
+    // The plan reads the stored kind; a request naming another one decides this deploy's.
+    let plan = match deploy_plan(scaling.as_deref(), req.replicas, writable).await {
+        Ok(plan) => plan.for_kind(workload_kind),
         Err(e) => {
-            tracing::error!(%e, name = %req.name, "deploy: could not read replica bounds");
+            tracing::error!(%e, name = %req.name, "deploy: could not read the deploy plan");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
         }
     };
+    let bounds = plan.bounds;
 
     let mut spec = DeploymentSpec {
         container_id,
         name: req.name.clone(),
-        image: crate::agents::qualify_deploy_image(&state.config.agent_image_registry, &req.image),
+        image: {
+            // Canonicalize (qualify) then validate - fixes R-123 unqualified-reference bypass
+            match crate::agents::canonicalize_and_validate_image_ref(
+                &state.db,
+                &state.config.agent_image_registry,
+                &state.config.agent_image_registry_aliases,
+                &req.image,
+                owner_id,
+                claims.is_superuser,
+            )
+            .await
+            {
+                Ok(qualified) => qualified,
+                Err((code, msg)) => return (code, msg).into_response(),
+            }
+        },
         ports,
         env_vars: env,
         min_replicas: bounds.min,
@@ -229,6 +252,8 @@ async fn deploy(
         writable_path,
         owner_id,
         force_pull: false,
+        parkable: plan.parkable,
+        overrides: Default::default(),
     };
     // Only a name that already maps to a registered catalog agent has an
     // `agents` row to scope a pull credential to (see pull_credentials'
@@ -283,6 +308,8 @@ async fn deploy(
                 tokio::spawn(crate::agents::utils::fetch_agent_card_with_retry(
                     state.db.clone(),
                     state.http_client.clone(),
+                    state.runtime.clone(),
+                    state.llm_backend.clone(),
                     agent_id,
                     endpoint.clone(),
                 ));
@@ -321,26 +348,34 @@ async fn deploy(
     }
 }
 
-/// The replica bounds of an ad-hoc deploy. A registered agent gets what its scaling
-/// policy gives it, as on every other deploy path, and a writable one stays on its single
-/// volume; the caller's `replicas` applies only to an image with no catalog entry.
-async fn deploy_bounds(
+/// The plan of an ad-hoc deploy. A registered agent gets what its scaling policy gives it,
+/// as on every other deploy path, and a writable one stays on its single volume; the
+/// caller's `replicas` applies only to an image with no catalog entry, which never parks.
+async fn deploy_plan(
     scaling: Option<&dyn AgentDeploy>,
     replicas: Option<u32>,
     writable: bool,
-) -> sqlx::Result<ReplicaBounds> {
+) -> sqlx::Result<DeployPlan> {
     let Some(scaling) = scaling else {
         let fixed = replicas.unwrap_or(1);
-        return Ok(ReplicaBounds {
-            min: fixed,
-            max: fixed,
-            target: None,
+        return Ok(DeployPlan {
+            bounds: ReplicaBounds {
+                min: fixed,
+                max: fixed,
+                target: None,
+            },
+            parkable: false,
+            resources: Default::default(),
         });
     };
+    let plan = scaling.plan().await?;
     if writable {
-        return Ok(ReplicaBounds::SINGLE);
+        return Ok(DeployPlan {
+            bounds: ReplicaBounds::SINGLE,
+            ..plan
+        });
     }
-    scaling.bounds().await
+    Ok(plan)
 }
 
 async fn list(State(state): State<AppState>, claims: Claims) -> impl IntoResponse {
@@ -409,6 +444,17 @@ async fn status(
     match state.runtime.status(&id).await {
         Ok(s) => Json(s).into_response(),
         Err(e) => {
+            // A parked agent may have no workload to report: one parked before parking scaled
+            // workloads to zero gets one back when it is next called.
+            if let Ok(agent_id) = Uuid::parse_str(id.as_str())
+                && is_parked(&state, agent_id).await
+            {
+                return Json(parked_status(
+                    agent_id,
+                    "agent is parked; the first request starts it",
+                ))
+                .into_response();
+            }
             tracing::error!(%e, %name, "status: runtime error");
             (StatusCode::NOT_FOUND, "container not found").into_response()
         }
@@ -447,16 +493,80 @@ async fn destroy(
     }
 }
 
+/// The `ContainerRuntime::deploy`-shaped body a parked agent answers with, so a client that
+/// reads `state` sees `parked` where a running agent shows `running`.
+fn parked_status(agent_id: Uuid, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "container_id": agent_id,
+        "state": "parked",
+        "replicas_live": 0,
+        "endpoint": null,
+        "message": message,
+        "restart_count": 0,
+    })
+}
+
+/// Whether the agent's row says `parked`. A row that cannot be read is not.
+async fn is_parked(state: &AppState, agent_id: Uuid) -> bool {
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+    status.as_deref() == Some("parked")
+}
+
+/// Holds the agent's lock ([`crate::agent_wake::lock_agent`]) for one lifecycle change until the
+/// returned transaction is dropped, so the change cannot interleave with a wake or a park: a wake
+/// that scaled the workload up after a `stop` would leave it running under a `stopped` row that
+/// nothing serves or parks. Waits at most one wake budget, which bounds how long a wake holds it.
+async fn lock_for_lifecycle(
+    state: &AppState,
+    agent_id: Uuid,
+    name: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, axum::response::Response> {
+    let budget = std::time::Duration::from_secs(state.config.agent_wake_budget_secs());
+    let locked = async {
+        let mut tx = state.db.begin().await?;
+        crate::agent_wake::lock_agent(&mut tx, agent_id, std::time::Instant::now() + budget)
+            .await?;
+        Ok::<_, sqlx::Error>(tx)
+    };
+    locked.await.map_err(|e| {
+        tracing::warn!(%e, %name, "lifecycle: could not take the agent's lock");
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the agent is being started or parked, try again shortly",
+        )
+            .into_response()
+    })
+}
+
 async fn stop(
     State(state): State<AppState>,
     claims: Claims,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let id = match resolve_authorized_container(&state, &claims, &name).await {
-        Ok(id) => id,
+    let agent_id = match resolve_authorized_agent(&state, &claims, &name).await {
+        Ok(agent_id) => agent_id,
         Err(resp) => return resp,
     };
-    match state.runtime.scale(&id, 0).await {
+    let _lock = match lock_for_lifecycle(&state, agent_id, &name).await {
+        Ok(lock) => lock,
+        Err(resp) => return resp,
+    };
+    let id = ContainerId::from_uuid(agent_id);
+    let stopped = match state.runtime.scale(&id, 0).await {
+        // An agent parked before parking scaled workloads to zero has none to stop.
+        Err(nasiko_runtime::RuntimeError::ContainerNotFound(_))
+            if is_parked(&state, agent_id).await =>
+        {
+            Ok(())
+        }
+        outcome => outcome,
+    };
+    match stopped {
         Ok(()) => {
             record_lifecycle_status(&state, &name, "stopped").await;
             StatusCode::OK.into_response()
@@ -473,10 +583,57 @@ async fn start(
     claims: Claims,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let id = match resolve_authorized_container(&state, &claims, &name).await {
-        Ok(id) => id,
+    let agent_id = match resolve_authorized_agent(&state, &claims, &name).await {
+        Ok(agent_id) => agent_id,
         Err(resp) => return resp,
     };
+    // A parked agent is woken as its next call would wake it: its address and idle clock come back
+    // and the answer waits until it serves, or it stays parked. Before the lifecycle lock, which
+    // the wake takes itself; inline, so a wake seam that refuses the wake can still answer.
+    if is_parked(&state, agent_id).await {
+        if let Err(message) = state.agent_wake.before_forward(agent_id, None).await {
+            return (StatusCode::SERVICE_UNAVAILABLE, message).into_response();
+        }
+        // Still parked: no wake applies to it (a harness agent's); it is started below as before.
+        if !is_parked(&state, agent_id).await {
+            return StatusCode::OK.into_response();
+        }
+    }
+    let _lock = match lock_for_lifecycle(&state, agent_id, &name).await {
+        Ok(lock) => lock,
+        Err(resp) => return resp,
+    };
+    let status: Option<String> = match sqlx::query_scalar("SELECT status FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::error!(%e, %name, "start: could not read the agent's status");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+        }
+    };
+    // An agent with no workload to scale up gets one, from the stored image and env, as a restart
+    // does: one stopped or parked before parking scaled workloads to zero, and any agent whose row
+    // was moved to this server without its workload — stopped, parked or failed where it came from.
+    if status.as_deref() != Some("running")
+        && state
+            .runtime
+            .status(&ContainerId::from_uuid(agent_id))
+            .await
+            .is_err()
+    {
+        return restart(
+            State(state),
+            claims,
+            Path(name),
+            Query(RestartQuery::default()),
+        )
+        .await
+        .into_response();
+    }
+    let id = ContainerId::from_uuid(agent_id);
     match state.runtime.scale(&id, 1).await {
         Ok(()) => {
             record_lifecycle_status(&state, &name, "running").await;
@@ -538,9 +695,14 @@ async fn restart(
         writable_path: Option<String>,
     }
 
+    //
+    // Only a live agent: a superuser passes `can_manage_agent` for a deleted one too, and a
+    // restart would bring its container back. A deleted agent's name may also belong to a new
+    // agent by now, which is the one `nasiko restart <name>` means.
     let agent: Option<RestartAgentRow> = if let Ok(id) = name.parse::<Uuid>() {
         sqlx::query_as(
-            "SELECT id, owner_id, image, writable, writable_path FROM agents WHERE id = $1",
+            "SELECT id, owner_id, image, writable, writable_path FROM agents \
+             WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id)
         .fetch_optional(&state.db)
@@ -549,7 +711,8 @@ async fn restart(
         .flatten()
     } else {
         sqlx::query_as(
-            "SELECT id, owner_id, image, writable, writable_path FROM agents WHERE name = $1",
+            "SELECT id, owner_id, image, writable, writable_path FROM agents \
+             WHERE name = $1 AND deleted_at IS NULL",
         )
         .bind(&name)
         .fetch_optional(&state.db)
@@ -571,6 +734,9 @@ async fn restart(
 
     if !crate::acl::can_manage_agent(&state, &claims, agent_id).await {
         return StatusCode::FORBIDDEN.into_response();
+    }
+    if let Some(refusal) = refuse_harness_agent(&state, agent_id).await {
+        return refusal;
     }
 
     let image = match image {
@@ -614,10 +780,10 @@ async fn restart(
     }
 
     let scaling = state.agent_scaling.begin_deploy(agent_id).await;
-    let replica_bounds = match scaling.bounds().await {
-        Ok(bounds) => bounds,
+    let plan = match scaling.plan().await {
+        Ok(plan) => plan,
         Err(e) => {
-            tracing::error!(%e, %name, "restart: could not read replica bounds");
+            tracing::error!(%e, %name, "restart: could not read the deploy plan");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
         }
     };
@@ -638,16 +804,17 @@ async fn restart(
         let _ = state.runtime.destroy(&ContainerId::new(&name)).await;
     }
 
-    // Redeploy with fresh env, UUID-keyed (see agents::build_agent_spec). Empty
-    // ports → build_agent_spec defaults to DEFAULT_AGENT_PORT.
+    // Redeploy with fresh env, UUID-keyed (see agents::build_agent_spec), on the port its last
+    // deployment recorded (the default when none did).
+    let ports = crate::agents::recorded_ports(&state.db, agent_id, &mut env).await;
     let mut spec = crate::agents::build_agent_spec(
         agent_id,
         &name,
         image,
-        vec![],
+        ports,
         env,
         &state.config.agent_default_memory,
-        replica_bounds,
+        plan,
         writable,
         writable_path,
         owner_id,
@@ -679,6 +846,8 @@ async fn restart(
             tokio::spawn(crate::agents::utils::fetch_agent_card_with_retry(
                 state.db.clone(),
                 state.http_client.clone(),
+                state.runtime.clone(),
+                state.llm_backend.clone(),
                 agent_id,
                 agent_url,
             ));
@@ -694,6 +863,24 @@ async fn restart(
 /// Whether `restart` can replace the agent where it runs: the runtime rolls restarts in place
 /// and the agent is serving. A status that cannot be read counts as not running, so the
 /// restart falls back to a redeploy, which does not need it.
+/// The answer to a redeploy or restart of a harness agent, `None` for any other agent: the
+/// workload is built by the sandbox provider, from settings the agent row does not hold.
+async fn refuse_harness_agent(
+    state: &AppState,
+    agent_id: Uuid,
+) -> Option<axum::response::Response> {
+    match crate::agents::is_harness_agent(&state.db, agent_id).await {
+        Ok(false) => None,
+        Ok(true) => {
+            Some((StatusCode::CONFLICT, crate::agents::HARNESS_AGENT_MANAGED).into_response())
+        }
+        Err(e) => {
+            tracing::error!(%e, %agent_id, "could not read the agent's kind");
+            Some((StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response())
+        }
+    }
+}
+
 async fn can_restart_in_place(state: &AppState, id: &ContainerId) -> bool {
     if !state.runtime.restarts_in_place().await {
         return false;
@@ -718,19 +905,7 @@ async fn restart_in_place(
     owner_id: Uuid,
     name: &str,
 ) -> axum::response::Response {
-    let mut env = resolve_full_env(state, owner_id, agent_id).await;
-    crate::agents::deploy_env::apply_platform_env(
-        state,
-        &mut env,
-        agent_id,
-        owner_id,
-        crate::agents::deploy_env::StateModeOnDeploy::Keep,
-    )
-    .await;
-    // The runtime applies this as the agent's whole env, so it carries the port as a deploy does.
-    crate::agents::set_port_env(&mut env, crate::agents::DEFAULT_AGENT_PORT);
-
-    if let Err(e) = state.runtime.refresh_secrets(id, name, env).await {
+    if let Err(e) = refresh_runtime_env(state, id, agent_id, owner_id, name).await {
         tracing::error!(%e, %name, "restart: could not apply the agent's env");
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
     }
@@ -745,6 +920,57 @@ async fn restart_in_place(
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
         }
     }
+}
+
+/// Rebuilds the agent's env, with the platform credentials rotated, and hands it to the runtime,
+/// so every instance it starts from now on runs with the agent's current secrets. Instances
+/// already running keep the env they started with until they are rolled.
+async fn refresh_runtime_env(
+    state: &AppState,
+    id: &ContainerId,
+    agent_id: Uuid,
+    owner_id: Uuid,
+    name: &str,
+) -> Result<(), nasiko_runtime::RuntimeError> {
+    let mut env = resolve_full_env(state, owner_id, agent_id).await;
+    crate::agents::deploy_env::apply_platform_env(
+        state,
+        &mut env,
+        agent_id,
+        owner_id,
+        crate::agents::deploy_env::StateModeOnDeploy::Keep,
+    )
+    .await;
+    // The runtime applies this as the agent's whole env, so it carries the port its last
+    // deployment recorded, as a redeploy does.
+    crate::agents::recorded_ports(&state.db, agent_id, &mut env).await;
+    state.runtime.refresh_secrets(id, name, env).await
+}
+
+/// Scales an agent up on a runtime that restarts in place (Kubernetes), where new instances
+/// read the env the runtime holds: that env is rebuilt first, so a secret changed since the last
+/// deploy reaches the new instances. Rebuilding it rotates the platform credentials, which the
+/// instances already running hold only until `ROTATION_GRACE_SECS` passes, so a running agent is
+/// rolled afterwards and every instance ends up on the same, current env.
+async fn scale_up_with_fresh_env(
+    state: &AppState,
+    id: &ContainerId,
+    agent_id: Uuid,
+    name: &str,
+    replicas: u32,
+) -> Result<(), nasiko_runtime::RuntimeError> {
+    let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+        .bind(agent_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| nasiko_runtime::RuntimeError::Internal(format!("read owner: {e}")))?;
+    let was_running = can_restart_in_place(state, id).await;
+    refresh_runtime_env(state, id, agent_id, owner_id, name).await?;
+    state.runtime.scale(id, replicas).await?;
+    if was_running {
+        state.runtime.restart(id).await?;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -762,6 +988,29 @@ async fn scale(
         Ok(agent_id) => agent_id,
         Err(resp) => return resp,
     };
+    // A parkable agent's workload runs one replica (a Sandbox cannot run more): a larger count
+    // would silently run one.
+    if req.replicas > 1 {
+        match crate::agent_scaling::runs_parkable(state.agent_scaling.as_ref(), &state.db, agent_id)
+            .await
+        {
+            Ok(true) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "a parkable agent runs one replica; set its parking_policy to resident to run more",
+                        "code": "parkable",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::error!(%e, %name, "scale: could not read whether the agent is parkable");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+            }
+        }
+    }
     // An autoscaled agent's count belongs to the autoscaler, which would undo a manual
     // one. Scaling to 0 still stops it: the runtime pauses the autoscaler first.
     if req.replicas > 0 {
@@ -783,8 +1032,19 @@ async fn scale(
             }
         }
     }
+    let _lock = match lock_for_lifecycle(&state, agent_id, &name).await {
+        Ok(lock) => lock,
+        Err(resp) => return resp,
+    };
     let id = ContainerId::from_uuid(agent_id);
-    match state.runtime.scale(&id, req.replicas).await {
+    // Docker keeps the env a container was created with and runs one replica, so a scale there
+    // starts no instance a fresh env could reach; its `restart` recreates the container instead.
+    let scaled = if req.replicas > 0 && state.runtime.restarts_in_place().await {
+        scale_up_with_fresh_env(&state, &id, agent_id, &name, req.replicas).await
+    } else {
+        state.runtime.scale(&id, req.replicas).await
+    };
+    match scaled {
         Ok(()) => {
             // Scaling to zero is what `stop` does, so it must leave the same
             // status behind — otherwise `scale 0` parks a container that the
@@ -887,24 +1147,21 @@ async fn record_lifecycle_status(state: &AppState, name: &str, status: &str) {
     //   this agent's is running afterwards, so any row still claiming otherwise
     //   is stale by definition and this converges it on reality — including rows
     //   orphaned `running` by an earlier crash.
-    let sql = if status == "stopped" {
-        "UPDATE agent_deployments SET status = $2, updated_at = now()
-         WHERE agent_id = $1 AND status != $2"
-    } else {
-        "UPDATE agent_deployments SET status = $2, updated_at = now()
-         WHERE id = (
-             SELECT id FROM agent_deployments
-             WHERE agent_id = $1
-             ORDER BY created_at DESC
-             LIMIT 1
-         ) AND status != $2"
-    };
-    if let Err(e) = sqlx::query(sql)
+    let recorded = if status == "stopped" {
+        sqlx::query(
+            "UPDATE agent_deployments SET status = $2::deployment_status, updated_at = now()
+             WHERE agent_id = $1 AND status != $2::deployment_status",
+        )
         .bind(agent_id)
         .bind(status)
         .execute(&state.db)
         .await
-    {
+        .map(|_| ())
+    } else {
+        crate::agents::deployments::record_newest_deployment_status(&state.db, agent_id, status)
+            .await
+    };
+    if let Err(e) = recorded {
         tracing::error!(%e, %name, %status, "failed to record deployment status");
     }
 }
@@ -975,46 +1232,17 @@ async fn resolve_full_env(
     owner_id: Uuid,
     agent_id: Uuid,
 ) -> std::collections::HashMap<String, String> {
-    use nasiko_secrets::SecretsCrypto;
-
-    let crypto = SecretsCrypto::for_user(owner_id);
-    let mut env = std::collections::HashMap::new();
-
-    // 1. Vault secrets (user-level, lower precedence)
-    let vault_rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT name, encrypted_value FROM user_secrets WHERE user_id = $1")
-            .bind(owner_id)
-            .fetch_all(&state.db)
-            .await
-            .unwrap_or_default();
-
-    for (name, encrypted) in vault_rows {
-        if let Ok(value) = crypto.decrypt(&encrypted) {
-            env.insert(name, value);
-        }
-    }
-
-    // 2. Agent secrets (higher precedence — overrides vault)
-    let agent_secrets = agent_secrets::resolve_agent_env(&state.db, agent_id).await;
-    for (k, v) in agent_secrets {
-        env.insert(k, v);
-    }
+    // 1-2. Vault secrets, then agent secrets on top.
+    let mut env = agent_secrets::resolve_secret_env(&state.db, owner_id, agent_id).await;
 
     // 3. Platform-level LLM config — only fills gaps left by vault/agent
     // secrets. `AppState::agent_env` (used by the deployment-scoped restart
     // path) already does this; this ad-hoc container path had silently
     // dropped it, so `nasiko restart` never picked up OPENAI_API_KEY /
     // OPENAI_BASE_URL changes made to the platform's own .env.
-    if let Some(ref key) = state.config.openai_api_key {
-        env.entry("OPENAI_API_KEY".into())
-            .or_insert_with(|| key.clone());
+    for (key, value) in state.platform_fallback_env() {
+        env.entry(key).or_insert(value);
     }
-    if let Some(ref url) = state.config.openai_base_url {
-        env.entry("OPENAI_BASE_URL".into())
-            .or_insert_with(|| url.clone());
-    }
-    env.entry("OPENAI_MODEL".into())
-        .or_insert_with(|| state.config.openai_model.clone());
 
     // 4. Same reasoning as the platform-LLM-config gap above, same fix shape —
     // this is a plain `agents` column (migration 0032), not a secret, so it's

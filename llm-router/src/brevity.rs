@@ -213,6 +213,7 @@ mod tests {
 
     fn test_resolved() -> ResolvedConfig {
         ResolvedConfig {
+            agent_id: String::new(),
             provider: "openai".into(),
             model: "gpt-4o-mini".into(),
             litellm_model: "openai/gpt-4o-mini".into(),
@@ -228,6 +229,7 @@ mod tests {
             platform_paid: true,
             custom_endpoint: None,
             is_coding_agent: false,
+            is_discovered_agent: false,
             compress_enabled: false,
         }
     }
@@ -239,6 +241,7 @@ mod tests {
                 name: "search".into(),
                 description: None,
                 parameters: None,
+                strict: None,
             },
             extra: Default::default(),
         }

@@ -41,6 +41,24 @@ describe("Agent detail's MCP tab (plans/feat-mcp.md §5.2)", () => {
     expect(screen.queryByRole('button', { name: copy.expand('SQL runner') })).toBeNull()
   })
 
+  it('an agent found on a user’s machine gets no Ask: its calls run outside any flow', async () => {
+    const id = seededAgent()
+    const res = await fetch(`/api/agents/${id}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ metadata: { source: 'nasiko-cli-discovery' } }),
+    })
+    expect(res.ok).toBe(true)
+    renderApp(`/agents/${id}?tab=mcp`)
+    expect(await screen.findByText(copy.agentMcpSubLocal, {}, T)).toBeInTheDocument()
+    await userEvent.click(await screen.findByRole('button', { name: copy.expand('GitHub') }, T))
+    const groups = await screen.findAllByRole('radiogroup', {}, T)
+    for (const g of groups) {
+      expect(within(g).getByRole('radio', { name: STANCE.allow.label })).toBeInTheDocument()
+      expect(within(g).queryByRole('radio', { name: STANCE.ask.label })).toBeNull()
+    }
+  })
+
   it('switches a server off for the agent at once', async () => {
     renderApp(`/agents/${seededAgent()}?tab=mcp`)
     const toggle = await screen.findByRole('switch', { name: copy.disable('Docs search') }, T)
@@ -51,6 +69,23 @@ describe("Agent detail's MCP tab (plans/feat-mcp.md §5.2)", () => {
     await waitFor(() =>
       expect(mcpMockState().access.get(`${seededAgent()}:${docsId()}`)?.enabled).toBe(false),
     )
+  })
+
+  it('shows a platform-run server as always on, whatever its access row says', async () => {
+    const agent = seededAgent()
+    const docs = mcpMockState().connectors.find((c) => c.name === 'docs-search')!
+    // The seed has no `system` server (Workspace, EE's only one), so one stands in, switched off in its row.
+    Object.assign(docs, { provider: 'system' })
+    mcpMockState().access.get(`${agent}:${docs.id}`)!.enabled = false
+    renderApp(`/agents/${agent}?tab=mcp`)
+    expect(await screen.findByText(copy.alwaysOn, {}, T)).toBeInTheDocument()
+    expect(screen.queryByRole('switch', { name: copy.enable('Docs search') })).toBeNull()
+    expect(screen.queryByRole('switch', { name: copy.disable('Docs search') })).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: copy.expand('Docs search') }))
+    expect(await screen.findByText(copy.alwaysOnNote, {}, T)).toBeInTheDocument()
+    // Its tool rules still apply at the gateway, so they stay editable.
+    const group = await screen.findByRole('radiogroup', { name: copy.stanceFor('get_page') }, T)
+    expect(within(group).getByRole('radio', { name: STANCE.block.label })).toBeEnabled()
   })
 
   it('rolls a stance back when the save fails', async () => {
@@ -75,6 +110,33 @@ describe("Agent detail's MCP tab (plans/feat-mcp.md §5.2)", () => {
         'true',
       ),
     )
+  })
+
+  it("filters a server's tools inside its row, keeping the full rule set for writes", async () => {
+    renderApp(`/agents/${seededAgent()}?tab=mcp`)
+    await userEvent.click(
+      await screen.findByRole('button', { name: copy.expand('Docs search') }, T),
+    )
+    const filter = await screen.findByRole(
+      'searchbox',
+      { name: copy.filterToolsOf('Docs search') },
+      T,
+    )
+    await userEvent.type(filter, 'PAGE')
+    expect(screen.getByRole('radiogroup', { name: copy.stanceFor('get_page') })).toBeInTheDocument()
+    expect(
+      screen.getByRole('radiogroup', { name: copy.stanceFor('summarize_page') }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('radiogroup', { name: copy.stanceFor('search_docs') })).toBeNull()
+    // Descriptions match too.
+    await userEvent.clear(filter)
+    await userEvent.type(filter, 'spaces')
+    expect(
+      screen.getByRole('radiogroup', { name: copy.stanceFor('list_spaces') }),
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('radiogroup', { name: copy.stanceFor('get_page') })).toBeNull()
+    await userEvent.type(filter, 'zzz')
+    expect(screen.getByText(copy.noToolMatch)).toBeInTheDocument()
   })
 
   it('points to the catalog when no server is available', async () => {

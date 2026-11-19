@@ -1,15 +1,17 @@
 /**
  * One MCP server on one agent (plans/feat-mcp.md §5.1, legacy agent page MCP card): mark, name, a summary ("3 of 5 tools
- * allowed · 1 ask first"), an Enabled switch, and when expanded each tool with Allow / Ask / Block. A stance click saves
- * at once (`useSetStance`: optimistic, rolled back with a toast). The agent's MCP tab lists one per server; the
- * server's Agents tab shows the one for the picked agent. `noAsk` (coding harnesses) hides Ask: a harness call has no
- * flow, so the gateway answers Ask with TOOL_ASK and stores no request to approve (nasiko-cloud-rs PR #631 reverted
- * f5cb65e7); a tool already on Ask keeps the item so its stance shows.
+ * allowed · 1 ask first"), an Enabled switch (an "Always on" badge for a platform-run server), and when expanded each
+ * tool with Allow / Ask / Block. A stance click saves at once (`useSetStance`: optimistic, rolled back with a toast).
+ * The agent's MCP tab lists one per server; the server's Agents tab shows the one for the picked agent. `noAsk`
+ * (coding harnesses) hides Ask: a harness call has no flow, so the gateway answers Ask with TOOL_ASK and stores no
+ * request to approve (nasiko-cloud-rs PR #631 reverted f5cb65e7); a tool already on Ask keeps the item so its stance
+ * shows.
  */
 import { Link } from '@tanstack/react-router'
-import { ChevronDown, RotateCw } from 'lucide-react'
+import { ChevronDown, Lock, RotateCw } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { Badge } from '@nasiko/ui/primitives/badge'
 import { Button } from '@nasiko/ui/primitives/button'
 import {
   Collapsible,
@@ -19,11 +21,12 @@ import {
 import { Skeleton } from '@nasiko/ui/primitives/skeleton'
 import { Switch } from '@nasiko/ui/primitives/switch'
 import { ToggleGroup, ToggleGroupItem } from '@nasiko/ui/primitives/toggle-group'
+import { SearchInput } from '@nasiko/ui/composites/search-input'
 import { AgentMark } from '@nasiko/features/agents/components/bits'
 import { cn } from '@nasiko/ui/lib/utils'
 import { useAgentTools, useSetAccess, useSetStance } from '../api'
 import { copy, reason, STANCE } from '../copy'
-import { stanceCounts } from '../logic'
+import { matchesTool, stanceCounts } from '../logic'
 import { ServerStatusBadge } from './bits'
 import { STANCES, type AgentTool, type Stance } from '../types'
 
@@ -32,6 +35,8 @@ export interface RuleTarget {
   label: string
   logoUrl?: string | null
   enabled: boolean
+  /** A platform-run server (`isAlwaysOn`): a locked badge instead of the switch; its tool rules still apply. */
+  alwaysOn?: boolean
 }
 
 export function ConnectorRules({
@@ -46,7 +51,9 @@ export function ConnectorRules({
   noAsk?: boolean
 }) {
   const [open, setOpen] = useState(defaultOpen)
+  const [q, setQ] = useState('')
   const tools = useAgentTools(agentId, target.connectorId, true)
+  const shown = (tools.data ?? []).filter((t) => matchesTool(t, q))
   const access = useSetAccess(agentId)
   const enabled = target.enabled
   const n = stanceCounts(tools.data ?? [])
@@ -90,21 +97,29 @@ export function ConnectorRules({
             <Skeleton className="mt-1 h-3 w-32" />
           )}
         </div>
-        <Switch
-          checked={enabled}
-          disabled={access.isPending}
-          aria-label={enabled ? copy.disable(target.label) : copy.enable(target.label)}
-          onCheckedChange={(v) =>
-            access.mutate(
-              { connectorId: target.connectorId, enabled: v },
-              { onError: (e) => toast.error(copy.accessFailed(reason(e))) },
-            )
-          }
-        />
+        {target.alwaysOn ? (
+          <Badge variant="outline">
+            <Lock aria-hidden /> {copy.alwaysOn}
+          </Badge>
+        ) : (
+          <Switch
+            checked={enabled}
+            disabled={access.isPending}
+            aria-label={enabled ? copy.disable(target.label) : copy.enable(target.label)}
+            onCheckedChange={(v) =>
+              access.mutate(
+                { connectorId: target.connectorId, enabled: v },
+                { onError: (e) => toast.error(copy.accessFailed(reason(e))) },
+              )
+            }
+          />
+        )}
       </div>
       <CollapsibleContent className="border-t border-border p-3">
-        {!enabled ? (
-          <p className="mb-2 text-xs text-muted-foreground">{copy.disabledNote}</p>
+        {target.alwaysOn || !enabled ? (
+          <p className="mb-2 text-xs text-muted-foreground">
+            {target.alwaysOn ? copy.alwaysOnNote : copy.disabledNote}
+          </p>
         ) : null}
         {tools.isPending ? (
           <Skeleton className="h-16" />
@@ -123,19 +138,33 @@ export function ConnectorRules({
         ) : !tools.data.length ? (
           <p className="text-sm text-muted-foreground">{copy.noToolsYet}</p>
         ) : (
-          <ul className={cn('divide-y divide-border', !enabled && 'opacity-60')}>
-            {tools.data.map((t) => (
-              <ToolRow
-                key={t.name}
-                agentId={agentId}
-                connectorId={target.connectorId}
-                tool={t}
-                tools={tools.data}
-                disabled={!enabled}
-                noAsk={noAsk}
-              />
-            ))}
-          </ul>
+          <>
+            <SearchInput
+              aria-label={copy.filterToolsOf(target.label)}
+              placeholder={copy.filterTools}
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              className="mb-2 w-full sm:w-72"
+            />
+            {shown.length ? (
+              <ul className={cn('divide-y divide-border', !enabled && 'opacity-60')}>
+                {shown.map((t) => (
+                  <ToolRow
+                    key={t.name}
+                    agentId={agentId}
+                    connectorId={target.connectorId}
+                    tool={t}
+                    // The whole set, not the filtered one: a stance write re-sends every rule (`rulesWith`).
+                    tools={tools.data}
+                    disabled={!enabled}
+                    noAsk={noAsk}
+                  />
+                ))}
+              </ul>
+            ) : (
+              <p className="text-sm text-muted-foreground">{copy.noToolMatch}</p>
+            )}
+          </>
         )}
       </CollapsibleContent>
     </Collapsible>

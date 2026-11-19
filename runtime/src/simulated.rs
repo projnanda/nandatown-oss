@@ -6,7 +6,10 @@ use async_trait::async_trait;
 use crate::{
     ContainerRuntime,
     error::{Result, RuntimeError},
-    types::{ContainerId, DeploymentSpec, DeploymentStatus, RuntimeState, validate_build_inputs},
+    types::{
+        BuildReport, ContainerId, DeploymentSpec, DeploymentStatus, RuntimeState,
+        validate_build_inputs,
+    },
 };
 
 /// `ContainerRuntime` backend for benchmarking control-plane throughput without
@@ -153,9 +156,9 @@ impl ContainerRuntime for SimulatedRuntime {
         ])
     }
 
-    async fn build(&self, tar_context: &[u8], image_tag: &str) -> Result<String> {
+    async fn build(&self, tar_context: &[u8], image_tag: &str) -> Result<BuildReport> {
         validate_build_inputs(tar_context, image_tag)?;
-        Ok(image_tag.to_owned())
+        Ok(BuildReport::image_only(image_tag))
     }
 }
 
@@ -184,6 +187,8 @@ mod tests {
             writable_path: None,
             owner_id: uuid::Uuid::nil(),
             force_pull: false,
+            parkable: false,
+            overrides: Default::default(),
         }
     }
 
@@ -223,6 +228,18 @@ mod tests {
         assert_eq!(runtime.list().await.unwrap().len(), 1);
         runtime.destroy(&s.container_id).await.unwrap();
         assert_eq!(runtime.list().await.unwrap().len(), 0);
+    }
+
+    /// The trait's default `is_serving` answers from `status()`.
+    #[tokio::test]
+    async fn a_runtime_serves_while_its_status_is_running() {
+        let runtime = SimulatedRuntime::new("http://127.0.0.1:9999");
+        let s = spec("agent-serving");
+        assert!(!runtime.is_serving(&s.container_id).await.unwrap());
+        runtime.deploy(&s).await.unwrap();
+        assert!(runtime.is_serving(&s.container_id).await.unwrap());
+        runtime.scale(&s.container_id, 0).await.unwrap();
+        assert!(!runtime.is_serving(&s.container_id).await.unwrap());
     }
 
     #[tokio::test]

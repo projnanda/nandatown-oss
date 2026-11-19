@@ -77,20 +77,16 @@ async fn seed_call(db: &sqlx::PgPool, c: Call<'_>) {
         saved_tokens,
         saved_cost,
     } = c;
-    sqlx::query(
-        "INSERT INTO token_usage (user_id, agent_id, operation_type, provider, model,
-             input_tokens, output_tokens, total_tokens, cost_usd, session_id, metadata)
-         VALUES ($1,$2,'direct_llm','openai','gpt-4o',$3,0,$3,$4,$5,
-                 '{\"brevity\": {\"applied\": true}}'::jsonb)",
+    router_call(
+        db,
+        user_id,
+        agent_id,
+        flow_id,
+        input_tokens,
+        cost_usd,
+        r#"{"brevity": {"applied": true}}"#,
     )
-    .bind(user_id)
-    .bind(agent_id)
-    .bind(input_tokens as i32)
-    .bind(cost_usd)
-    .bind(flow_id)
-    .execute(db)
-    .await
-    .unwrap();
+    .await;
 
     sqlx::query(
         "INSERT INTO token_savings (user_id, agent_id, flow_id, provider, model, layer, program,
@@ -212,6 +208,58 @@ async fn the_agent_scope_reports_input_tokens_before_and_after() {
     assert_eq!(row["calls"], 1);
 }
 
+/// Q1-5: saved tokens include cache reads and writes, so the actual tokens they are measured
+/// against must too, or the percentage is too high. All three views must agree.
+#[tokio::test]
+#[serial]
+async fn actual_tokens_count_cache_reads_and_writes_in_every_view() {
+    let server = common::TestServer::start().await;
+    let token = admin_token(&server).await;
+    let user = admin_user_id(&server.db).await;
+    let agent = seed_agent(&server.db, user, "cached-agent", true).await;
+    seed_call(
+        &server.db,
+        Call {
+            user_id: user,
+            agent_id: agent,
+            flow_id: "trace-cached",
+            input_tokens: 1000,
+            cost_usd: 10.0,
+            saved_tokens: 250,
+            saved_cost: 2.5,
+        },
+    )
+    .await;
+    sqlx::query(
+        "UPDATE trace_usage SET cache_read_tokens = 500, cache_creation_tokens = 100
+         WHERE trace_id = 'trace-cached'",
+    )
+    .execute(&server.db)
+    .await
+    .unwrap();
+
+    let body = savings(&server, &token, "?range=30d&scope=total").await;
+    let data = &body["data"];
+
+    // 1000 uncached input + 500 cache reads + 100 cache writes.
+    assert_eq!(data["total"]["actual_tokens"], 1600);
+    assert_eq!(data["total"]["baseline_tokens"], 1850);
+    let agent_row = data["by_agent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["agent_name"] == "cached-agent")
+        .expect("the agent with savings must appear");
+    assert_eq!(agent_row["actual_tokens"], 1600);
+    let session_row = data["by_session"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["session_id"] == "trace-cached")
+        .expect("the session with savings must appear");
+    assert_eq!(session_row["actual_tokens"], 1600);
+}
+
 #[tokio::test]
 #[serial]
 async fn a_category_with_no_eligible_traffic_returns_zero_with_a_reason() {
@@ -285,6 +333,8 @@ async fn coverage_separates_optimized_from_unoptimized_spend() {
     assert!(cov["unoptimized_spend_usd"].as_f64().unwrap() >= 40.0);
     // The biggest unoptimized spender is the actionable line: turn it on there next.
     assert_eq!(cov["top_unoptimized"]["agent_name"], "opt-off");
+    // Every saving is stored as estimated now, so a calibrated share would only count old rows.
+    assert!(cov.get("calibrated_pct").is_none());
 }
 
 #[tokio::test]
@@ -341,10 +391,47 @@ async fn the_total_scope_carries_both_rollups_so_a_panel_needs_one_request() {
     );
 }
 
+/// One router-priced LLM call, added to its flow's `trace_usage` row the way the
+/// router's live writer adds it.
+async fn router_call(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    agent_id: Uuid,
+    flow_id: &str,
+    input_tokens: i64,
+    cost_usd: f64,
+    metadata: &str,
+) {
+    sqlx::query(
+        "INSERT INTO trace_usage (trace_id, agent_name, session_id, agent_id, user_id, model,
+             provider, input_tokens, cost_usd, prompt_cost_usd, router_input_tokens,
+             router_cost_usd, router_prompt_cost_usd, started_at, priced_by, metadata)
+         VALUES ($3, COALESCE((SELECT name FROM agents WHERE id = $2), $2::text), $3, $2, $1,
+                 'gpt-4o', 'openai', $4, $5, $5, $4, $5, $5, now(), 'router', $6::jsonb)
+         ON CONFLICT (trace_id, agent_name) DO UPDATE SET
+             input_tokens = trace_usage.input_tokens + EXCLUDED.input_tokens,
+             cost_usd = trace_usage.cost_usd + EXCLUDED.cost_usd,
+             prompt_cost_usd = trace_usage.prompt_cost_usd + EXCLUDED.prompt_cost_usd,
+             router_input_tokens = trace_usage.router_input_tokens + EXCLUDED.router_input_tokens,
+             router_cost_usd = trace_usage.router_cost_usd + EXCLUDED.router_cost_usd,
+             router_prompt_cost_usd = trace_usage.router_prompt_cost_usd + EXCLUDED.router_prompt_cost_usd,
+             metadata = trace_usage.metadata || EXCLUDED.metadata",
+    )
+    .bind(user_id)
+    .bind(agent_id)
+    .bind(flow_id)
+    .bind(input_tokens)
+    .bind(cost_usd)
+    .bind(metadata)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
 /// Seed an orchestrator-side savings row — the shape IP-3, IP-4 and context selection write.
 ///
 /// `model`/`provider` are NULL and `saved_cost_usd` is 0 because none of those layers has a model
-/// response in scope when it measures. The matching `token_usage` row is what the read path prices
+/// response in scope when it measures. The matching `trace_usage` row is what the read path prices
 /// them from, so `with_llm_call = false` reproduces a turn that never reached a model.
 #[allow(clippy::too_many_arguments)]
 async fn seed_unpriced_saving(
@@ -358,17 +445,7 @@ async fn seed_unpriced_saving(
     program_name: &str,
 ) {
     if with_llm_call {
-        sqlx::query(
-            "INSERT INTO token_usage (user_id, agent_id, operation_type, provider, model,
-                 input_tokens, output_tokens, total_tokens, cost_usd, session_id)
-             VALUES ($1,$2,'direct_llm','openai','gpt-4o',100,0,100,1.0,$3)",
-        )
-        .bind(user_id)
-        .bind(agent_id)
-        .bind(flow_id)
-        .execute(db)
-        .await
-        .unwrap();
+        router_call(db, user_id, agent_id, flow_id, 100, 1.0, "{}").await;
     }
 
     sqlx::query(

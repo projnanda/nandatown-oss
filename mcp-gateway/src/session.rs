@@ -44,10 +44,30 @@ struct CachedComposioSession {
     mcp_url: String,
     mcp_headers: HashMap<String, String>,
     toolkits: Vec<String>,
+    /// [`key_fingerprint`] of the key the session was made under. A session from another
+    /// key belongs to another Composio project, and replicas switch keys at slightly
+    /// different times, so a mismatch is a miss rather than trusting the cache clear.
+    #[serde(default)]
+    key_fingerprint: String,
 }
 
+/// A short, non-reversible tag for a Composio key, safe to store beside a cached session.
+fn key_fingerprint(api_key: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(api_key.unwrap_or_default().as_bytes());
+    hex::encode(&digest[..8])
+}
+
+const SESSION_CACHE_PREFIX: &str = "mcp:session:";
+
 fn session_cache_key(user_id: Uuid) -> String {
-    format!("mcp:session:{user_id}")
+    format!("{SESSION_CACHE_PREFIX}{user_id}")
+}
+
+/// Drop every user's cached Composio session. A new key belongs to a different Composio
+/// project, so a session cached under the old one would keep being served until its TTL.
+pub async fn clear_session_cache(redis: &redis::Client) {
+    cache::delete_prefix(redis, SESSION_CACHE_PREFIX).await;
 }
 
 /// Remove the Composio API-key header (case-insensitively) before caching.
@@ -91,10 +111,10 @@ pub async fn invalidate_session_cache(state: &McpState, user_id: Uuid) {
 
 /// Resolve the conversation id a paused `auth_required`/`tool_approval` HITL
 /// request should be recorded against — the closest thing MCP has to an A2A
-/// `contextId`, via `session_traces` (populated by `agent_proxy` on every
-/// forwarded user query: `trace_id -> chat_sessions.session_id`). Falls back
-/// to the raw `trace_id` when no such row exists yet (e.g. a call made
-/// before `agent_proxy`'s insert lands, or in a test harness) — still a
+/// `contextId`, via `flows.session_id` (a flow's `flow_id` is its trace id, and
+/// every flow-creating path writes a NOT NULL `session_id`). Falls back
+/// to the raw `trace_id` when no such flow row exists yet (e.g. a call made
+/// before the flow insert lands, or in a test harness) — still a
 /// stable, per-conversation value a future resume dispatcher can push
 /// against, just not yet resolved to the human-facing chat session. `None`
 /// only when there is no verified flow at all, i.e. nothing to correlate
@@ -117,7 +137,7 @@ pub async fn resolve_context_id(
 ) -> Option<String> {
     let trace_id = verified_flow_id?;
     let session_id: Option<String> =
-        sqlx::query_scalar("SELECT session_id FROM session_traces WHERE trace_id = $1")
+        sqlx::query_scalar("SELECT session_id FROM flows WHERE flow_id = $1")
             .bind(trace_id)
             .fetch_optional(&state.db)
             .await
@@ -134,27 +154,30 @@ async fn resolve_composio_backend(
     accounts: &ConnectedAccounts,
     toolkits: &[String],
 ) -> Result<Option<MCPServerConfig>> {
-    let Some(provider) = &state.providers.composio else {
+    let Some(backend) = state.providers.composio.backend() else {
         return Ok(None);
     };
     if accounts.is_empty() {
         return Ok(None);
     }
+    let fingerprint = key_fingerprint(backend.api_key.as_deref());
 
-    // Fast path: cached session with matching toolkits, no Composio call.
+    // Fast path: cached session with matching toolkits, made under the current key,
+    // no Composio call.
     let key = session_cache_key(user_id);
     if let Some(cached) = cache::get_json::<CachedComposioSession>(&state.redis, &key).await
         && cached.toolkits == toolkits
+        && cached.key_fingerprint == fingerprint
     {
         return Ok(Some(composio_config(
             cached.mcp_url,
             cached.mcp_headers,
-            &state.config.composio_api_key,
+            &backend.api_key,
         )));
     }
 
     // Slow/cold path: reuse / patch / create the upstream session.
-    let session = match resolve_upstream(state, provider, user_id, accounts).await {
+    let session = match resolve_upstream(state, &backend.provider, user_id, accounts).await {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(%user_id, error = %e, "composio session resolution failed — omitting composio backend this cycle");
@@ -170,6 +193,7 @@ async fn resolve_composio_backend(
             mcp_url: session.mcp_url.clone(),
             mcp_headers: strip_cached_secret(&session.mcp_headers),
             toolkits: toolkits.to_vec(),
+            key_fingerprint: fingerprint,
         },
         state.config.session_ttl_seconds,
     )
@@ -178,7 +202,7 @@ async fn resolve_composio_backend(
     Ok(Some(composio_config(
         session.mcp_url,
         session.mcp_headers,
-        &state.config.composio_api_key,
+        &backend.api_key,
     )))
 }
 
@@ -354,6 +378,21 @@ mod tests {
     }
 
     #[test]
+    fn a_session_cached_under_another_key_is_not_reused() {
+        let old = key_fingerprint(Some("ak_old_project"));
+        assert_ne!(old, key_fingerprint(Some("ak_new_project")));
+        assert_eq!(old, key_fingerprint(Some("ak_old_project")));
+        assert!(!old.contains("ak_old_project"));
+
+        // An entry written before the fingerprint existed matches no key.
+        let legacy: CachedComposioSession = serde_json::from_str(
+            r#"{"session_id":"s","mcp_url":"u","mcp_headers":{},"toolkits":[]}"#,
+        )
+        .unwrap();
+        assert_ne!(legacy.key_fingerprint, old);
+    }
+
+    #[test]
     fn cached_composio_session_round_trip_never_reintroduces_the_secret() {
         // Simulates exactly what `cache::set_json_ex` / `get_json` do (JSON
         // serialize, store, deserialize) for the struct that's actually
@@ -370,6 +409,7 @@ mod tests {
             mcp_url: "https://mcp.composio/x".to_string(),
             mcp_headers: stripped,
             toolkits: vec!["gmail".to_string()],
+            key_fingerprint: key_fingerprint(Some("ak_master_secret")),
         };
         let json = serde_json::to_string(&cached).unwrap();
         assert!(

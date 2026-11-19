@@ -3,6 +3,13 @@
  * installers are this server's own `/install.sh` and `/install.ps1` (ui/shared/ui/public), which install the CLI as
  * `nandatown`. Re-check them when the CLI changes.
  */
+
+/** This server's origin, which serves the installers, or a placeholder where the page isn't served over http(s). */
+const origin =
+  typeof window !== 'undefined' && /^https?:$/.test(window.location.protocol)
+    ? window.location.origin
+    : 'https://<your-cluster>'
+
 export const copy = {
   title: 'Nandatown CLI',
   sub: 'Deploy, chat with and observe your agents from the terminal.',
@@ -12,8 +19,8 @@ export const copy = {
     line: 'One command, no account and no administrator rights. Run it again to update.',
     unix: 'macOS and Linux',
     windows: 'Windows (PowerShell)',
-    unixCommand: (origin: string) => `curl -fsSL ${origin}/install.sh | bash`,
-    windowsCommand: (origin: string) => `irm ${origin}/install.ps1 | iex`,
+    unixCommand: `curl -fsSL ${origin}/install.sh | bash`,
+    windowsCommand: `irm ${origin}/install.ps1 | iex`,
   },
   tasks: {
     title: 'What do you want to do?',
@@ -21,9 +28,7 @@ export const copy = {
   start: {
     title: 'Get started',
     install: 'Install the CLI',
-    connect: 'Connect to this cluster',
-    signIn: 'Sign in with your Nandatown account',
-    deploy: 'Deploy an agent from its folder',
+    connect: 'Connect to this cluster and sign in',
   },
   copyCommand: (what: string) => `Copy: ${what}`,
 }
