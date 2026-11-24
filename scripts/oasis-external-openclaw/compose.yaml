@@ -1,0 +1,39 @@
+name: oasis16-openclaw
+services:
+  agent:
+    image: ghcr.io/openclaw/openclaw:2026.9.3@sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b
+    command: ["sh", "-ec", "node /fixture.mjs init && exec openclaw gateway"]
+    user: "1000:1000"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    volumes:
+      - state:/home/node/.openclaw
+      - ./fixture.mjs:/fixture.mjs:ro
+    networks: [fixture]
+    environment:
+      OPENCLAW_GATEWAY_PORT: "18916"
+    healthcheck:
+      test: ["CMD", "node", "/fixture.mjs", "card"]
+      start_period: 90s
+      interval: 20s
+      timeout: 8s
+      retries: 4
+  edge:
+    image: nginx:stable-alpine@sha256:8eb2b5540eae779603cc3db84b3986a15ecb5308b54303146eee9837c137b51a
+    entrypoint: ["nginx", "-c", "/fixture-nginx.conf", "-g", "daemon off;"]
+    user: "101:101"
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    ports: ["127.0.0.1:18916:18916"]
+    volumes: ["./nginx.conf:/fixture-nginx.conf:ro"]
+    depends_on:
+      agent: { condition: service_healthy }
+    networks: [fixture, access]
+networks:
+  fixture:
+    internal: true
+  access: {}
+volumes:
+  state:

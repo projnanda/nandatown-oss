@@ -1,0 +1,8 @@
+# Optional: opt the disposable agent into outbound internet for provider sign-in
+# and a live model run. Does not add a published port or mount host credentials.
+services:
+  agent:
+    networks:
+      provider-egress: { gw_priority: 1 }
+networks:
+  provider-egress: {}
