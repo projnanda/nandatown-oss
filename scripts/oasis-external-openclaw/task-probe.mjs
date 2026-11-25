@@ -18,6 +18,21 @@ function completed(task, taskId, contextId, expectedAnswer) {
   return true;
 }
 
+// Independent witness for a single already-submitted offline addition task.
+// Only accepts a read operation; it cannot submit a message or trigger the model.
+export async function verifyStoredTask({ taskId, contextId, getTask }) {
+  if (typeof taskId !== 'string' || !safeId.test(taskId) || typeof contextId !== 'string' || !contextId.trim())
+    throw Error('Both original identifiers are required: OpenClaw task UUID and expected context ID.');
+  let stored;
+  try {
+    stored = await getTask(taskId);
+  } catch {
+    throw Error('Could not read the stored task; result unconfirmed. Do not send another task.');
+  }
+  if (!completed(stored, taskId, contextId, '17'))
+    throw Error('Task is pending; repeat the read later, not the submission.');
+}
+
 // OpenClaw's SendMessage wraps the Task; GetTask returns the Task itself.
 export async function runTask({ rpc, prompt = 'What is the sum of 8 and 9? Reply with just the number.', expectedAnswer = '17',
   now = () => Math.floor(performance.now()), sleep = delay }) {
@@ -54,7 +69,7 @@ export async function runTask({ rpc, prompt = 'What is the sum of 8 and 9? Reply
       throw Error('Could not confirm task ' + taskId + '; no second submission.');
     }
     remaining();
-    if (completed(task, taskId, contextId, expectedAnswer)) return { taskId, answer: expectedAnswer };
+    if (completed(task, taskId, contextId, expectedAnswer)) return { taskId, contextId, answer: expectedAnswer };
     if (initiallyDone) throw Error('Task store did not confirm the completed submission.');
   }
 }

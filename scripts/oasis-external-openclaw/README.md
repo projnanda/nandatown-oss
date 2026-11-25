@@ -34,7 +34,13 @@ The one-shot control exits after the test. The persistent agent can answer local
 
 1. Use the supported onboarding flow to register the separately operated agent's card without deploying a copy. Select an interface by **binding and version**. This fixture advertises JSON-RPC 1.0; another agent may prefer gRPC yet also advertise a compatible JSON-RPC interface.
 2. Configure a destination-specific peer credential using the build's supported secret mechanism. The public card is discovery information, not permission to invoke the agent. If that mechanism or network path is unavailable, record the missing prerequisite and stop.
-3. Submit the exact fixture question **through Oasis**, once. Confirm that OpenClaw received that run and the returned task has one text artifact equal to `17`. Correlate the task IDs on both sides (record the mapping if different). For another agent, establish its own expected result first. A direct call or a listing in the UI is not a substitute.
+3. Start a fresh conversation. Record its context ID from the outgoing request (or a documented mapping), and submit the exact fixture question **through Oasis**, once. Record the returned result and remote OpenClaw task UUID. In the offline fixture, independently read that task with the identifiers **from this run**:
+
+   ```sh
+   docker compose exec -T agent node /fixture.mjs verify 'paste-remote-task-uuid' 'paste-original-context-id'
+   ```
+
+   Replace the placeholders with the actual IDs before running. This sends only `GetTask`. It requires matching IDs, a completed state and one matching text artifact (`17`). If the task is pending, repeat the read later, not the original request. If Oasis can't expose the corresponding identifiers, report that correlation is unverified. The fixture read alone cannot tell who submitted the task: retain the Oasis-side result too. Earlier direct-control IDs are not evidence for a later Oasis run. For another agent, use its own expected outcome and independent readback.
 4. Capture the first step that failed, or the successful result and rerun instructions. Include only synthetic inputs, non-secret identifiers and the observed result. If the remote outcome is unknown, look up the existing task rather than sending the question again.
 
 ## If the external agent wants to use the Oasis model or tool gateway

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { runTask } from './task-probe.mjs';
+import { runTask, verifyStoredTask } from './task-probe.mjs';
 
 const id = '19f255ae-c87b-419c-b9fd-c7be4f68a732';
 const done = 'TASK_STATE_COMPLETED';
@@ -17,7 +17,7 @@ function scenario(handler) {
     rpc: async (method, params, timeoutMs) => {
       if (method === 'SendMessage') contextId = params.message.contextId;
       else assert.deepEqual(params, { id });
-      calls.push({ method, time, timeoutMs });
+      calls.push({ method, time, timeoutMs, contextId });
       const task = (state, artifacts, overrides) => ({
         id, contextId, status: { state }, artifacts, ...overrides,
       });
@@ -33,7 +33,8 @@ test('a 70-second task stays within the pinned gateway rate budget', async () =>
     if (calls.filter(call => call.time > time - 60_000).length > 30) throw Error('rate limited');
     return time < 70_000 ? task(working) : task(done, [output('17')]);
   });
-  assert.deepEqual(await probe(), { taskId: id, answer: '17' });
+  const result = await probe();
+  assert.deepEqual(result, { taskId: id, contextId: calls[0].contextId, answer: '17' });
   assert.equal(calls.filter(c => c.method === 'SendMessage').length, 1);
 });
 
@@ -52,7 +53,8 @@ test('requires the exact expected refusal for the unsupported offline question',
   const expectedAnswer = 'Unsupported offline fixture prompt.';
   const { probe, calls } = scenario(({ method, task }) => method === 'SendMessage'
     ? task(working) : task(done, [output(expectedAnswer)]));
-  assert.deepEqual(await probe({ expectedAnswer }), { taskId: id, answer: expectedAnswer });
+  const result = await probe({ expectedAnswer });
+  assert.deepEqual(result, { taskId: id, contextId: calls[0].contextId, answer: expectedAnswer });
   assert.deepEqual(calls.map(c => c.method), ['SendMessage', 'GetTask']);
   const wrong = scenario(({ task }) => task(done, [output('17')]));
   await assert.rejects(() => wrong.probe({ expectedAnswer }), /semantic result/i);
@@ -98,4 +100,40 @@ test('pending tasks have one whole-run deadline, including per-request timeouts'
   await assert.rejects(probe, err => err.message.includes(id) && /deadline/i.test(err.message));
   assert.ok(calls.every(c => c.timeoutMs > 0 && c.time + c.timeoutMs <= 120_000));
   assert.equal(calls.filter(c => c.method === 'SendMessage').length, 1);
+});
+
+test('an operator can verify an existing task in one read, without another submission', async () => {
+  const contextId = 'ses_local-fixture-1';
+  const reads = [];
+  await verifyStoredTask({ taskId: id, contextId, getTask: async requested => {
+    reads.push(requested);
+    return { id, contextId, status: { state: done }, artifacts: [output('17')] };
+  } });
+  assert.deepEqual(reads, [id]);
+});
+
+test('an unavailable or unrelated stored result never counts as this run', async () => {
+  const contextId = 'unique-to-this-run';
+  const stored = { id, contextId, status: { state: done }, artifacts: [output('17')] };
+  for (const [change, match] of [
+    [{ contextId: 'previous-run' }, /context/i], [{ id: 'wrong-task' }, /task/i],
+    [{ status: { state: working } }, /pending/i], [{ artifacts: [output('16')] }, /semantic/i],
+  ]) {
+    await assert.rejects(() => verifyStoredTask({
+      taskId: id, contextId, getTask: async () => ({ ...stored, ...change }),
+    }), match);
+  }
+  await assert.rejects(() => verifyStoredTask({
+    taskId: id, contextId, getTask: async () => { throw Error('private-response-body'); },
+  }), err => /could not read/i.test(err.message) && !err.stack.includes('private-response-body'));
+});
+
+test('a missing correlation ID is not treated as a match or sent to the store', async () => {
+  let reads = 0;
+  for (const [taskId, contextId] of [['wrong-format', 'ctx1'], [id, ''], [id, undefined], [id, '  ']]) {
+    await assert.rejects(() => verifyStoredTask({
+      taskId, contextId, getTask: async () => { reads++; },
+    }), /identifiers/i);
+  }
+  assert.equal(reads, 0);
 });

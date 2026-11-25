@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { runTask } from './task-probe.mjs';
+import { runTask, verifyStoredTask } from './task-probe.mjs';
 import { arithmetic, configureStub, startStub, unsupported } from './control/stub.mjs';
 
 const state = '/home/node/.openclaw';
@@ -96,14 +96,10 @@ function requireOffline(config) {
   assert.equal(config.models?.providers?.control?.baseUrl, 'http://127.0.0.1:' + stubPort + '/v1');
 }
 
-async function task(kind) {
+function peerRpc(config) {
   const base = 'http://edge:18916';
-  await card(base);
-  const config = JSON.parse(await readFile(file, 'utf8'));
-  if (kind === 'live') assert.equal(mode, 'live', 'use the separate opt-in provider project');
-  else requireOffline(config);
   const peer = config.channels.a2a.peers.oasis.token;
-  async function rpc(method, params, timeoutMs) {
+  return async (method, params, timeoutMs) => {
     const req = randomUUID();
     const response = await fetch(base + '/a2a/v1', {
       method: 'POST', redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
@@ -115,21 +111,38 @@ async function task(kind) {
     assert.equal(body.id, req);
     assert.ok(!body.error, 'RPC failed: ' + (body.error?.code ?? 'no code'));
     return body.result;
-  }
+  };
+}
+
+async function verify() {
+  const config = JSON.parse(await readFile(file, 'utf8'));
+  requireOffline(config);
+  const rpc = peerRpc(config);
+  const [taskId, contextId] = process.argv.slice(3);
+  await verifyStoredTask({ taskId, contextId, getTask: id => rpc('GetTask', { id }, 15_000) });
+  console.log('PASS: offline OpenClaw stored the matching completed task and artifact 17. Read only; caller not established.');
+}
+
+async function task(kind) {
+  await card('http://edge:18916');
+  const config = JSON.parse(await readFile(file, 'utf8'));
+  if (kind === 'live') assert.equal(mode, 'live', 'use the separate opt-in provider project');
+  else requireOffline(config);
+  const rpc = peerRpc(config);
   if (kind === 'negative') {
     await runTask({ rpc, prompt: 'What is 2 + 2?', expectedAnswer: unsupported });
     console.log('PASS: unsupported prompt returned the explicit fixture refusal, not 17.');
     return;
   }
-  const { taskId } = await runTask({ rpc });
-  console.log('PASS: directly read OpenClaw task %s; artifact 17 (%s). No Oasis call.', taskId,
-    kind === 'live' ? 'opt-in provider' : 'fixed-answer offline provider');
+  const { taskId, contextId } = await runTask({ rpc });
+  console.log('PASS: directly read OpenClaw task %s; context %s; artifact 17 (%s). No Oasis call.',
+    taskId, contextId, kind === 'live' ? 'opt-in provider' : 'fixed-answer offline provider');
 }
 
 const modes = new Map([['init', init], ['card', card], ['smoke', smoke], ['task', () => task('offline')],
-  ['negative', () => task('negative')], ['live', () => task('live')], ['stub', () => {
+  ['negative', () => task('negative')], ['verify', verify], ['live', () => task('live')], ['stub', () => {
     assert.equal(mode, 'offline');
     return startStub(arithmetic, stubPort);
   }]]);
-assert.ok(modes.has(process.argv[2]), 'expected init, card, smoke, task, negative, live or stub');
+assert.ok(modes.has(process.argv[2]), 'expected init, card, smoke, task, negative, verify, live or stub');
 await modes.get(process.argv[2])();
