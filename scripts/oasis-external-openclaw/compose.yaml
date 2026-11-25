@@ -9,6 +9,7 @@ services:
     volumes:
       - state:/home/node/.openclaw
       - ./fixture.mjs:/fixture.mjs:ro
+      - ./task-probe.mjs:/task-probe.mjs:ro
     networks: [fixture]
     environment:
       OPENCLAW_GATEWAY_PORT: "18916"

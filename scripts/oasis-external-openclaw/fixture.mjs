@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
+import { runTask } from './task-probe.mjs';
 
 const state = '/home/node/.openclaw';
 const file = state + '/openclaw.json';
@@ -90,11 +91,10 @@ async function live() {
   await card(base);
   const config = JSON.parse(await readFile(file, 'utf8'));
   const peer = config.channels.a2a.peers.oasis.token;
-  const until = Date.now() + 120_000;
-  async function rpc(method, params) {
+  async function rpc(method, params, timeoutMs) {
     const req = randomUUID();
     const response = await fetch(base + '/a2a/v1', {
-      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(15_000),
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
       headers: { 'Content-Type': 'application/json', 'A2A-Version': '1.0', Authorization: 'Bearer ' + peer },
       body: JSON.stringify({ jsonrpc: '2.0', id: req, method, params }),
     });
@@ -104,26 +104,7 @@ async function live() {
     assert.ok(!body.error, 'RPC failed: ' + (body.error?.code ?? 'no code'));
     return body.result;
   }
-  // Never repeat SendMessage automatically, including after a transport timeout.
-  const start = await rpc('SendMessage', {
-    message: { role: 'ROLE_USER', messageId: randomUUID(), contextId: randomUUID(),
-      parts: [{ text: 'What is the sum of 8 and 9? Reply with just the number.' }] },
-    configuration: { returnImmediately: true },
-  });
-  let task = start?.task;
-  assert.ok(task?.id, 'expected an OpenClaw Task');
-  const taskId = task.id;
-  while (['TASK_STATE_SUBMITTED', 'TASK_STATE_WORKING'].includes(task.status?.state)) {
-    assert.ok(Date.now() < until, 'last observed pending; no second submission');
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    const result = await rpc('GetTask', { id: taskId });
-    task = result?.task ?? result;
-    assert.equal(task?.id, taskId);
-  }
-  assert.equal(task.status?.state, 'TASK_STATE_COMPLETED', 'terminal task state');
-  const answer = (task.artifacts ?? []).flatMap(a => a.parts ?? [])
-    .map(p => p.text ?? '').join('').trim();
-  assert.equal(answer, '17', 'expected the actual agent output artifact to contain the answer');
+  await runTask({ rpc });
   console.log('PASS: direct OpenClaw task completed with text artifact 17. This did not go through Oasis.');
 }
 
