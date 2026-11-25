@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
+import { expectAccessible } from './axe'
 
 // Intercept the backend boundary only: the document, controls and requests are the shipped code.
 const api = '/api/nanda/external-agents'
@@ -68,7 +69,12 @@ test('an operator registers a peer and sends once; an ambiguous result never loo
       tasks.push(req.postDataJSON())
       return tasks.length === 1
         ? route.fulfill({
-            json: { text: '17 <demo>', task_id: 'remote-task', context_id: 'remote-context' },
+            json: {
+              result_kind: 'task',
+              text: '17 <demo>',
+              task_id: 'remote-task',
+              context_id: 'remote-context',
+            },
           })
         : route.fulfill({ status: 502, json: { error: 'a2a_invalid_result' } })
     }
@@ -122,4 +128,143 @@ test('an operator registers a peer and sends once; an ambiguous result never loo
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click()
   await expect(page.getByText('Disconnected.', { exact: true })).toBeVisible()
   expect(disconnected).toBe(true)
+})
+
+const standalone = () =>
+  readFileSync(new URL('../../server/src/nanda_external/operator.html', import.meta.url), 'utf8')
+const peer = (id: string) => ({ id, name: id, endpoint, card_url: card, auth_mode: 'none' })
+
+test('normal detail opens the owner’s selected external agent, without a managed chat or deployment', async ({
+  page,
+  context,
+}) => {
+  const id = '5eed0000-0001-4000-8000-000000000001'
+  await page.goto('/agents/' + id + '?mock=external-connection&tab=builds')
+  await expect(page.getByText('Externally hosted', { exact: true })).toBeVisible()
+  await expect(page.getByRole('tab')).toHaveCount(0)
+  await expect(page.getByRole('link', { name: 'Try it' })).toHaveCount(0)
+  await expectAccessible(page)
+  const send = page.getByRole('link', { name: 'Send a task' })
+  await expect(send).toHaveAttribute('href', '/nanda/external-agents?connection=' + id)
+  await context.route('**/nanda/external-agents?connection=*', (route) =>
+    route.fulfill({ contentType: 'text/html', body: standalone() }),
+  )
+  await context.route('**/api/nanda/external-agents', (route) =>
+    route.fulfill({ json: [peer('first'), peer(id)] }),
+  )
+  await send.click()
+  await expect(page.getByLabel('Connected agent')).toHaveValue(id)
+  await expectAccessible(page)
+})
+
+test('preselects the requested owner connection, and distinguishes a direct Message from a completed Task', async ({
+  page,
+}) => {
+  const sent: string[] = []
+  await page.route('https://town.example/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === api) return route.fulfill({ json: [peer('first'), peer('wanted')] })
+    if (path.endsWith('/tasks')) {
+      sent.push(path)
+      return route.fulfill({
+        json: {
+          result_kind: 'message',
+          text: 'Direct answer',
+          task_id: 'referenced',
+          context_id: null,
+        },
+      })
+    }
+    return route.fulfill({ contentType: 'text/html', body: standalone() })
+  })
+  await page.goto('https://town.example/nanda/external-agents?connection=wanted')
+  await expect(page.getByLabel('Connected agent')).toHaveValue('wanted')
+  await page.getByLabel('Task to send').fill('question')
+  await page.getByRole('button', { name: 'Send one task' }).click()
+  await expect(page.getByText('Direct answer', { exact: true })).toBeVisible()
+  await expect(page.locator('#result-hint')).toContainText(/direct message/i)
+  expect(sent).toEqual([api + '/wanted/tasks'])
+  await page.goto('https://town.example/nanda/external-agents?connection=someone-elses')
+  await expect(
+    page.getByRole('status').filter({ hasText: /not in your connections/i }),
+  ).toBeVisible()
+  await expect(page.getByLabel('Task to send')).not.toBeVisible()
+})
+
+test('a failed logout in another tab erases a pending task and blocks requests across reload until a fresh sign-in', async ({
+  page,
+  context,
+}) => {
+  let lists = 0
+  let finish!: () => void
+  let started!: () => void
+  const inFlight = new Promise<void>((r) => {
+    started = r
+  })
+  const waiting = new Promise<void>((r) => {
+    finish = r
+  })
+  const url = '/nanda/external-agents'
+  await context.route('**/nanda/external-agents', (route) =>
+    route.fulfill({ contentType: 'text/html', body: standalone() }),
+  )
+  await context.route('**/api/nanda/external-agents**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === api) {
+      lists++
+      return route.fulfill({ json: [peer('private agent')] })
+    }
+    if (path.endsWith('/tasks')) {
+      started()
+      await waiting
+      return route.fulfill({
+        json: { result_kind: 'task', text: 'old account answer', task_id: 't', context_id: 'c' },
+      })
+    }
+    return route.abort()
+  })
+  await page.goto(url)
+  const origin = await context.newPage()
+  await origin.goto('/agents?mock=logout-unavailable')
+  await page.getByLabel('Task to send').fill('private draft')
+  await page.getByRole('button', { name: 'Send one task' }).click()
+  await inFlight
+  await origin.getByRole('button', { name: 'Account: admin' }).click()
+  await origin.getByRole('menuitem', { name: 'Sign out' }).click()
+  await expect(origin.getByText(/this browser may still be signed in/i)).toBeVisible()
+  await expect(page.getByRole('link', { name: /Sign in to Town/ })).toBeVisible()
+  finish()
+  await expect(page.getByLabel('Connected agent')).not.toBeVisible()
+  await expect(page.getByRole('button', { name: 'Refresh' })).toBeDisabled()
+  await expect(page.locator('#answer')).toHaveText('')
+  await page.reload()
+  await expect(page.getByRole('button', { name: 'Refresh' })).toBeDisabled()
+  expect(lists).toBe(1)
+  await origin.getByRole('button', { name: 'Sign in', exact: true }).click()
+  await expect(page.getByLabel('Connected agent')).toBeEnabled()
+  await origin.evaluate(() => {
+    new BroadcastChannel('openruntime.session').postMessage({
+      type: 'signed-out',
+      failed: true,
+      generation: '0',
+    })
+  })
+  await expect(page.getByLabel('Connected agent')).toBeEnabled()
+  await expect(page.locator('#answer')).toHaveText('')
+})
+
+test('a non-loopback HTTP Town never accepts a peer token', async ({ page }) => {
+  await page.route('http://town.example/**', (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === api) return route.fulfill({ json: [] })
+    if (path === api + '/preview')
+      return route.fulfill({ json: { name: 'Peer', endpoint, requires_bearer: true } })
+    return route.fulfill({ contentType: 'text/html', body: standalone() })
+  })
+  await page.goto('http://town.example/nanda/external-agents')
+  await page.getByLabel('Agent card URL').fill(card)
+  await page.getByRole('button', { name: 'Preview card' }).click()
+  await expect(page.getByLabel('Dedicated peer bearer token')).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Connect agent' })).toBeDisabled()
+  await expect(page.getByText(/open Town over HTTPS/i)).toBeVisible()
 })

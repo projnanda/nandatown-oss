@@ -17,7 +17,7 @@ import type { components } from '@nasiko/data-access/schema.gen'
 type S = components['schemas']
 
 export type Agent = S['Agent']
-export type AgentDetailResponse = S['AgentDetailResponse']
+export type AgentDetailResponse = S['AgentDetailResponse'] & { is_external_connection?: boolean }
 export type AgentVersion = S['AgentVersion']
 export type DeploymentRow = S['DeploymentRow']
 export type DeletedAgent = S['DeletedAgent']
@@ -109,6 +109,7 @@ export const agentDetailSchema = z.looseObject({
   owner_id: z.string(),
   status: z.string(),
   can_manage: z.boolean(),
+  is_external_connection: z.boolean().optional(),
   is_coding_agent: z.boolean(),
   coding_agent_integration_id: z.string().nullish(),
   // Newer than the generated spec (catalog/routes.rs at 05f22246); optional so an older server still parses.

@@ -823,6 +823,32 @@ describe('owner-controlled text', () => {
 })
 
 describe('Try it (chat plan §9)', () => {
+  it.each([true, false])('external detail replaces managed controls (owner: %s)', async (mine) => {
+    const me = (await (await fetch('/api/me')).json()) as { sub: string }
+    const { data } = await (await fetch(`/api/agents/${running.id}`)).json()
+    server.use(
+      http.get(`/api/agents/${running.id}`, () =>
+        HttpResponse.json({
+          data: {
+            ...data,
+            owner_id: mine ? me.sub : 'another-owner',
+            is_external_connection: true,
+            can_manage: true,
+          },
+        }),
+      ),
+    )
+    renderApp(url(0, 'builds'))
+    expect(await screen.findByText('Externally hosted')).toBeVisible()
+    const send = screen.queryByRole('link', { name: 'Send a task' })
+    if (mine)
+      expect(send).toHaveAttribute('href', `/nanda/external-agents?connection=${running.id}`)
+    else expect(send).toBeNull()
+    expect(screen.queryByRole('tab')).toBeNull()
+    expect(screen.queryByRole('link', { name: 'Try it' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Restart' })).toBeNull()
+  })
+
   it('a running agent links to Chat from the header, once', async () => {
     renderApp(url(0, 'details'))
     await title()

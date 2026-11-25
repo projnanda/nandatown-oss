@@ -28,6 +28,7 @@ export interface AgentView {
   tags: string[]
   canManage: boolean
   isHarness: boolean
+  isExternalConnection: boolean
   integrationId: string | null
   /** `compress_enabled` (catalog/routes.rs `AgentDetailResponse`): the Token optimization switch; absent reads as off. */
   compressEnabled: boolean
@@ -122,6 +123,7 @@ export function normalizeDetail(d: AgentDetailResponse): AgentView {
     skills: skills(raw.skills),
     tags: strings(raw.tags),
     canManage: bool(raw.can_manage),
+    isExternalConnection: bool(raw.is_external_connection),
     isHarness: isHarness({
       is_coding_agent: bool(raw.is_coding_agent),
       tags: strings(raw.tags),

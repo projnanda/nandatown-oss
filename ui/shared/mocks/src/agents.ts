@@ -404,6 +404,7 @@ export function detailBody(a: MockAgent, canManage: boolean) {
     supportsAuthenticatedExtendedCard: false,
     provider: null,
     can_manage: canManage,
+    is_external_connection: false,
     is_coding_agent: a.harness !== null,
     coding_agent_integration_id: a.harness,
     compress_enabled: a.compress,

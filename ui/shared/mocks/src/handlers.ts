@@ -278,6 +278,7 @@ export const MOCK_VARIANTS = [
   'server-down',
   // App shell sign out: logout gets the server's fail-closed 401 (review, api-contract).
   'logout-unavailable',
+  'external-connection',
   // Deploy (plans/feat-deploy.md §9): every build read answers `{available:false}` (a caller without deploy rights, EE);
   // `builds-absent` answers /api/builds with a bare 404, like a server that predates it; `deploy-build-fails` accepts an
   // upload and then fails its build.
@@ -1156,6 +1157,8 @@ export const handlerGroups: Record<Mockable, HttpHandler[]> = {
       // get_one: a bare 404 with an empty body for unknown and deleted agents.
       if (!a) return new HttpResponse(null, { status: 404 })
       const body = detailBody(a, canManage(a))
+      if (variant() === 'external-connection' && a.name === 'seed-support-bot')
+        body.is_external_connection = true
       // Partial-live mode: the seed admin's agents are the live user's (as in the `owner=` list above).
       return envelope(
         personaLocked && liveOwner && a.owner_id === ADMIN_ID
