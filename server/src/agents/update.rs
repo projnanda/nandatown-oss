@@ -124,10 +124,13 @@ pub(crate) async fn update_agent(
         owner_id: Uuid,
         writable: bool,
         writable_path: Option<String>,
+        is_external: bool,
     }
 
     let agent: Option<UpdateAgentRow> = match sqlx::query_as(
-        "SELECT name, version, image, owner_id, writable, writable_path FROM agents WHERE id = $1 AND deleted_at IS NULL",
+        "SELECT a.name, a.version, a.image, a.owner_id, a.writable, a.writable_path,
+                EXISTS (SELECT 1 FROM nanda_external_connections c WHERE c.agent_id=a.id) AS is_external
+         FROM agents a WHERE a.id=$1 AND a.deleted_at IS NULL",
     )
     .bind(agent_id)
     .fetch_optional(&state.db)
@@ -147,6 +150,7 @@ pub(crate) async fn update_agent(
         owner_id: agent_owner_id,
         writable,
         writable_path,
+        is_external,
     }) = agent
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -204,6 +208,15 @@ pub(crate) async fn update_agent(
         Ok(policy) => policy,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // External registration always creates a new UUID, never a binding on an existing
+    // managed agent. A source-less managed rebuild must not retire a live peer binding.
+    if is_external && source_data.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            "upload a source zip to convert an external connection to a managed agent",
+        )
+            .into_response();
+    }
 
     // Determine new version.
     // Accepts strategy keywords (auto, patch, minor, major) or an explicit semver string (e.g. "1.2.3").

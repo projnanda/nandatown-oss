@@ -234,6 +234,8 @@
         a2a_card_unsupported: 'The card must offer one supported A2A 1.0 JSON-RPC interface.',
         a2a_security_unsupported: 'The card requires an authentication scheme this connector does not support.',
         a2a_peer_access_denied: 'The peer refused access to this task. Check the required permissions with its operator; to change the peer credential, disconnect and reconnect with a dedicated bearer. Town did not resend the task.',
+        a2a_task_failed: 'The agent reported that the task failed, was canceled, or was rejected. Check the task at the agent before trying again. Town did not resend it.',
+        a2a_task_needs_input: 'The agent needs more input or authorization. This page cannot continue that task. Follow up with the agent operator; Town did not send another request to start it again.',
         a2a_invalid_result: 'The agent returned an ambiguous or invalid result; no answer was confirmed.',
         a2a_task_pending: 'The task remained pending; no answer was confirmed.',
         a2a_task_unconfirmed: 'The remote task could not be confirmed.',
@@ -259,7 +261,8 @@
     catch (e) {
       if (active !== request) return;
       const reason = e instanceof TypeError || e instanceof SyntaxError ? 'No usable response from Town.' : e.message;
-      show(status, [reason, e.cause === 'a2a_peer_access_denied' ? '' : caution].filter(Boolean).join(' '));
+      const peerReportedOutcome = ['a2a_peer_access_denied', 'a2a_task_failed', 'a2a_task_needs_input'].includes(e.cause);
+      show(status, [reason, peerReportedOutcome ? '' : caution].filter(Boolean).join(' '));
     } finally {
       if (active === request) { active = null; busy = false; controls(); focus?.focus(); }
     }

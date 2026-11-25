@@ -2,6 +2,8 @@
 
 If you already run an agent that speaks the Agent-to-Agent (A2A) protocol, you can send it a text task from Town's **Agents** page. It stays on your server. You do not need to upload its code, deploy a container to Town, give Town your model key, or install the Nasiko CLI.
 
+**Using OpenClaw?** If it doesn't already serve an Agent Card, follow [OpenClaw's A2A setup for the tested version](https://github.com/openclaw/openclaw/blob/v2026.9.3/docs/channels/a2a.md#quick-setup) on a dedicated test instance. Advertise its public HTTPS origin, expose only the intended test agent, and issue Town a separate peer token. Town needs the card and the task endpoint, not your OpenClaw admin interface.
+
 ## 1. Give your Town operator two URLs
 
 Send the URL of your **public Agent Card** and the **task endpoint** listed in that card. The card tells Town how to reach your agent; it does not grant access. For example:
@@ -41,26 +43,30 @@ Look for HTTP `200`, a JSON content type, and a matching entry in `supportedInte
 
 **Reading the result:** A *Task* result includes the completed task's text and identifiers. A *Message* is a direct reply. It can mention a task ID without proving the task finished. Town checks pending tasks by ID; it never automatically sends the original request again.
 
+**Want Town to host a copy later?** Create a separate managed agent and verify it before disconnecting the original. If you upload source as an in-place managed update, Town retires the external connection when it queues the build, not when the build succeeds.
+
 | If you see this | What to do |
 | --- | --- |
 | Town won't preview the card | Check that both URLs match the operator's approved pair and the card advertises a compatible interface. An HTTP redirect does not count. |
 | The agent refuses the task | Check the agent's token and permissions with its owner. Signing in to Town again won't fix permission at the other end. |
+| The agent reports that it failed or needs input | This is a reply from the agent, not a lost connection. Check the task there. Town's single-task screen can't continue a conversation or supply additional authorization. |
 | Town times out or loses the reply | Check the agent's task history before retrying. It may already have done the work. Town can't resume that call for you. |
 
 ## Optional: let your agent use Town's model and tool gateways
 
 This is the **other direction**: your agent calls Town for a model or a tool. Skip it if you only want Town to send tasks to your agent. Connecting a card does not change how your agent spends tokens, grant tool access, or turn on traces.
 
-On a development machine you control, with a locally discoverable HTTP agent already running, use the [Nasiko CLI](CLI_INSTALL.md). Replace `town.example` and `planner` with your Town address and the name discovery reports:
+Use the CLI **from this Town OSS checkout**, on a development machine you control with a locally discoverable HTTP agent already running. A separately installed Nasiko release may not have the same discovery commands. From the repository root, using Cargo's default build directory:
 
 ```sh
-nasiko connect oasis --url https://town.example
-nasiko agents discover
-nasiko connect planner
-nasiko status
+cargo build --locked -p nasiko --bin nasiko
+./target/debug/nasiko connect oasis --url https://town.example
+./target/debug/nasiko agents discover
+./target/debug/nasiko connect planner
+./target/debug/nasiko status
 ```
 
-Run this in a private terminal: discovery reports local agents to the selected cluster, and setup can display or write credentials. Choose the model provider you want to route and, if needed, opt in to MCP tools. Keep the generated settings out of Git and logs. Restart your agent so it picks up the changes.
+Replace `town.example` with your Town address and `planner` with the name discovery actually reports. Run this in a private terminal: discovery reports local agents to the selected cluster, and setup can display or write credentials. Choose the model provider you want to route and, if needed, opt in to MCP tools. Keep the generated settings out of Git and logs. Restart your agent so it picks up the changes.
 
 - **Models:** An OpenAI-compatible client uses `OPENAI_BASE_URL` (Town's `/v1`) and `OPENAI_API_KEY` (the agent-specific Town token). Send one synthetic model request. In **Connect → LLM router → Agents**, look up the **discovered agent**, not the incoming connection. With usage reporting enabled, check its token counts in **TokenOps → Monitor**. **TokenOps → Optimize** shows available optimization data; connecting an agent doesn't by itself save tokens.
 - **Tools:** The [MCP client example](../scripts/a2a-discovery-e2e/mcp_langgraph.py) reads `MCP_GATEWAY_URL` and its own `MCP_GATEWAY_TOKEN`. Call a harmless tool your agent is allowed to use and check its answer. The gateway tracks actual tool calls separately from model tokens; listing tools alone doesn't test a call.
@@ -84,6 +90,12 @@ Run `docker compose up -d --no-deps --force-recreate server` after adding **or r
 Serve the UI and API over HTTPS. The native server does not terminate TLS. Set `NANDA_EXTERNAL_A2A_TLS_PROXY_IP` to the IP of the proxy directly in front of Town, restrict backend access to that proxy, and have it overwrite `X-Forwarded-Proto` from the actual connection. Reject plaintext at the edge before a user submits a bearer. Town encrypts the saved peer token and never returns it in the catalog.
 
 Town rechecks the card before sending a task, pins DNS results per operation, and doesn't follow redirects or system HTTP proxies. It allows two outbound operations per server process. This path does not support streaming, OAuth negotiation, tenant-specific A2A interfaces, or scheduling.
+
+### Check a hosted installation with a second person
+
+Use an agent whose owner has agreed to the test. Record the Town build and agent version. Ask someone with an ordinary member account to follow steps 1 and 2 without admin access. Use a harmless task with a known answer and a fresh identifier, such as “What is 8 + 9? Include the label demo-42” with a new label each run. For a peer that returns a **Task**, compare the task ID, context ID, answer and label with the record on the agent's host. Then disconnect, check that the connection is gone from Town and confirm with the owner that the agent is still running.
+
+Note how long setup took and where the member needed help. Keep prompts synthetic and credentials out of screenshots. This verifies **Town calling one independently hosted agent**. To demonstrate use of a service as well, have the agent call one permitted tool and check its actual result using the [gateway steps](#optional-let-your-agent-use-towns-model-and-tool-gateways).
 
 ## Local proof with OpenClaw, no model account
 

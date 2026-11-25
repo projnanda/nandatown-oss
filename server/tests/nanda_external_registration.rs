@@ -492,7 +492,7 @@ async fn retirement_winning_the_source_update_claim_cannot_queue_a_managed_build
         &owner.to_string(),
         "update-owner",
     )
-    .multipart(reqwest::multipart::Form::new().text("version", "2.0.0"));
+    .multipart(conversion_form());
     let updating = tokio::spawn(async move { req.send().await });
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -520,6 +520,49 @@ async fn retirement_winning_the_source_update_claim_cannot_queue_a_managed_build
     assert_eq!(count, 0);
 }
 
+fn conversion_form() -> reqwest::multipart::Form {
+    // Exercise admission/queueing without letting the worker build a Docker image.
+    reqwest::multipart::Form::new()
+        .text("version", "2.0.0")
+        .part(
+            "source",
+            reqwest::multipart::Part::bytes(common::make_zip(&[("agent.py", b"print(17)")]))
+                .file_name("agent.zip"),
+        )
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn missing_source_preserves_the_external_binding_without_queueing_a_build() {
+    let s = TestServer::start().await;
+    let owner = user(&s, "missing-source").await;
+    let id = seed_connection(&s, owner).await;
+    let res = common::as_superuser(
+        s.client.put(s.url(&format!("/api/agents/{id}/update"))),
+        &owner.to_string(),
+        "missing-source",
+    )
+    .multipart(reqwest::multipart::Form::new().text("version", "2.0.0"))
+    .send()
+    .await
+    .unwrap();
+    let row: (bool, i64, i64, String) = sqlx::query_as(
+        "SELECT EXISTS(SELECT 1 FROM nanda_external_connections WHERE agent_id=$1 AND owner_id=$2),
+         (SELECT count(*) FROM agent_builds WHERE agent_id=$1),
+         (SELECT count(*) FROM build_jobs WHERE agent_id=$1), status FROM agents WHERE id=$1",
+    )
+    .bind(id)
+    .bind(owner)
+    .fetch_one(&s.db)
+    .await
+    .unwrap();
+    s.cleanup().await;
+    assert_eq!(
+        (res.status().as_u16(), row),
+        (409, (true, 0, 0, "registered".into()))
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn authorized_source_conversion_retires_the_binding_and_queues_the_build() {
@@ -531,11 +574,7 @@ async fn authorized_source_conversion_retires_the_binding_and_queues_the_build()
         &owner.to_string(),
         "convert-owner",
     )
-    .multipart(
-        reqwest::multipart::Form::new()
-            .text("version", "2.0.0")
-            .text("parking_policy", "resident"),
-    );
+    .multipart(conversion_form().text("parking_policy", "resident"));
     let res = req.send().await.unwrap();
     let row: (bool, i64, String) = sqlx::query_as(
         "SELECT EXISTS(SELECT 1 FROM nanda_external_connections WHERE agent_id=$1),

@@ -122,6 +122,7 @@ test('an operator registers a peer and sends once; an ambiguous result never loo
   await page.getByLabel('Task to send').fill('another task')
   await send.click()
   await expect(page.getByText(/ambiguous or invalid/)).toBeVisible()
+  await expect(page.locator('#task-status')).toContainText(/outcome may be unknown/i)
   await expect(page.getByText('17 <demo>', { exact: true })).toHaveCount(0)
   expect(tasks).toEqual([{ text: '8+9' }, { text: 'another task' }])
   page.once('dialog', (dialog) => dialog.accept())
@@ -300,3 +301,32 @@ test('a refused transport or peer credential has a specific recovery without log
   await expect(page.locator('#signin')).toBeHidden()
   expect(sends).toBe(1)
 })
+
+for (const [code, expected, uncertain] of [
+  ['a2a_task_failed', /failed.*canceled.*rejected/i, false],
+  ['a2a_task_needs_input', /needs more input or authorization/i, false],
+  ['a2a_task_unconfirmed', /could not be confirmed/i, true],
+] as const) {
+  test(`a task response distinguishes ${code} from a lost reply`, async ({ page }) => {
+    const peer = { id: 'one', name: 'Peer', card_url: card, endpoint, auth_mode: 'none' }
+    let sends = 0
+    await page.route('https://town.example/**', (route) => {
+      const path = new URL(route.request().url()).pathname
+      if (path === api) return route.fulfill({ json: [peer] })
+      if (path === api + '/one/tasks') {
+        sends++
+        return route.fulfill({ status: uncertain ? 504 : 502, json: { error: code } })
+      }
+      return route.fulfill({ contentType: 'text/html', body: standalone() })
+    })
+    await page.goto('https://town.example/nanda/external-agents')
+    await page.getByLabel('Task to send').fill('check one order')
+    await page.getByRole('button', { name: 'Send one task' }).click()
+    const status = page.locator('#task-status')
+    await expect(status).toContainText(expected)
+    if (uncertain) await expect(status).toContainText(/outcome may be unknown/i)
+    else await expect(status).not.toContainText(/outcome may be unknown/i)
+    await expect(page.locator('#result')).toBeHidden()
+    expect(sends).toBe(1)
+  })
+}
