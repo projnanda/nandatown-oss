@@ -55,11 +55,18 @@ fn check_text_modes(card: &Value, field: &str) -> Result<(), &'static str> {
     };
     let mut compatible = false;
     for value in declared.as_array().ok_or(CARD_INVALID)? {
-        let mode: mime::Mime = value
-            .as_str()
-            .ok_or(CARD_INVALID)?
-            .parse()
-            .map_err(|_| CARD_INVALID)?;
+        let label = value.as_str().ok_or(CARD_INVALID)?;
+        // The Python SDK samples advertise these legacy labels. Only "text"
+        // promises a text answer; a status notification isn't one.
+        match label {
+            "text" => {
+                compatible = true;
+                continue;
+            }
+            "task-status" if field == "defaultOutputModes" => continue,
+            _ => {}
+        }
+        let mode: mime::Mime = label.parse().map_err(|_| CARD_INVALID)?;
         let plain = matches!(mode.essence_str(), "text/plain" | "text/*" | "*/*");
         compatible |= plain && utf8_params(&mode);
     }
@@ -498,6 +505,32 @@ mod tests {
     }
 
     #[test]
+    fn python_sdk_hello_card_selects_only_the_approved_text_interface() {
+        // Actual hello_world_agent.py discovery response, a2aproject/a2a-python at eaa71bc.
+        // This calls only the parser; the fixture's loopback URLs are not deployment approvals.
+        let mut doc: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/python-sdk-hello-card.json"
+        ))
+        .unwrap();
+        let rpc = Url::parse("http://127.0.0.1:60067/a2a/jsonrpc").unwrap();
+        let selected = parse_card(&rpc, &doc).unwrap();
+        assert_eq!(selected.endpoint, rpc);
+        assert!(!selected.requires_bearer);
+        assert_eq!(
+            parse_card(&location(), &doc).unwrap_err(),
+            "a2a_endpoint_changed"
+        );
+
+        doc["defaultOutputModes"] = json!(["task-status"]);
+        assert_eq!(parse_card(&rpc, &doc).unwrap_err(), CARD_UNSUPPORTED);
+        doc["defaultOutputModes"] = json!(["text", "other-label"]);
+        assert_eq!(parse_card(&rpc, &doc).unwrap_err(), CARD_INVALID);
+        doc["defaultOutputModes"] = json!(["text"]);
+        doc["defaultInputModes"] = json!(["text", "task-status"]);
+        assert_eq!(parse_card(&rpc, &doc).unwrap_err(), CARD_INVALID);
+    }
+
+    #[test]
     fn selects_only_the_approved_interface_among_backups_and_ignores_patch() {
         let mut c = card();
         c["supportedInterfaces"][1]["protocolVersion"] = json!("1.0.7");
@@ -516,6 +549,8 @@ mod tests {
     #[test]
     fn returned_parts_must_be_concrete_plain_utf8_text() {
         for media in [
+            json!("text"),
+            json!("task-status"),
             json!("text/html"),
             json!("text/*"),
             json!("*/*"),

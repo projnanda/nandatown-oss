@@ -1,0 +1,29 @@
+{
+  "name": "Sample Agent",
+  "description": "A sample agent to test the stream functionality.",
+  "provider": {"organization": "A2A Samples", "url": "https://example.com"},
+  "version": "1.0.0",
+  "capabilities": {"streaming": true, "pushNotifications": false},
+  "defaultInputModes": ["text"],
+  "defaultOutputModes": ["text", "task-status"],
+  "skills": [{
+    "id": "sample_agent", "name": "Sample Agent", "description": "Say hi.",
+    "tags": ["sample"], "examples": ["hi"],
+    "inputModes": ["text"], "outputModes": ["text", "task-status"]
+  }],
+  "supportedInterfaces": [
+    {"protocolBinding": "GRPC", "protocolVersion": "1.0", "url": "127.0.0.1:60068"},
+    {"protocolBinding": "GRPC", "protocolVersion": "0.3", "url": "127.0.0.1:60069"},
+    {"protocolBinding": "JSONRPC", "protocolVersion": "1.0", "url": "http://127.0.0.1:60067/a2a/jsonrpc"},
+    {"protocolBinding": "JSONRPC", "protocolVersion": "0.3", "url": "http://127.0.0.1:60067/a2a/jsonrpc"},
+    {"protocolBinding": "HTTP+JSON", "protocolVersion": "1.0", "url": "http://127.0.0.1:60067/a2a/rest"},
+    {"protocolBinding": "HTTP+JSON", "protocolVersion": "0.3", "url": "http://127.0.0.1:60067/a2a/rest"}
+  ],
+  "protocolVersion": "0.3",
+  "preferredTransport": "GRPC",
+  "url": "127.0.0.1:60069",
+  "additionalInterfaces": [
+    {"transport": "JSONRPC", "url": "http://127.0.0.1:60067/a2a/jsonrpc"},
+    {"transport": "HTTP+JSON", "url": "http://127.0.0.1:60067/a2a/rest"}
+  ]
+}

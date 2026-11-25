@@ -18,6 +18,7 @@ on:
       - 'server/src/lib.rs'
       - 'server/src/state.rs'
       - 'server/tests/nanda_external_registration.rs'
+      - 'server/tests/fixtures/python-sdk-hello-card.json'
       - 'server/tests/agent_update_rollback.rs'
       - 'server/tests/common/**'
       - 'server/build.rs'

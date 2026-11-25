@@ -34,6 +34,8 @@ Look for HTTP `200`, a JSON content type, and a matching entry in `supportedInte
 }
 ```
 
+Use `text/plain` for a new card. Town also recognizes the `text` shorthand in the [Python SDK sample](https://github.com/a2aproject/a2a-python/blob/eaa71bcaffaae8b6cb3606b797ece4f7ae0dd554/samples/hello_world_agent.py#L146-L166). A card that advertises only task-status notifications is not a text agent.
+
 ## 2. Connect and send a task
 
 1. Sign in to Town. Open **Agents → Connect external A2A agent** (or `/nanda/external-agents`). Paste your card URL and choose **Preview card**. Check the name and the full **Task destination**. Town hasn't sent a task or credential yet.
@@ -79,13 +81,17 @@ This enrollment has its own agent ID and credentials, separate from your **incom
 
 Only approve agents whose owners expect your traffic. Approval lets any signed-in member create their **own** connection to that destination; it does not share one member's token with another.
 
+**First install or upgrade:** deploy a Town build that includes this feature. If you build from source with Compose, check out the revision you intend to deploy and run `docker compose up -d --build server`. For desktop Compose, select an image containing that revision with `NASIKO_SERVER_IMAGE`. Sign in and check for **Agents → Connect external A2A agent**; a green `/health` response alone doesn't identify the build.
+
+Before accepting peer tokens on a shared installation, verify that Town uses private, persistent signing and encryption keys, not the example values in `.env.example`. Keep the existing encryption key when upgrading: changing it is not a way to rotate a peer token.
+
 With Docker Compose, add this line to the **repository-root `.env`**, beside `docker-compose.yml`, using the real URLs:
 
 ```dotenv
 NANDA_EXTERNAL_A2A_TARGETS='[{"card_url":"https://your-agent.example/.well-known/agent-card.json","endpoint":"https://your-agent.example/a2a/v1"}]'
 ```
 
-Run `docker compose up -d --no-deps --force-recreate server` after adding **or removing** a pair. A plain restart doesn't reload this file. For a native server, change its environment and restart the process. With no approved destinations, members can still list and disconnect existing connections, but cannot preview or call an agent.
+On an already-upgraded installation, run `docker compose up -d --no-deps --force-recreate server` after adding **or removing** a pair. A plain restart doesn't reload this file. For a native server, change its environment and restart the process. Removing a pair stops new calls to that destination; it doesn't disconnect members or revoke their tokens at the peer. If you're retiring the pilot, have members disconnect and revoke those tokens at their source before rolling Town back.
 
 Serve the UI and API over HTTPS. The native server does not terminate TLS. Set `NANDA_EXTERNAL_A2A_TLS_PROXY_IP` to the IP of the proxy directly in front of Town, restrict backend access to that proxy, and have it overwrite `X-Forwarded-Proto` from the actual connection. Reject plaintext at the edge before a user submits a bearer. Town encrypts the saved peer token and never returns it in the catalog.
 
