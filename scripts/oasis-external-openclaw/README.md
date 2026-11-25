@@ -2,6 +2,8 @@
 
 Use a fresh, version-pinned OpenClaw agent to check the external side of onboarding. This is not an agent image deployed or managed by Oasis. The default fixture has **no model credentials and no internet egress** from its agent container. It needs no account and does not use a personal OpenClaw installation.
 
+To test the whole path, follow the [native Town onboarding guide](../../docs/NANDA_EXTERNAL_A2A.md#local-proof-with-openclaw-no-model-account). Its `oasis-proof.mjs` command checks both the answer returned to the Town caller and the task stored by OpenClaw. The direct controls below help isolate a failure.
+
 ## Start here: does the agent work on its own?
 
 With the pinned agent image cached, run the [offline control](control/README.md):
@@ -26,7 +28,7 @@ docker compose exec -T agent node /fixture.mjs negative
 
 The relay exposes only the card and the A2A JSON-RPC endpoint on the host's loopback port. `smoke` verifies the card, a closed control-UI route, HTTP 401 without a peer credential, and **task not found** on an authenticated lookup for an unknown task. `task` submits “What is the sum of 8 and 9? Reply with just the number.” It must read back `17`. `negative` submits a different question and must read back `Unsupported offline fixture prompt.` Both use a fixed-answer provider on the agent container's own loopback interface. All three checks talk directly to OpenClaw, not through Oasis.
 
-OpenClaw generates separate random gateway and peer credentials on first start and persists them in a project-specific Docker volume. Nothing mounts a personal workspace, SSH keys, provider profiles or the Docker socket. Do not print the config, paste a token into an issue, or give Oasis the gateway credential. Only the **peer** bearer belongs in a future private Oasis connection, bound to its destination. Do not copy a personal agent's provider credential.
+OpenClaw generates separate random gateway and peer credentials on first start and persists them in a project-specific Docker volume. Nothing mounts a personal workspace, SSH keys, provider profiles or the Docker socket. Do not print the config, paste a token into an issue, or give Oasis the gateway credential. Only the **peer** bearer belongs in the private Oasis connection, bound to its destination. Do not copy a personal agent's provider credential.
 
 ## What would count as an Oasis onboarding result?
 

@@ -72,3 +72,9 @@ jobs:
         run: |
           cp .env.example .env
           docker compose config -q
+
+      - name: Check the external A2A proof client and fixture configurations
+        run: >
+          node --test scripts/oasis-external-openclaw/task-probe.test.mjs
+          scripts/oasis-external-openclaw/control/stub.test.mjs
+          scripts/oasis-external-openclaw/compose.test.mjs

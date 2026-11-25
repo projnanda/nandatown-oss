@@ -636,7 +636,7 @@ docs/           Design docs (architecture, protocol, conventions)
 
 - **Official docs** — **[docs.nasiko.com](https://docs.nasiko.com)** — guides, API reference, and concepts
 - **Design docs** — [`docs/`](docs/): architecture, the A2A protocol, agent lifecycle, MCP Gateway internals, CLI design, networking
-- **Bring your own agent** — [test OpenClaw's A2A endpoint locally](scripts/oasis-external-openclaw/README.md), or [configure a local LangGraph/CrewAI agent to use the Nasiko model router and MCP gateway](scripts/a2a-discovery-e2e/MANUAL.md).
+- **Bring your own agent** — [connect an external A2A agent to Town without redeploying it](docs/NANDA_EXTERNAL_A2A.md), [verify the round trip with offline OpenClaw](scripts/oasis-external-openclaw/README.md), or [let a local agent use the Nasiko model and tool gateways](scripts/a2a-discovery-e2e/MANUAL.md).
 - **A2A protocol** — https://github.com/a2aproject/a2a-spec
 - **Rust toolchain** — https://rustup.rs
 - **Docker** — https://docs.docker.com/get-docker/
