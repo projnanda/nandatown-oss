@@ -1,0 +1,22 @@
+name: oasis16-openclaw-offline-control
+services:
+  control:
+    image: ghcr.io/openclaw/openclaw:2026.9.3@sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b
+    pull_policy: never
+    command: ["sh", "-ec", "node /fixture.mjs init && exec timeout 240 node --test /control/stub.test.mjs /control/run.test.mjs"]
+    user: "1000:1000"
+    read_only: true
+    network_mode: none
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    tmpfs:
+      - /home/node/.openclaw:uid=1000,gid=1000,mode=0700
+      - /home/node/.cache:uid=1000,gid=1000,mode=0700
+      - /tmp:mode=1777
+    volumes:
+      - ../fixture.mjs:/fixture.mjs:ro
+      - ../task-probe.mjs:/task-probe.mjs:ro
+      - ./run.test.mjs:/control/run.test.mjs:ro
+      - ./runtime.mjs:/control/runtime.mjs:ro
+      - ./stub.mjs:/control/stub.mjs:ro
+      - ./stub.test.mjs:/control/stub.test.mjs:ro

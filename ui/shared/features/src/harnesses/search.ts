@@ -24,6 +24,7 @@ export const HARNESS_MOCK_VARIANTS = [
   'no-spend',
   'server-down',
   'logout-unavailable',
+  'external-connection',
   // Deploy (plans/feat-deploy.md §9); same reason.
   'deploy-no-rights',
   'builds-absent',

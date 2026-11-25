@@ -161,6 +161,14 @@ impl AuthServiceImpl {
 
 #[async_trait]
 impl AuthService for AuthServiceImpl {
+    fn has_local_issuer_signature(&self, token: &str) -> Result<bool, AuthError> {
+        Ok(crate::jwt::has_hmac_issuer_signature(
+            token,
+            &self.jwt_secret,
+            jsonwebtoken::Algorithm::HS256,
+        ))
+    }
+
     async fn validate_token(&self, token: &str) -> Result<Identity, AuthError> {
         crate::jwt::decode_jwt(&self.jwt_secret, token)
     }

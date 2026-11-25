@@ -902,12 +902,14 @@ impl TestServer {
 }
 
 fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config {
+    let s3_access_key = std::env::var("TEST_S3_ACCESS_KEY").unwrap_or_else(|_| "nasiko".into());
+    let s3_secret_key = std::env::var("TEST_S3_SECRET_KEY").unwrap_or_else(|_| "nasiko123".into());
     // SAFETY: tests run serially via #[serial], so no concurrent env mutation.
     unsafe {
         std::env::set_var("JWT_SECRET", "test-secret-for-nasiko-tests");
         std::env::set_var("S3_ENDPOINT", &s3_endpoint);
-        std::env::set_var("S3_ACCESS_KEY", "nasiko");
-        std::env::set_var("S3_SECRET_KEY", "nasiko123");
+        std::env::set_var("S3_ACCESS_KEY", &s3_access_key);
+        std::env::set_var("S3_SECRET_KEY", &s3_secret_key);
         std::env::set_var("S3_REGION", "us-east-1");
         // 32 bytes of 0x41 ('A'), base64-encoded — required by SecretsCrypto::load_master_key()
         std::env::set_var(
@@ -929,8 +931,8 @@ fn test_config(db_url: String, redis_url: String, s3_endpoint: String) -> Config
         storage_provider: "s3".into(),
         s3_endpoint,
         s3_bucket: "nasiko-test".into(),
-        s3_access_key: "nasiko".into(),
-        s3_secret_key: "nasiko123".into(),
+        s3_access_key,
+        s3_secret_key,
         s3_region: "us-east-1".into(),
         assessment_intake_url: None,
         secrets_encryption_key: "12345678901234567890123456789012".into(),

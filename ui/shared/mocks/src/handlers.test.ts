@@ -66,6 +66,23 @@ describe('auth handlers', () => {
   })
 })
 
+// The September agents.detail recording predates this field. Match the current
+// catalog contract (server/tests/nanda_external_registration.rs) until re-recording.
+describe('agent detail external connection marker', () => {
+  it.each([
+    [null, false],
+    ['external-connection', true],
+  ] as const)('serves a boolean for mock=%s', async (variant, expected) => {
+    configureMocks({ variant })
+    onTestFinished(() => configureMocks({ variant: null }))
+    const id = seed.agents.find((agent) => agent.name === 'seed-support-bot')!.id
+    const detail = await apiFetch<{ data: { is_external_connection: boolean } }>(
+      `/api/agents/${id}`,
+    )
+    expect(detail.data.is_external_connection).toBe(expected)
+  })
+})
+
 describe('mock login and /api/me agree on the user (the same-account check depends on it)', () => {
   // OSS: the session is the viewer (the seed admin by default, or the persona).
   it.each([null, 'sam'])(

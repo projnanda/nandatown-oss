@@ -21,6 +21,19 @@ pub trait AgentDeletionHook: Send + Sync {
 /// OSS default — nothing enterprise-only is wired up, so there is nothing to clean up.
 pub struct NoopAgentDeletionHook;
 
+/// Shared post-commit work for catalog soft deletes. External connections
+/// have no managed workload: runtime teardown belongs to the managed caller.
+pub(crate) async fn after_soft_delete(state: &crate::state::AppState, id: Uuid) {
+    use nasiko_mcp_gateway::agent_tokens::{TokenScope, revoke_scoped};
+    // Best effort: both credential lookups also reject a tombstoned agent.
+    for scope in [TokenScope::Gateway, TokenScope::State] {
+        if let Err(error) = revoke_scoped(&state.db, id, scope).await {
+            tracing::warn!(%error, %id, ?scope, "delete agent: credential revoke failed");
+        }
+    }
+    state.agent_deletion_hook.on_agent_deleted(id).await;
+}
+
 #[async_trait]
 impl AgentDeletionHook for NoopAgentDeletionHook {
     async fn on_agent_deleted(&self, _agent_id: Uuid) {}

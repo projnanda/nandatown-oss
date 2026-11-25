@@ -85,6 +85,22 @@ pub fn hash_token(token: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// The exact reserved wire shape minted below, not evidence of a usable credential.
+pub fn has_scoped_token_format(token: &str) -> bool {
+    [TokenScope::Gateway, TokenScope::State]
+        .into_iter()
+        .any(|scope| {
+            token
+                .strip_prefix(scope.token_prefix())
+                .is_some_and(|suffix| {
+                    suffix.len() == 64
+                        && suffix
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+        })
+}
+
 /// Mint a fresh gateway token for `agent_id`, superseding any previous one —
 /// on redeploy for a deployed agent (the old plaintext lived only in the
 /// container env being replaced, so there is nothing worth keeping

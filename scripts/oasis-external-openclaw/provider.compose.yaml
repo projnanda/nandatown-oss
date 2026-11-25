@@ -1,0 +1,16 @@
+# Optional: opt the disposable agent into outbound internet for provider sign-in
+# and a live model run. Does not add a published port or mount host credentials.
+name: oasis16-openclaw-live
+services:
+  agent:
+    command: ["sh", "-ec", "node /fixture.mjs init && exec openclaw gateway"]
+    environment:
+      OASIS16_MODE: live
+    volumes:
+      - state:/home/node/.openclaw
+    networks:
+      provider-egress: { gw_priority: 1 }
+networks:
+  provider-egress: {}
+volumes:
+  state:

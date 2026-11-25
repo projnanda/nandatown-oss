@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use nasiko_runtime::DeploymentStatus;
 
-use crate::agent_scaling::{ParkingPolicy, save_parking_policy};
+use crate::agent_scaling::ParkingPolicy;
 use crate::agents::upload::BuildJobPayload;
 use crate::auth::Claims;
 use crate::build::{self, BuildStatus, download_repo_tarball, routes::extract_zip_to_dir};
@@ -124,10 +124,13 @@ pub(crate) async fn update_agent(
         owner_id: Uuid,
         writable: bool,
         writable_path: Option<String>,
+        is_external: bool,
     }
 
     let agent: Option<UpdateAgentRow> = match sqlx::query_as(
-        "SELECT name, version, image, owner_id, writable, writable_path FROM agents WHERE id = $1",
+        "SELECT a.name, a.version, a.image, a.owner_id, a.writable, a.writable_path,
+                EXISTS (SELECT 1 FROM nanda_external_connections c WHERE c.agent_id=a.id) AS is_external
+         FROM agents a WHERE a.id=$1 AND a.deleted_at IS NULL",
     )
     .bind(agent_id)
     .fetch_optional(&state.db)
@@ -147,6 +150,7 @@ pub(crate) async fn update_agent(
         owner_id: agent_owner_id,
         writable,
         writable_path,
+        is_external,
     }) = agent
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -204,6 +208,15 @@ pub(crate) async fn update_agent(
         Ok(policy) => policy,
         Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
+    // External registration always creates a new UUID, never a binding on an existing
+    // managed agent. A source-less managed rebuild must not retire a live peer binding.
+    if is_external && source_data.is_none() {
+        return (
+            StatusCode::CONFLICT,
+            "upload a source zip to convert an external connection to a managed agent",
+        )
+            .into_response();
+    }
 
     // Determine new version.
     // Accepts strategy keywords (auto, patch, minor, major) or an explicit semver string (e.g. "1.2.3").
@@ -315,28 +328,39 @@ pub(crate) async fn update_agent(
         return (code, msg).into_response();
     }
 
-    // Stored before the build is queued, so the worker's deploy reads it from the row. Not in
-    // one transaction with the queueing below (this handler writes each row on its own): an
-    // update whose job then fails to queue keeps the new policy, which takes effect at the
-    // agent's next deploy, as one saved through `PUT /api/agents/{id}` would.
-    if let Some(policy) = parking_policy
-        && let Err(e) = save_parking_policy(&state.db, agent_id, policy).await
-    {
-        tracing::error!(%e, %agent_id, "update_agent: save parking policy");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
-    }
-
-    // Optimistic write — lets the UI show "deploying to <image_tag>".
-    // On failure the background task rolls both version and image back.
-    let _ = sqlx::query(
-        "UPDATE agents SET status = 'deploying', version = $2, image = $3, updated_at = now() \
-         WHERE id = $1",
+    // The multipart upload may outlive an ownership change or deletion.
+    // Claim the SAME live owner/namespace used above, and retain that row lock
+    // through queue insertion. If this is an intentional conversion, the
+    // external retirement trigger and the managed job now commit together.
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(%e, %agent_id, "update_agent: begin build claim");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    match sqlx::query(
+        "UPDATE agents SET status = 'deploying', version = $2, image = $3,
+             parking_policy = COALESCE($4, parking_policy), updated_at=now()
+         WHERE id=$1 AND deleted_at IS NULL AND owner_id=$5 AND ($6 OR owner_id=$7)",
     )
     .bind(agent_id)
     .bind(&new_version)
     .bind(&image_tag)
-    .execute(&state.db)
-    .await;
+    .bind(parking_policy.map(ParkingPolicy::as_str))
+    .bind(agent_owner_id)
+    .bind(claims.is_superuser)
+    .bind(owner_id)
+    .execute(&mut *tx)
+    .await
+    {
+        Ok(r) if r.rows_affected() == 1 => {}
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(%e, %agent_id, "update_agent: claim build target");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
 
     // Create a build record.
     let build_id = match sqlx::query_scalar::<_, Uuid>(
@@ -347,7 +371,7 @@ pub(crate) async fn update_agent(
     .bind(&new_version)
     .bind(&image_tag)
     .bind(owner_id)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     {
         Ok(id) => id,
@@ -394,11 +418,15 @@ pub(crate) async fn update_agent(
             .bind(agent_id)
             .bind(owner_id)
             .bind(serde_json::to_value(&payload).expect("serialize update payload"))
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await
     {
         tracing::error!(%e, %agent_id, "update: queue build_jobs db error");
         return (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response();
+    }
+    if let Err(e) = tx.commit().await {
+        tracing::error!(%e, %agent_id, "update_agent: commit queued build");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let _ = state.build_tx.send(()).await;
 

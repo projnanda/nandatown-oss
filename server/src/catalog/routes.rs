@@ -720,6 +720,10 @@ pub(crate) struct AgentDetailResponse {
     /// tabs without guessing.
     #[serde(rename = "can_manage")]
     can_manage: bool,
+    /// An active binding with the catalog row's current owner; this is not a
+    /// grant to use the connection. Owner-editable metadata is not authority.
+    #[serde(rename = "is_external_connection")]
+    is_external_connection: bool,
     #[serde(rename = "is_coding_agent")]
     is_coding_agent: bool,
     #[serde(rename = "coding_agent_integration_id")]
@@ -857,15 +861,18 @@ pub(crate) async fn get_one(
 
     let can_manage = crate::acl::can_manage_agent(&state, &claims, agent.id).await;
     // Columns the shared `Agent` row does not carry, so every query mapping into it keeps working.
-    let (coding_agent_integration_id, parking_policy) =
-        match sqlx::query_as::<_, (Option<String>, String)>(
-            "SELECT coding_agent_integration_id, parking_policy FROM agents WHERE id = $1",
+    let (coding_agent_integration_id, parking_policy, is_external_connection) =
+        match sqlx::query_as::<_, (Option<String>, String, bool)>(
+            "SELECT coding_agent_integration_id, parking_policy,
+             EXISTS (SELECT 1 FROM nanda_external_connections c WHERE c.agent_id=a.id AND c.owner_id=a.owner_id)
+             FROM agents a WHERE a.id = $1 AND a.deleted_at IS NULL",
         )
         .bind(agent.id)
-        .fetch_one(&state.db)
+        .fetch_optional(&state.db)
         .await
         {
-            Ok(value) => value,
+            Ok(Some(value)) => value,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
             Err(error) => {
                 tracing::error!(%error, agent_id = %agent.id, "agent detail columns lookup failed");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -885,6 +892,7 @@ pub(crate) async fn get_one(
         display_name: agent.display_name.clone(),
         owner_id: agent.owner_id,
         can_manage,
+        is_external_connection,
         is_coding_agent: coding_agent_integration_id.is_some(),
         coding_agent_integration_id,
         compress_enabled: agent.compress_enabled,
@@ -1360,66 +1368,58 @@ pub(crate) async fn delete(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    // Claim the delete up front: one statement is both the existence check and
-    // the mutual exclusion, and it hands back the primary container name needed
-    // for teardown.
-    //
-    // This route soft-deletes, so `deleted_at IS NULL` is what makes a repeat
-    // delete 404 instead of re-stamping the row and reporting success forever.
-    // Doing it as a single `UPDATE ... RETURNING` rather than SELECT-then-UPDATE
-    // also means only the caller that actually flipped `deleted_at` proceeds —
-    // two concurrent deletes would otherwise both pass a separate SELECT and
-    // both run the whole container teardown below before one of them lost.
-    //
-    // Teardown therefore runs *after* the row is marked. A runtime failure
-    // still leaves the agent deleted, which is the pre-existing behavior: the
-    // errors are reported in `runtime_errors` rather than rolling the delete
-    // back.
-    //
-    // The status goes to `stopped` in the same statement. Left at `running` or `parked`, the
-    // row still read as live to every query that selects agents by status, so the orchestrator
-    // kept offering a deleted agent as a routing candidate (and, once its name was reused,
-    // dropped both agents as indistinguishable).
-    let name: String = match sqlx::query_scalar(
-        "UPDATE agents SET deleted_at = NOW(), status = 'stopped' \
-         WHERE id = $1 AND deleted_at IS NULL \
-         RETURNING name",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    {
-        Ok(Some(n)) => n,
-        Ok(None) => {
-            return StatusCode::NOT_FOUND.into_response();
+    // First lock the live row. If a transfer or managed conversion was
+    // committing, the next statement sees its committed binding state, not
+    // a pre-wait snapshot. Only the winner claims the delete and does cleanup.
+    let claim = async {
+        let mut tx = state.db.begin().await?;
+        let locked: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM agents WHERE id=$1 AND deleted_at IS NULL
+             AND ($2 OR owner_id=$3) FOR UPDATE",
+        )
+        .bind(id)
+        .bind(claims.is_superuser)
+        .bind(claims.user_uuid().ok())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if locked.is_none() {
+            return Ok::<_, sqlx::Error>(None);
         }
+        // RETURNING identifies the binding before the AFTER trigger retires
+        // it. Mark stopped even for a managed row whose teardown later fails.
+        let target: (String, bool) = sqlx::query_as(
+            "UPDATE agents a SET deleted_at=now(), status='stopped' WHERE id=$1
+             RETURNING name, EXISTS (
+               SELECT 1 FROM nanda_external_connections c WHERE c.agent_id=a.id AND c.owner_id=a.owner_id
+             )",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(target))
+    };
+    let (name, external) = match claim.await {
+        Ok(Some(target)) => target,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!(%e, %id, "delete agent: claim soft delete");
             return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
         }
     };
 
-    // Tombstone the agent's credentials - a destroyed agent's leaked env must not
-    // keep authenticating at /api/mcp or the agent state API. Best-effort: the soft
-    // delete above already stands (both lookups also refuse a deleted agent), and the
-    // gateway's flow-participant check still bounds any residual credential to flows
-    // actively routed here.
-    if let Err(e) = nasiko_mcp_gateway::agent_tokens::revoke(&state.db, id).await {
-        tracing::warn!(%e, %id, "delete agent: gateway token revoke failed");
+    crate::agent_lifecycle::after_soft_delete(&state, id).await;
+    if external {
+        // No local workload belongs to a remote connection. In particular
+        // never try to destroy an unrelated container by a guessed name.
+        return Json(DeletedAgent {
+            deleted: true,
+            agent_id: id,
+            containers_stopped: 0,
+            runtime_errors: vec![],
+        })
+        .into_response();
     }
-    if let Err(e) = nasiko_mcp_gateway::agent_tokens::revoke_scoped(
-        &state.db,
-        id,
-        nasiko_mcp_gateway::agent_tokens::TokenScope::State,
-    )
-    .await
-    {
-        tracing::warn!(%e, %id, "delete agent: state token revoke failed");
-    }
-
-    // Let enterprise-only, agent-keyed state clean itself up (e.g. a reserved name that has no
-    // FK a soft delete could cascade through) — see `agent_lifecycle` module docs.
-    state.agent_deletion_hook.on_agent_deleted(id).await;
 
     // Every real deploy path keys the running container on the agent's UUID, never the
     // display name (see build_agent_spec's doc comment) — so the UUID-keyed id must always

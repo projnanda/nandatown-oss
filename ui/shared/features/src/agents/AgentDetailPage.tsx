@@ -201,7 +201,8 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
   const navigate = useNavigate()
   const me = useQuery(meQuery).data
   const agent = detail.data
-  const status = useAgentStatus(agent, w.watching)
+  const managed = agent?.isExternalConnection ? undefined : agent
+  const status = useAgentStatus(managed, w.watching)
   const statusOffPage = !!agent && !agent.isHarness && status.updatedAt > 0 && !status.row
   if (statusOffPage !== offPage) setOffPage(statusOffPage)
   useWatchStep(
@@ -210,13 +211,13 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
     offPage ? detail.dataUpdatedAt : status.updatedAt,
     offPage ? detail.errorUpdatedAt : status.errorAt,
   )
-  const users = useUsers(!!me?.is_superuser)
-  const grants = useGrants(id, !!agent?.canManage && !agent.isHarness)
-  const errors = useErrorLogs(id, !!agent && !agent.isHarness)
+  const users = useUsers(!!managed && !!me?.is_superuser)
+  const grants = useGrants(id, !!managed?.canManage && !managed.isHarness)
+  const errors = useErrorLogs(id, !!managed && !managed.isHarness)
   const [tailOpen, setTailOpen] = useState(false)
 
   const { agentTabs } = useSlots()
-  const layerTabs = agent ? agentTabs.filter((t) => t.visible(agent)) : []
+  const layerTabs = managed ? agentTabs.filter((t) => t.visible(managed)) : []
   const probes = useQueries({ queries: agent ? layerTabs.map((t) => t.query(id, agent)) : [] })
   // A layer tab shows once its read says so; a failed read shows it too (the tab reports the failure itself).
   const extra = layerTabs.filter((t, i) => {
@@ -225,7 +226,7 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
   })
   const waiting = layerTabs.filter((_, i) => probes[i]?.isPending).map((t) => t.key)
 
-  const allowed = agent ? tabsFor(agent) : []
+  const allowed = managed ? tabsFor(managed) : []
   const tabs = withLayerTabs(allowed, extra)
   const current = tab && tabs.includes(tab) ? tab : 'overview'
   // A layer tab still being checked isn't bad yet: a link to it opens it once its read answers.
@@ -249,6 +250,27 @@ function AgentDetail({ id, tab }: { id: string; tab?: string }) {
     ) : (
       <WithSiblings id={id}>
         <ErrorState error={detail.error} onRetry={() => void detail.refetch()} />
+      </WithSiblings>
+    )
+  }
+  if (agent?.isExternalConnection) {
+    return (
+      <WithSiblings id={id}>
+        <PageHeader
+          title={agent.displayName}
+          description={<Badge variant="outline">Externally hosted</Badge>}
+        />
+        <p className="mt-3 text-sm">
+          This agent runs on its own host. Town does not deploy or manage its runtime.
+        </p>
+        {me?.sub === agent.ownerId ? (
+          <a
+            className="mt-3 inline-block text-primary-text underline underline-offset-2"
+            href={`/nanda/external-agents?connection=${encodeURIComponent(id)}`}
+          >
+            Send a task
+          </a>
+        ) : null}
       </WithSiblings>
     )
   }

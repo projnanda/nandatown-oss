@@ -46,6 +46,7 @@ pub mod maf;
 pub mod maf_policy;
 pub mod mcp;
 pub mod multipart_util;
+mod nanda_external;
 pub mod observability;
 pub mod onboarding;
 pub mod openapi;
@@ -376,6 +377,7 @@ where
             agents::user_routes().merge(agents::capability_routes()),
         )
         .merge(catalog::router())
+        .merge(nanda_external::router())
         .merge(container_routes)
         .merge(admin_routes)
         .merge(pool_routes)
@@ -541,6 +543,7 @@ where
     // page navigations get a redirect to /login.html instead of the document
     // (see `auth::require_page_auth`); non-page assets pass through.
     let ui_pages = Router::new()
+        .route("/nanda/external-agents", get(nanda_external::page))
         .fallback(fallback)
         .layer(middleware::from_fn_with_state(
             state.clone(),

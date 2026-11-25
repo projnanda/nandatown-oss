@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'none'; base-uri 'none'">
+  <title>External agents · NANDA Town</title>
+  <style>
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body { margin: 0; font: 1rem/1.5 system-ui, sans-serif; color: #172b2c; background: #f5f8f7; }
+    main { max-width: 70rem; margin: auto; padding: 1.75rem clamp(1rem, 4vw, 3rem); }
+    header { margin: 0 0 1.4rem; }
+    .brand { font-size: .8rem; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
+    h1, h2, h3, p, dl { margin: 0 0 .7rem; }
+    h1 { margin-top: .3rem; font-size: clamp(1.6rem, 4vw, 2rem); line-height: 1.15; }
+    h2 { font-size: 1.2rem; } h3, legend { font-size: 1rem; font-weight: 650; }
+    .panels { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 23rem), 1fr)); align-items: start; }
+    section { padding: 1.2rem; background: white; border: 1px solid #c6d4d1; border-radius: .5rem; min-width: 0; }
+    fieldset { min-width: 0; border: 0; margin: 0; padding: 0; } legend { padding: 0; }
+    label, dt { display: block; font-weight: 600; margin-top: .65rem; }
+    input:not([type=radio]), select, textarea { display: block; width: 100%; margin: .3rem 0 .65rem; padding: .55rem; border: 1px solid #728481; border-radius: .35rem; }
+    input, textarea, select, button { font: inherit; color: inherit; }
+    input[type=radio] { accent-color: #00675c; } textarea { resize: vertical; }
+    .choice { display: flex; align-items: center; gap: .45rem; margin: 0; min-height: 2.25rem; font-weight: 400; }
+    button { border: 1px solid #617673; padding: .4rem .85rem; background: white; border-radius: .4rem; cursor: pointer; min-height: 2.75rem; }
+    .primary { background: #016758; border-color: #016758; color: white; font-weight: 600; }
+    button:disabled { cursor: not-allowed; opacity: .55; } a { color: #005f55; }
+    :focus-visible { outline: 3px solid #146db0; outline-offset: 2px; }
+    .hint, dt { font-size: .88rem; color: #435755; }
+    dd { margin: 0; } dd, .answer, .status { overflow-wrap: anywhere; }
+    .wire { font: .87rem/1.55 ui-monospace, monospace; unicode-bidi: isolate; direction: ltr; }
+    .inset { border-left: .2rem solid #78a79f; background: #f2f7f5; padding: .75rem .9rem; margin: .8rem 0; }
+    .answer { white-space: pre-wrap; }
+    .status:not(:empty), #signin { margin: .75rem 0; } .status:empty { margin: 0; }
+    .row { display: flex; gap: .65rem; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+    .row h2 { margin: 0; } .row { margin-bottom: .7rem; }
+    @media (pointer: coarse) { .choice { min-height: 2.75rem; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <a class="brand" href="/">NANDA Town</a>
+    <h1>External agents</h1>
+    <p>Connect an agent you already run. It stays on its own host; Town sends a task only when you ask.</p>
+  </header>
+  <noscript>Enable JavaScript to preview a card, connect an agent or send a task.</noscript>
+  <p id="signin" class="inset" hidden><a href="/login" target="_blank" rel="noopener noreferrer">Sign in to Town (new tab)</a> to load your connections.</p>
+  <div class="panels">
+    <section aria-labelledby="add-title">
+      <h2 id="add-title">Connect an agent</h2>
+      <fieldset id="add-controls" disabled>
+        <label for="card-url">Agent card URL</label>
+        <p id="card-hint" class="hint">Ask your Town operator to approve the public card URL and exact task destination first. Use a URL without credentials or a query string. Previewing sends no token.</p>
+        <input id="card-url" type="url" autocomplete="off" spellcheck="false" aria-describedby="card-hint" placeholder="https://agent.example/.well-known/agent-card.json">
+        <button id="preview" type="button">Preview card</button>
+        <div id="review" hidden>
+          <div class="inset">
+            <h3 id="preview-name" tabindex="-1"></h3>
+            <dl>
+              <dt>Task destination</dt><dd class="wire" id="preview-endpoint"></dd>
+              <dt>Card authentication</dt><dd id="requirement"></dd>
+            </dl>
+          </div>
+          <fieldset>
+            <legend>How should Town connect?</legend>
+            <label class="choice"><input id="anonymous" type="radio" name="mode"> Anonymous (no token)</label>
+            <label class="choice"><input id="bearer" type="radio" name="mode"> Dedicated peer bearer token</label>
+            <p id="transport-notice" class="hint" hidden>Open Town over HTTPS or on loopback before entering a peer token.</p>
+          </fieldset>
+          <div id="secret" hidden>
+            <label for="peer-token">Peer token</label>
+            <p id="token-hint" class="hint">Use a token issued for the exact destination above. Never enter a Town session token, gateway administrator token or model provider key.</p>
+            <input id="peer-token" type="password" autocomplete="off" spellcheck="false" aria-describedby="token-hint" disabled>
+          </div>
+          <button id="connect" class="primary" type="button" disabled>Connect agent</button>
+        </div>
+      </fieldset>
+      <p id="add-status" class="status" role="status"></p>
+    </section>
+    <section aria-labelledby="connections-title">
+      <div class="row">
+        <h2 id="connections-title">Your connections</h2>
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+      <p id="list-status" class="status" role="status">Loading connections…</p>
+      <a id="all-connections" href="/nanda/external-agents" hidden>View all your connections</a>
+      <fieldset id="manage-controls" hidden disabled>
+        <label for="connection">Connected agent</label>
+        <select id="connection"></select>
+        <dl class="inset">
+          <dt>Agent card</dt><dd id="active-card" class="wire"></dd>
+          <dt>Task destination</dt><dd id="active-endpoint" class="wire"></dd>
+          <dt>Connection authentication</dt><dd id="active-auth"></dd>
+        </dl>
+        <label for="task-text">Task to send</label>
+        <p class="hint" id="task-hint">Use a non-sensitive question with a known answer. The text goes to the selected agent.</p>
+        <textarea id="task-text" rows="3" autocomplete="off" aria-describedby="task-hint" placeholder="What is 8 + 9? Reply with just the number."></textarea>
+        <div class="row">
+          <button class="primary" id="send" type="button" disabled>Send one task</button>
+          <button id="disconnect" type="button">Disconnect</button>
+        </div>
+      </fieldset>
+      <p id="task-status" class="status" role="status"></p>
+      <div id="result" class="inset" hidden>
+        <h3 id="result-title" tabindex="-1">Agent reply</h3>
+        <dl><dt>Submitted task</dt><dd class="answer" id="submitted"></dd>
+          <dt>Answer</dt><dd class="answer" id="answer"></dd>
+          <dt>Remote task ID</dt><dd class="wire" id="task-id"></dd>
+          <dt>Remote context ID</dt><dd class="wire" id="context-id"></dd></dl>
+        <p class="hint" id="result-hint"></p>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+  'use strict';
+  const base = '/api/nanda/external-agents';
+  const $ = id => document.getElementById(id);
+  const show = (id, value = '') => { $(id).textContent = value; };
+  let connections = [], card = null, busy = false, signedIn = false;
+  const requested = new URLSearchParams(location.search).get('connection');
+  const canUseBearer = window.isSecureContext || (location.protocol === 'http:' &&
+    (location.hostname === 'localhost' || location.hostname.endsWith('.localhost') ||
+      location.hostname === '[::1]' || /^127(?:\.\d{1,3}){3}$/.test(location.hostname)));
+  // Same local sign-out barrier and sign-in generation as ui/shared/app-core/src/session.ts.
+  const markKey = 'openruntime.signedOut', generationKey = 'openruntime.signinGeneration';
+  let generation, blockedAt = null, active = null;
+
+  function session() {
+    try { return { marked: localStorage.getItem(markKey) === '1', gen: localStorage.getItem(generationKey) ?? '0' }; }
+    catch { return { marked: true, gen: null }; } // Cannot verify the local barrier.
+  }
+  function forgetOwner() {
+    active?.abort(); active = null; busy = signedIn = false;
+    connections = []; $('card-url').value = ''; clearPreview(); renderList();
+    $('signin').hidden = false;
+  }
+  function syncSession() {
+    const { marked, gen } = session();
+    const changed = generation !== gen;
+    generation = gen;
+    if (marked) {
+      if (blockedAt === null) blockedAt = gen ?? 'storage-blocked';
+      if (changed || signedIn || active || $('signin').hidden) forgetOwner();
+    } else if (changed || (blockedAt !== null && blockedAt !== gen)) {
+      blockedAt = null;
+      forgetOwner();
+      return true;
+    }
+    return false;
+  }
+
+  function controls() {
+    const locked = busy || !signedIn;
+    $('add-controls').disabled = $('manage-controls').disabled = locked;
+    $('refresh').disabled = busy || blockedAt !== null;
+    $('bearer').disabled = !canUseBearer;
+    $('transport-notice').hidden = canUseBearer;
+    $('secret').hidden = $('peer-token').disabled = !canUseBearer || !$('bearer').checked;
+    $('connect').disabled = !card || (!$('anonymous').checked && !($('bearer').checked && $('peer-token').value.trim()));
+    $('send').disabled = !$('task-text').value.trim();
+  }
+  function clearPreview() {
+    card = null;
+    $('review').hidden = true;
+    $('anonymous').checked = $('bearer').checked = false;
+    $('peer-token').value = '';
+    for (const id of ['preview-name', 'preview-endpoint', 'requirement', 'add-status']) show(id);
+    controls();
+  }
+  function clearResult() {
+    $('result').hidden = true;
+    for (const id of ['submitted', 'answer', 'task-id', 'context-id', 'result-hint', 'task-status']) show(id);
+  }
+  function selected() { return connections.find(c => c.id === $('connection').value); }
+  function selectAgent() {
+    clearResult();
+    $('task-text').value = '';
+    const c = selected();
+    $('manage-controls').hidden = !c;
+    show('active-card', c?.card_url); show('active-endpoint', c?.endpoint);
+    show('active-auth', !c ? '' : c.auth_mode === 'bearer' ? 'Dedicated peer bearer' : 'Anonymous');
+    controls();
+  }
+  function renderList(id) {
+    const menu = $('connection');
+    menu.replaceChildren();
+    for (const c of connections) {
+      const o = document.createElement('option');
+      o.value = c.id; o.textContent = c.name; menu.append(o);
+    }
+    if (id) menu.value = id;
+    const missing = Boolean(id && !selected() && signedIn);
+    $('all-connections').hidden = !missing;
+    selectAgent();
+    show('list-status', !signedIn ? '' : missing ? 'This agent is not in your connections.' : connections.length ? '' : 'No connections yet. Start by previewing an agent card.');
+  }
+  async function api(request, path, method = 'GET', data) {
+    function check() {
+      if (syncSession()) queueMicrotask(refresh);
+      if (active !== request || blockedAt !== null) throw new Error('Session changed.');
+    }
+    check();
+    const r = await fetch(base + path, {
+      signal: request.signal,
+      method, credentials: 'same-origin', mode: 'same-origin', redirect: 'error', cache: 'no-store',
+      headers: data ? { 'Content-Type': 'application/json', Accept: 'application/json' } : { Accept: 'application/json' },
+      body: data === undefined ? undefined : JSON.stringify(data),
+    });
+    const payload = r.status === 204 ? undefined : await r.json().catch(err => {
+      if (r.ok) throw err;
+      return null;
+    });
+    check();
+    if (!r.ok) {
+      if (r.status === 401) {
+        signedIn = false; connections = []; $('signin').hidden = false;
+        $('card-url').value = ''; clearPreview(); renderList();
+      }
+      // Error bodies can originate at another host; never echo them or submitted credentials.
+      const reasons = { 400: 'Check the card URL, endpoint and authentication requirements.', 401: 'Sign in to Town and refresh.',
+        403: 'Access was refused.', 404: 'Not found. Refresh the connections.', 409: 'The connection or card changed. Refresh your connections and preview the card again.',
+        413: 'The request is too large.', 422: 'Check the card, authentication choice and submitted values.', 429: 'Too many requests. Wait before trying again.',
+        502: 'Town could not get a usable reply from the remote agent.', 504: 'The remote agent did not reply in time.' };
+      const codes = {
+        a2a_disabled: 'External tasks are disabled here. Ask your Town operator to set NANDA_EXTERNAL_A2A_TARGETS to the approved card and endpoint, then recreate the Compose server container with the updated environment (or restart the server process outside Compose). Existing connections can still be disconnected.',
+        a2a_config_invalid: 'Ask your Town operator to check the configured card and endpoint pairs.',
+        a2a_target_not_allowed: 'This destination is not approved. Ask your Town operator to check the card URL and exact endpoint.',
+        a2a_endpoint_changed: 'The card no longer advertises the approved endpoint. Ask the Town and agent operators to check the destination.',
+        a2a_card_invalid: 'The response was not a valid supported agent card.',
+        a2a_card_unsupported: 'The card must offer one supported A2A 1.0 JSON-RPC interface.',
+        a2a_security_unsupported: 'The card requires an authentication scheme this connector does not support.',
+        a2a_peer_access_denied: 'The peer refused access to this task. Check the required permissions with its operator; to change the peer credential, disconnect and reconnect with a dedicated bearer. Town did not resend the task.',
+        a2a_task_failed: 'The agent reported that the task failed, was canceled, or was rejected. Check the task at the agent before trying again. Town did not resend it.',
+        a2a_task_needs_input: 'The agent needs more input or authorization. This page cannot continue that task. Follow up with the agent operator; Town did not send another request to start it again.',
+        a2a_invalid_result: 'The agent returned an ambiguous or invalid result; no answer was confirmed.',
+        a2a_task_pending: 'The task remained pending; no answer was confirmed.',
+        a2a_task_unconfirmed: 'The remote task could not be confirmed.',
+        invalid_peer_auth: 'Check the connection mode and re-enter a dedicated peer token if needed.',
+        secure_transport_required: 'Town could not verify a secure connection. Open the HTTPS operator URL, or ask your administrator to check the trusted proxy.',
+        connection_exists: 'Already connected. Refresh your connections to select the existing agent.',
+        connection_busy: 'This connection is busy. Wait for the in-flight task to finish.',
+      };
+      const code = payload?.error;
+      const known = typeof code === 'string' && Object.hasOwn(codes, code) ? code : undefined;
+      const message = known ? codes[known] : reasons[r.status];
+      throw new Error((message || 'Town could not finish the request.') + ' (HTTP ' + r.status + ')', {cause: known});
+    }
+    return payload;
+  }
+  async function run(status, pending, action, caution = '') {
+    if (syncSession() && status !== 'list-status') { refresh(); return; }
+    if (busy || blockedAt !== null || (!signedIn && status !== 'list-status')) return;
+    const request = active = new AbortController();
+    busy = true; controls(); show(status, pending);
+    let focus;
+    try { focus = await action((...args) => api(request, ...args)); }
+    catch (e) {
+      if (active !== request) return;
+      const reason = e instanceof TypeError || e instanceof SyntaxError ? 'No usable response from Town.' : e.message;
+      const peerReportedOutcome = ['a2a_peer_access_denied', 'a2a_task_failed', 'a2a_task_needs_input'].includes(e.cause);
+      show(status, [reason, peerReportedOutcome ? '' : caution].filter(Boolean).join(' '));
+    } finally {
+      if (active === request) { active = null; busy = false; controls(); focus?.focus(); }
+    }
+  }
+  function refresh() {
+    run('list-status', 'Loading connections…', async api => {
+      const id = $('connection').value || requested;
+      connections = await api('');
+      signedIn = true; $('signin').hidden = true; renderList(id);
+    });
+  }
+  $('card-url').oninput = clearPreview;
+  $('preview').onclick = () => {
+    clearPreview();
+    const url = $('card-url').value.trim();
+    try {
+      const u = new URL(url);
+      if (!['https:', 'http:'].includes(u.protocol) || u.username || u.password || u.search || u.hash) throw new Error();
+    } catch { show('add-status', 'Enter the full public card URL without credentials, a query or a fragment.'); return; }
+    run('add-status', 'Reading the agent card…', async api => {
+      const p = await api('/preview', 'POST', { card_url: url });
+      if (!p.name || !p.endpoint || typeof p.requires_bearer !== 'boolean') throw new Error('The card preview is incomplete.');
+      card = { url, endpoint: p.endpoint };
+      show('preview-name', p.name); show('preview-endpoint', p.endpoint);
+      show('requirement', p.requires_bearer ? 'The card requires a bearer token.'
+        : 'The card does not declare a requirement. Ask the agent operator whether it needs a peer token.');
+      $('anonymous').disabled = p.requires_bearer;
+      $('review').hidden = false; show('add-status', 'Review the destination before connecting.');
+      return $('preview-name');
+    });
+  };
+  $('anonymous').onchange = () => { $('peer-token').value = ''; controls(); };
+  $('bearer').onchange = controls;
+  $('peer-token').oninput = $('task-text').oninput = controls;
+  $('connect').onclick = () => run('add-status', 'Connecting…', async api => {
+    const data = { card_url: card.url, expected_endpoint: card.endpoint, auth_mode: $('bearer').checked ? 'bearer' : 'none' };
+    if (data.auth_mode === 'bearer') {
+      if (!canUseBearer) throw new Error('Open Town over HTTPS or on loopback to use a peer token.');
+      data.peer_token = $('peer-token').value;
+    }
+    $('peer-token').value = '';
+    const c = await api('', 'POST', data);
+    connections = [...connections.filter(x => x.id !== c.id), c];
+    $('card-url').value = ''; clearPreview(); renderList(c.id); show('add-status', 'Agent connected.');
+    return $('task-text');
+  });
+  $('connection').onchange = selectAgent;
+  $('send').onclick = () => run('task-status', 'Waiting for the agent’s reply…', async api => {
+    $('result').hidden = true;
+    for (const id of ['submitted', 'answer', 'task-id', 'context-id']) show(id);
+    const text = $('task-text').value;
+    const r = await api('/' + encodeURIComponent(selected().id) + '/tasks', 'POST', { text });
+    if (!r || typeof r.text !== 'string' || !r.text.trim() || !['message', 'task'].includes(r.result_kind) ||
+      (r.result_kind === 'task' && (!r.task_id || !r.context_id))) throw new Error('Town returned an incomplete reply.');
+    show('submitted', text); show('answer', r.text); show('task-id', r.task_id || 'Not provided'); show('context-id', r.context_id || 'Not provided');
+    show('result-hint', r.result_kind === 'task' ? 'The agent returned a completed task. Compare the reply with your expected answer. Use these IDs to check the same task on the agent’s own host.'
+      : 'The agent returned a direct message. Compare its answer with your expectation; any IDs are references, not proof of a completed task.');
+    $('task-text').value = ''; $('result').hidden = false; show('task-status', 'Reply received.'); return $('result-title');
+  }, 'The remote outcome may be unknown. Nothing was resent; check with the operator before submitting again.');
+  $('disconnect').onclick = () => {
+    const c = selected();
+    if (!c || !window.confirm('Disconnect this agent from Town? The remote agent will keep running.')) return;
+    run('task-status', 'Disconnecting…', async api => {
+      await api('/' + encodeURIComponent(c.id), 'DELETE');
+      connections = connections.filter(x => x.id !== c.id);
+      renderList(); show('task-status', 'Disconnected.'); return $('refresh');
+    });
+  };
+  $('refresh').onclick = refresh;
+  // Match the native sign-in/sign-out channel: do not leave one owner's data visible to another.
+  if (typeof BroadcastChannel === 'function') {
+    new BroadcastChannel('openruntime.session').onmessage = ({ data }) => {
+      if (data?.type === 'signed-out' && typeof data.failed === 'boolean') {
+        if (typeof data.generation === 'string' && data.generation !== session().gen) return;
+        blockedAt = session().gen ?? 'storage-blocked'; forgetOwner();
+      } else if (data?.type === 'signed-in' && syncSession()) refresh();
+    };
+  }
+  window.addEventListener('storage', ({ key }) => {
+    if ((key === null || key === markKey || key === generationKey) && syncSession()) refresh();
+  });
+  window.addEventListener('pagehide', forgetOwner);
+  window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
+  refresh();
+</script>
+</body>
+</html>
