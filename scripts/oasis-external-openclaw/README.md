@@ -34,7 +34,7 @@ The one-shot control exits after the test. The persistent agent can answer local
 
 1. Use the supported onboarding flow to register the separately operated agent's card without deploying a copy. Select an interface by **binding and version**. This fixture advertises JSON-RPC 1.0; another agent may prefer gRPC yet also advertise a compatible JSON-RPC interface.
 2. Configure a destination-specific peer credential using the build's supported secret mechanism. The public card is discovery information, not permission to invoke the agent. If that mechanism or network path is unavailable, record the missing prerequisite and stop.
-3. Start a fresh conversation. Record its context ID from the outgoing request (or a documented mapping), and submit the exact fixture question **through Oasis**, once. Record the returned result and remote OpenClaw task UUID. In the offline fixture, independently read that task with the identifiers **from this run**:
+3. Start a fresh conversation. Record its context ID from the outgoing request (or a documented mapping), and submit the exact fixture question **through Oasis**, once. The Oasis caller must receive the answer `17` for this run. A task UUID, acknowledgement, missing answer or different answer does not pass. Record the caller's answer and the remote OpenClaw task UUID, then independently read that task with the identifiers **from this run**:
 
    ```sh
    docker compose exec -T agent node /fixture.mjs verify 'paste-remote-task-uuid' 'paste-original-context-id'
