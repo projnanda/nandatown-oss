@@ -4,7 +4,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 const pending = new Set(['TASK_STATE_SUBMITTED', 'TASK_STATE_WORKING']);
 const safeId = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 
-function completed(task, taskId, contextId) {
+function completed(task, taskId, contextId, expectedAnswer) {
   if (task?.id !== taskId || task?.contextId !== contextId)
     throw Error('Task or context does not match the original submission.');
   if (pending.has(task.status?.state)) return false;
@@ -13,13 +13,13 @@ function completed(task, taskId, contextId) {
   const parts = task.artifacts?.[0]?.parts;
   if (!Array.isArray(task.artifacts) || task.artifacts.length !== 1 ||
       !Array.isArray(parts) || !parts.every(p => typeof p?.text === 'string' && !('data' in p || 'raw' in p || 'url' in p)) ||
-      parts.map(p => p.text).join('').trim() !== '17')
-    throw Error('Completed task has the wrong semantic result; expected one text artifact containing 17.');
+      parts.map(p => p.text).join('').trim() !== expectedAnswer)
+    throw Error('Completed task has the wrong semantic result; expected one matching text artifact.');
   return true;
 }
 
 // OpenClaw's SendMessage wraps the Task; GetTask returns the Task itself.
-export async function runTask({ rpc, prompt = 'What is the sum of 8 and 9? Reply with just the number.',
+export async function runTask({ rpc, prompt = 'What is the sum of 8 and 9? Reply with just the number.', expectedAnswer = '17',
   now = () => Math.floor(performance.now()), sleep = delay }) {
   const until = now() + 120_000;
   const contextId = randomUUID();
@@ -37,7 +37,7 @@ export async function runTask({ rpc, prompt = 'What is the sum of 8 and 9? Reply
   const taskId = task?.id;
   if (typeof taskId !== 'string' || !safeId.test(taskId))
     throw Error('No usable OpenClaw task ID; submission acceptance unknown. Do not resubmit automatically.');
-  let done = completed(task, taskId, contextId);
+  const initiallyDone = completed(task, taskId, contextId, expectedAnswer);
   const remaining = () => {
     const ms = until - now();
     if (ms <= 0) throw Error('Deadline reached; outcome unconfirmed. Check task ' + taskId + '.');
@@ -46,7 +46,7 @@ export async function runTask({ rpc, prompt = 'What is the sum of 8 and 9? Reply
   // Confirm even an immediately completed reply against the task store. Three
   // seconds between pending reads leaves room within the gateway's 30 RPC/min.
   while (true) {
-    if (!done) await sleep(Math.min(3000, remaining()));
+    if (!initiallyDone) await sleep(Math.min(3000, remaining()));
     const timeout = Math.min(15_000, remaining());
     try {
       task = await rpc('GetTask', { id: taskId }, timeout);
@@ -54,8 +54,7 @@ export async function runTask({ rpc, prompt = 'What is the sum of 8 and 9? Reply
       throw Error('Could not confirm task ' + taskId + '; no second submission.');
     }
     remaining();
-    if (completed(task, taskId, contextId)) return { taskId, answer: '17' };
-    if (done) throw Error('Task store did not confirm the completed submission.');
-    done = false;
+    if (completed(task, taskId, contextId, expectedAnswer)) return { taskId, answer: expectedAnswer };
+    if (initiallyDone) throw Error('Task store did not confirm the completed submission.');
   }
 }

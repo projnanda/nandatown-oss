@@ -15,7 +15,13 @@ docker compose -f compose.yaml run --rm --no-deps control
 
 On macOS, use `docker --context orbstack compose -f compose.yaml run --rm --no-deps control`
 to select OrbStack explicitly. The command never pulls. If the image is missing,
-obtain the pinned image in [compose.yaml](compose.yaml) before running offline.
+download it once to the same engine before running offline:
+
+```sh
+docker pull ghcr.io/openclaw/openclaw:2026.9.3@sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b
+```
+
+Use `docker --context orbstack pull …` if you selected OrbStack explicitly.
 To run only the unit checks (Node.js 22+, no Docker): `node --test stub.test.mjs`.
 
 The one-shot container creates fresh state, checks the Agent Card, then uses

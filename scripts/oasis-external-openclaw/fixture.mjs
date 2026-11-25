@@ -1,14 +1,17 @@
-// Direct-agent control for a synthetic, local-only fixture. No model calls.
+// Direct-agent checks for the synthetic local fixture.
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { runTask } from './task-probe.mjs';
+import { arithmetic, configureStub, startStub, unsupported } from './control/stub.mjs';
 
 const state = '/home/node/.openclaw';
 const file = state + '/openclaw.json';
 const origin = 'http://127.0.0.1:18916';
 const endpoint = origin + '/a2a/v1';
 const id = 'oasis-test';
+const mode = process.env.OASIS16_MODE;
+const stubPort = 18918;
 const secret = () => randomBytes(32).toString('hex');
 
 async function init() {
@@ -31,6 +34,7 @@ async function init() {
     discovery: { mdns: { mode: 'off' } },
     update: { checkOnStart: false },
   };
+  if (mode === 'offline') configureStub(config, stubPort);
   try {
     await writeFile(file, JSON.stringify(config, null, 2), { mode: 0o600, flag: 'wx' });
   } catch (err) {
@@ -39,6 +43,7 @@ async function init() {
     const existing = JSON.parse(await readFile(file, 'utf8'));
     assert.ok(existing.agents?.entries?.[id] || existing.agents?.list?.some(a => a.id === id),
       'not the expected fixture volume');
+    if (mode === 'offline') requireOffline(existing);
   }
 }
 
@@ -85,11 +90,18 @@ async function smoke() {
   console.log('PASS through local relay: card; non-A2A route closed; anonymous RPC rejected; authenticated GetTask reached the task store. No inference or Oasis call.');
 }
 
-// Optional, explicitly invoked only after a provider is authorized.
-async function live() {
+function requireOffline(config) {
+  assert.equal(mode, 'offline', 'use the dedicated offline fixture');
+  assert.equal(config.agents.defaults.model?.primary, 'control/addition-stub', 'not the offline fixture config');
+  assert.equal(config.models?.providers?.control?.baseUrl, 'http://127.0.0.1:' + stubPort + '/v1');
+}
+
+async function task(kind) {
   const base = 'http://edge:18916';
   await card(base);
   const config = JSON.parse(await readFile(file, 'utf8'));
+  if (kind === 'live') assert.equal(mode, 'live', 'use the separate opt-in provider project');
+  else requireOffline(config);
   const peer = config.channels.a2a.peers.oasis.token;
   async function rpc(method, params, timeoutMs) {
     const req = randomUUID();
@@ -104,10 +116,20 @@ async function live() {
     assert.ok(!body.error, 'RPC failed: ' + (body.error?.code ?? 'no code'));
     return body.result;
   }
-  await runTask({ rpc });
-  console.log('PASS: direct OpenClaw task completed with text artifact 17. This did not go through Oasis.');
+  if (kind === 'negative') {
+    await runTask({ rpc, prompt: 'What is 2 + 2?', expectedAnswer: unsupported });
+    console.log('PASS: unsupported prompt returned the explicit fixture refusal, not 17.');
+    return;
+  }
+  const { taskId } = await runTask({ rpc });
+  console.log('PASS: directly read OpenClaw task %s; artifact 17 (%s). No Oasis call.', taskId,
+    kind === 'live' ? 'opt-in provider' : 'fixed-answer offline provider');
 }
 
-const modes = new Map([['init', init], ['card', card], ['smoke', smoke], ['live', live]]);
-assert.ok(modes.has(process.argv[2]), 'expected init, card, smoke or live');
+const modes = new Map([['init', init], ['card', card], ['smoke', smoke], ['task', () => task('offline')],
+  ['negative', () => task('negative')], ['live', () => task('live')], ['stub', () => {
+    assert.equal(mode, 'offline');
+    return startStub(arithmetic, stubPort);
+  }]]);
+assert.ok(modes.has(process.argv[2]), 'expected init, card, smoke, task, negative, live or stub');
 await modes.get(process.argv[2])();

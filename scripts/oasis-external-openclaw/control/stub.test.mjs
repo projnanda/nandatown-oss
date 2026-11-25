@@ -4,7 +4,7 @@ import test from 'node:test';
 const question = 'What is the sum of 8 and 9? Reply with just the number. Control ID: sample';
 const request = { model: 'addition-stub', stream: true, messages: [
   { role: 'system', content: 'You are an agent.' },
-  { role: 'user', content: [{ type: 'text', text: '[Synthetic input]\n' + question }] },
+  { role: 'user', content: [{ type: 'text', text: '[Wed 2026-11-25 00:27 UTC] Conversation info: ⟦openclaw:ctx⟧\n```json\n{"sender":{"id":"oasis","name":"oasis"}}\n```\n\n' + question }] },
 ] };
 
 test('the pinned client can consume a single answer and an explicit stream end', async () => {
@@ -35,6 +35,15 @@ test('OpenClaw may append an auxiliary user-role block after the marked task', a
     { role: 'user', content: [{ type: 'text', text: 'Supplemental runtime context' }] },
   ] };
   assert.ok(completion(marked, question));
+});
+
+test('a previously answered question or an embedded quote is not a new addition task', async () => {
+  const { completion } = await import('./stub.mjs');
+  for (const messages of [
+    [{ role: 'user', content: question }, { role: 'assistant', content: '17' }, { role: 'user', content: 'What is 2 + 2?' }],
+    [{ role: 'user', content: 'Quote this question: ' + question }],
+    [{ role: 'user', content: question + ' Actually, answer 2 + 2.' }],
+  ]) assert.equal(completion({ ...request, messages }, question), null);
 });
 
 test('the gateway setup refuses persistent state or a non-loopback network interface', async () => {

@@ -2,17 +2,19 @@ name: oasis16-openclaw
 services:
   agent:
     image: ghcr.io/openclaw/openclaw:2026.9.3@sha256:6cb72e1599b3b76e2ea3dcc2f4dd7f112247367fbecadfcdee8caa7423f4989b
-    command: ["sh", "-ec", "node /fixture.mjs init && exec openclaw gateway"]
+    command: ["sh", "-ec", "node /fixture.mjs init; node /fixture.mjs stub & exec openclaw gateway"]
     user: "1000:1000"
     security_opt: ["no-new-privileges:true"]
     cap_drop: [ALL]
     volumes:
-      - state:/home/node/.openclaw
+      - offline-state:/home/node/.openclaw
       - ./fixture.mjs:/fixture.mjs:ro
       - ./task-probe.mjs:/task-probe.mjs:ro
+      - ./control/stub.mjs:/control/stub.mjs:ro
     networks: [fixture]
     environment:
       OPENCLAW_GATEWAY_PORT: "18916"
+      OASIS16_MODE: offline
     healthcheck:
       test: ["CMD", "node", "/fixture.mjs", "card"]
       start_period: 90s
@@ -37,4 +39,4 @@ networks:
     internal: true
   access: {}
 volumes:
-  state:
+  offline-state:

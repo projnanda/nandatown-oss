@@ -10,7 +10,8 @@ const output = text => ({ parts: [{ text }] });
 function scenario(handler) {
   let time = 0, contextId;
   const calls = [];
-  const probe = () => runTask({
+  const probe = (options = {}) => runTask({
+    ...options,
     now: () => time,
     sleep: async ms => { time += ms; },
     rpc: async (method, params, timeoutMs) => {
@@ -45,6 +46,16 @@ test('reads back an immediately completed task from the task store', async () =>
 test('one artifact can contain multiple text parts', async () => {
   const { probe } = scenario(({ task }) => task(done, [{ parts: [{ text: '1' }, { text: '7' }] }]));
   await probe();
+});
+
+test('requires the exact expected refusal for the unsupported offline question', async () => {
+  const expectedAnswer = 'Unsupported offline fixture prompt.';
+  const { probe, calls } = scenario(({ method, task }) => method === 'SendMessage'
+    ? task(working) : task(done, [output(expectedAnswer)]));
+  assert.deepEqual(await probe({ expectedAnswer }), { taskId: id, answer: expectedAnswer });
+  assert.deepEqual(calls.map(c => c.method), ['SendMessage', 'GetTask']);
+  const wrong = scenario(({ task }) => task(done, [output('17')]));
+  await assert.rejects(() => wrong.probe({ expectedAnswer }), /semantic result/i);
 });
 
 for (const [name, artifacts] of [

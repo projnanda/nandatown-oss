@@ -14,44 +14,48 @@ The actual OpenClaw gateway receives one authenticated A2A task, forwards it to 
 
 ## Persistent local agent and relay
 
-From this directory, using Docker Compose on the local engine (on macOS, `docker context show` should report `orbstack` if that's the engine you intend):
+Use this when you want the same agent to stay up between runs. From this directory, with Docker Compose on the intended local engine:
 
 ```sh
 docker compose up -d --wait
 curl -fsS http://127.0.0.1:18916/.well-known/agent-card.json
 docker compose exec -T agent node /fixture.mjs smoke
+docker compose exec -T agent node /fixture.mjs task
+docker compose exec -T agent node /fixture.mjs negative
 ```
 
-The relay exposes only the card and the authenticated A2A JSON-RPC route on a Mac loopback port. The smoke check verifies the card advertises the right agent and exact endpoint, the relay doesn't serve the control UI, anonymous invocation gets 401, and an authenticated GetTask for a new random ID reaches OpenClaw's task store. The expected response is **task not found**, not a successful task. This is a direct control, not an Oasis onboarding result. Hosted Oasis cannot reach this address; do not disable its public-destination policy or publish a tunnel for this test.
+The relay exposes only the card and the A2A JSON-RPC endpoint on the host's loopback port. `smoke` verifies the card, a closed control-UI route, HTTP 401 without a peer credential, and **task not found** on an authenticated lookup for an unknown task. `task` submits “What is the sum of 8 and 9? Reply with just the number.” It must read back `17`. `negative` submits a different question and must read back `Unsupported offline fixture prompt.` Both use a fixed-answer provider on the agent container's own loopback interface. All three checks talk directly to OpenClaw, not through Oasis.
 
 OpenClaw generates separate random gateway and peer credentials on first start and persists them in a project-specific Docker volume. Nothing mounts a personal workspace, SSH keys, provider profiles or the Docker socket. Do not print the config, paste a token into an issue, or give Oasis the gateway credential. Only the **peer** bearer belongs in a future private Oasis connection, bound to its destination. Do not copy a personal agent's provider credential.
 
 ## What would count as an Oasis onboarding result?
 
-The two checks above are **direct controls**. Neither registers or invokes an agent through Oasis. When a build supporting external onboarding is available, record its commit and the OpenClaw image digest, then:
+The one-shot control exits after the test. The persistent agent can answer locally, but **hosted Oasis cannot reach its loopback address**. Use it with a local build only if that build has a supported test route to it; do not disable public-destination protections or publish a tunnel. For a hosted test, use a consenting operator's reachable test agent. Record the build commit and agent version, then:
 
-1. Use the supported onboarding flow for a separately operated agent at an operator-approved address reachable from that Oasis instance. Register its Agent Card without deploying a copy of the agent. Record the supported A2A version and binding; this fixture advertises JSON-RPC 1.0.
+1. Use the supported onboarding flow to register the separately operated agent's card without deploying a copy. Select an interface by **binding and version**. This fixture advertises JSON-RPC 1.0; another agent may prefer gRPC yet also advertise a compatible JSON-RPC interface.
 2. Configure a destination-specific peer credential using the build's supported secret mechanism. The public card is discovery information, not permission to invoke the agent. If that mechanism or network path is unavailable, record the missing prerequisite and stop.
-3. Submit the same addition question **through Oasis**, once. Confirm that OpenClaw received that run and that the result returned to the caller contains `17`. Correlate the task IDs on both sides (record the mapping if different). A direct call or a listing in the UI is not a substitute for this step.
+3. Submit the exact fixture question **through Oasis**, once. Confirm that OpenClaw received that run and the returned task has one text artifact equal to `17`. Correlate the task IDs on both sides (record the mapping if different). For another agent, establish its own expected result first. A direct call or a listing in the UI is not a substitute.
 4. Capture the first step that failed, or the successful result and rerun instructions. Include only synthetic inputs, non-secret identifiers and the observed result. If the remote outcome is unknown, look up the existing task rather than sending the question again.
 
-Oasis serving a model or MCP request **from** an agent is the other direction. It does not establish that Oasis can invoke an external agent. Public OpenTelemetry ingestion is a separate deployment decision and is not needed to compare the task results.
+For model or tool traffic **from** a local agent **into** Oasis, use the existing [LangGraph/CrewAI setup guide](../a2a-discovery-e2e/MANUAL.md#5-connect). On a disposable developer machine, `nasiko agents discover` inventories local agents and reports their cards to the active cluster when logged in. `nasiko connect <discovered-name>` walks the owner through choosing which model calls to route and whether to grant MCP access. Review the target cluster and file before confirming; the generated settings contain credentials. The agent must load those settings and use an MCP client to call tools. Neither command lets Oasis call an arbitrary internet agent. Public OpenTelemetry ingestion is a separate deployment decision; it is not needed to compare the task results.
 
 ## Optional: one real model answer
 
-Only do this when you want outbound provider access and are willing to use your account. The extra Compose file adds ordinary outbound internet access to the test agent; the published port stays on loopback. Use Compose 2.33.1+ for network gateway priority. These are operator steps, **not** part of the offline smoke check:
+Only do this when you want outbound provider access and are willing to use your account. The extra Compose file starts a **different project and state volume**, `oasis16-openclaw-live`, with internet access for the agent. The published port stays on loopback. Use Compose 2.33.1+ for network gateway priority, from this directory. The optional live project uses the same port, so first stop the default fixture if it is running:
 
 ```sh
-docker compose -f compose.yaml -f provider.compose.yaml up -d --wait
-docker compose exec agent openclaw config set plugins.allow '["a2a","openai"]' --strict-json
-docker compose exec agent openclaw models auth login --agent oasis-test --provider openai --device-code --set-default
-docker compose -f compose.yaml -f provider.compose.yaml restart agent
-docker compose -f compose.yaml -f provider.compose.yaml up -d --wait
-docker compose exec -T agent node /fixture.mjs live
+docker compose -p oasis16-openclaw stop
+dc_live() { docker compose -p oasis16-openclaw-live -f compose.yaml -f provider.compose.yaml "$@"; }
+dc_live up -d --wait
+dc_live exec agent openclaw config set plugins.allow '["a2a","openai"]' --strict-json
+dc_live exec agent openclaw models auth login --agent oasis-test --provider openai --device-code --set-default
+dc_live restart agent
+dc_live up -d --wait
+dc_live exec -T agent node /fixture.mjs live
 ```
 
 Complete the provider's sign-in privately in your browser. The optional check sends **one** synthetic addition task, polls the same task ID, and requires a completed result artifact of exactly `17`. It does not evaluate the model's general capability or prove Oasis routed the call. Do not automatically resend on timeout. The fixture's tool denylist stays in place. If the account cannot use this flow, stop; the fixture does not require switching to paid API-key billing.
 
-To turn off outbound access again, run `docker compose up -d --wait` **without** the override. This does not revoke or erase credentials already saved. To stop the fixture without removing its data, run `docker compose down`.
+When finished, use `dc_live down` to stop the live project and release its port. This preserves its private state for a later run. If you want to **erase that project's test credentials, tasks and workspace**, use `dc_live down --volumes` instead. Removing local data does not revoke the provider's authorization; revoke it separately in your provider account if required. The default fixture is separate and can be restarted with `docker compose -p oasis16-openclaw up -d --wait`.
 
 Sources: [OpenClaw A2A at the fixture version](https://github.com/openclaw/openclaw/blob/v2026.9.3/docs/channels/a2a.md), [OpenClaw provider guide at the fixture version](https://github.com/openclaw/openclaw/blob/v2026.9.3/docs/providers/openai.md).
