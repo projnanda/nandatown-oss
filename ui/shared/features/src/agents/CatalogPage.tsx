@@ -8,7 +8,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Bot, LayoutGrid, List, RotateCw, SearchX, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useSlots } from '@nasiko/app-core/edition/edition-context'
+import { useEdition, useSlots } from '@nasiko/app-core/edition/edition-context'
 import { Button } from '@nasiko/ui/primitives/button'
 import { Label } from '@nasiko/ui/primitives/label'
 import {
@@ -71,6 +71,7 @@ export function CatalogPage({
   setSearch: (patch: Partial<CatalogSearch>) => void
 }) {
   const me = useQuery(meQuery).data
+  const isOss = useEdition() === 'oss'
   const q = useCatalogAgents()
   const pinnedTabs = useCatalogTabs().data
   const names = useUsers(!!me?.is_superuser).data
@@ -158,6 +159,17 @@ export function CatalogPage({
       description={
         <>
           {copy.catalogSub}
+          {isOss && (
+            <>
+              {' · '}
+              <a
+                className="text-primary-text underline underline-offset-2"
+                href="/nanda/external-agents"
+              >
+                Connect external A2A agent
+              </a>
+            </>
+          )}
           {(q.hasNextPage || q.isFetchingNextPage) && !q.isFetchNextPageError
             ? ` · ${copy.loadingMore}`
             : ''}

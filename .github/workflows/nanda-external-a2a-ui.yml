@@ -1,0 +1,78 @@
+name: NANDA external A2A UI
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/nanda-external-a2a-ui.yml'
+      - 'server/src/nanda_external/**'
+      - 'ui/e2e/external-agents.spec.ts'
+      - 'ui/e2e/playwright.config.ts'
+      - 'ui/shared/features/src/agents/CatalogPage.tsx'
+      - 'ui/vite.shared.ts'
+      - 'ui/package.json'
+      - 'ui/pnpm-lock.yaml'
+      - 'ui/pnpm-workspace.yaml'
+      - 'ui/.nvmrc'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nanda-external-a2a-ui-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  synthetic-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      VITE_NASIKO_API_MODE: mock
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: candidate
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: candidate/ui/.nvmrc
+      # pnpm 12 ships a native executable. Older Corepack shims look for a removed bin/pnpm.cjs.
+      - name: Install the UI's pinned pnpm
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/nanda-tools" pnpm@12.8.1
+          echo "$RUNNER_TEMP/nanda-tools/bin" >> "$GITHUB_PATH"
+      - name: Capture the catalog at the PR base commit
+        working-directory: baseline/ui
+        env:
+          NANDA_E2E_ARTIFACTS: ${{ runner.temp }}/nanda-external-screenshots
+          NANDA_E2E_BASELINE: '1'
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+          cp "$GITHUB_WORKSPACE/candidate/ui/e2e/external-agents.spec.ts" e2e/external-agents.spec.ts
+          pnpm exec playwright test --config e2e/playwright.config.ts --project=desktop --workers=1 --grep "the OSS catalog" external-agents.spec.ts
+      - name: Check candidate catalog and operator flow; capture synthetic screens
+        working-directory: candidate/ui
+        env:
+          NANDA_E2E_ARTIFACTS: ${{ runner.temp }}/nanda-external-screenshots
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright test --config e2e/playwright.config.ts --project=desktop --workers=1 external-agents.spec.ts
+          for png in catalog-before catalog-after operator-preview-synthetic operator-result-synthetic; do
+            test -s "$NANDA_E2E_ARTIFACTS/$png.png"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanda-external-a2a-synthetic-ui
+          path: |
+            ${{ runner.temp }}/nanda-external-screenshots/catalog-before.png
+            ${{ runner.temp }}/nanda-external-screenshots/catalog-after.png
+            ${{ runner.temp }}/nanda-external-screenshots/operator-preview-synthetic.png
+            ${{ runner.temp }}/nanda-external-screenshots/operator-result-synthetic.png
+          if-no-files-found: error
+          retention-days: 14

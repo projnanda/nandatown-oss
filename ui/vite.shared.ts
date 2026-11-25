@@ -331,7 +331,10 @@ export function weaveCompiledIn(mode: string): boolean {
 
 export function nasikoApp(o: AppOptions): UserConfig {
   const env = loadEnv(o.mode, ROOT, '')
-  const proxy = o.proxy ?? { paths: PROXIED, target: env.NASIKO_API_URL || 'http://localhost:8080' }
+  const proxy = o.proxy ?? {
+    paths: o.id === 'oss' ? [...PROXIED, '/nanda/external-agents'] : PROXIED,
+    target: env.NASIKO_API_URL || 'http://localhost:8080',
+  }
   const port = o.port ?? 3000
   const src = join(o.appDir, 'src')
   const ownRoutes = o.commonRoutes === false
