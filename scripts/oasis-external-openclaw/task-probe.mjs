@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const pending = new Set(['TASK_STATE_SUBMITTED', 'TASK_STATE_WORKING']);
 const safeId = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+export const validContext = v => typeof v === 'string' && v.length <= 1024 && Boolean(v.trim()) && !/[\u0000-\u001f\u007f]/.test(v);
 
 function completed(task, taskId, contextId, expectedAnswer) {
   if (task?.id !== taskId || task?.contextId !== contextId)
@@ -20,8 +21,8 @@ function completed(task, taskId, contextId, expectedAnswer) {
 
 // Independent witness for a single already-submitted offline addition task.
 // Only accepts a read operation; it cannot submit a message or trigger the model.
-export async function verifyStoredTask({ taskId, contextId, getTask }) {
-  if (typeof taskId !== 'string' || !safeId.test(taskId) || typeof contextId !== 'string' || !contextId.trim())
+export async function verifyStoredTask({ taskId, contextId, getTask, expectedAnswer = '17' }) {
+  if (typeof taskId !== 'string' || !safeId.test(taskId) || !validContext(contextId))
     throw Error('Both original identifiers are required: OpenClaw task UUID and expected context ID.');
   let stored;
   try {
@@ -29,7 +30,7 @@ export async function verifyStoredTask({ taskId, contextId, getTask }) {
   } catch {
     throw Error('Could not read the stored task; result unconfirmed. Do not send another task.');
   }
-  if (!completed(stored, taskId, contextId, '17'))
+  if (!completed(stored, taskId, contextId, expectedAnswer))
     throw Error('Task is pending; repeat the read later, not the submission.');
 }
 

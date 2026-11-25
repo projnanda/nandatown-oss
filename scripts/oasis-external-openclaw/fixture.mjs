@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { runTask, verifyStoredTask } from './task-probe.mjs';
-import { arithmetic, configureStub, startStub, unsupported } from './control/stub.mjs';
+import { arithmetic, challenge, configureStub, startStub, unsupported } from './control/stub.mjs';
 
 const state = '/home/node/.openclaw';
 const file = state + '/openclaw.json';
@@ -49,7 +49,7 @@ async function init() {
 
 async function card(base = origin) {
   const res = await fetch(base + '/.well-known/agent-card.json', {
-    redirect: 'error', signal: AbortSignal.timeout(5000),
+    redirect: 'error', signal: AbortSignal.timeout(5000), headers: { 'A2A-Version': '1.0' },
   });
   assert.equal(res.status, 200, 'card HTTP status');
   const body = await res.json();
@@ -118,9 +118,10 @@ async function verify() {
   const config = JSON.parse(await readFile(file, 'utf8'));
   requireOffline(config);
   const rpc = peerRpc(config);
-  const [taskId, contextId] = process.argv.slice(3);
-  await verifyStoredTask({ taskId, contextId, getTask: id => rpc('GetTask', { id }, 15_000) });
-  console.log('PASS: offline OpenClaw stored the matching completed task and artifact 17. Read only; caller not established.');
+  const [taskId, contextId, nonce] = process.argv.slice(3);
+  const expectedAnswer = nonce === undefined ? '17' : challenge(nonce).expected;
+  await verifyStoredTask({ taskId, contextId, expectedAnswer, getTask: id => rpc('GetTask', { id }, 15_000) });
+  console.log('PASS: offline OpenClaw stored the expected completed result. Read only.');
 }
 
 async function task(kind) {

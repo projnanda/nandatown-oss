@@ -53,3 +53,13 @@ test('the gateway setup refuses persistent state or a non-loopback network inter
   assert.throws(() => requireIsolated(0x01021994, { ...onlyLoopback, eth0: [{ internal: false }] }), /loopback/);
   requireIsolated(0x01021994, onlyLoopback);
 });
+
+test('the offline witness binds the arithmetic answer to this one run', async () => {
+  const { arithmetic, challenge, completion } = await import('./stub.mjs');
+  const a = challenge(), b = challenge();
+  assert.notEqual(a.expected, b.expected);
+  const reply = prompt => completion({...request, messages:[{role:'user',content:prompt}]}, arithmetic);
+  assert.ok(reply(a.prompt).includes(a.expected));
+  assert.ok(!reply(b.prompt).includes(a.expected));
+  assert.equal(reply('Quoted: ' + a.prompt),null);
+});

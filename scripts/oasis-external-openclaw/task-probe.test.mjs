@@ -137,3 +137,19 @@ test('a missing correlation ID is not treated as a match or sent to the store', 
   }
   assert.equal(reads, 0);
 });
+
+test('correct stored IDs and an earlier answer cannot witness a fresh challenge', async () => {
+  const contextId = 'same-context', oldAnswer = '17 / previous-run', fresh = '17 / current-run';
+  let reads = 0;
+  const read = () => { reads++; return {id, contextId,status:{state:done},artifacts:[output(oldAnswer)]}; };
+  await verifyStoredTask({taskId:id,contextId,getTask:read,expectedAnswer:oldAnswer});
+  await assert.rejects(() => verifyStoredTask({taskId:id,contextId,getTask:read,expectedAnswer:fresh}), /semantic/);
+  assert.equal(reads,2);
+});
+
+test('the caller accepts a bounded opaque peer-assigned context, not just a bare task UUID', async () => {
+  const { validContext } = await import('./task-probe.mjs');
+  assert.equal(validContext('ctx-' + id), true);
+  assert.equal(validContext('   '), false);
+  assert.equal(validContext('x'.repeat(10000)), false);
+});

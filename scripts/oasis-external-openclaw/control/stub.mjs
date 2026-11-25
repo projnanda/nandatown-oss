@@ -1,8 +1,15 @@
 import { once } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 
 export const arithmetic = 'What is the sum of 8 and 9? Reply with just the number.';
 export const unsupported = 'Unsupported offline fixture prompt.';
+const noncePattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const prefix = 'Add 8 and 9 and include this run ID in the answer: ';
+export function challenge(nonce = randomUUID()) {
+  if (!noncePattern.test(nonce)) throw Error('Expected a fresh UUIDv4 challenge.');
+  return { nonce, prompt: prefix + nonce, expected: '17 / ' + nonce };
+}
 
 function validRequest(input) {
   return input?.model === 'addition-stub' && input.stream === true && Array.isArray(input.messages);
@@ -13,12 +20,20 @@ const envelope = /^\[[^\]\n]+\] Conversation info: ⟦openclaw:ctx⟧\n```json\n
 export function completion(input, question) {
   if (!validRequest(input)) return null;
   const currentTurn = input.messages.slice(input.messages.findLastIndex(m => m?.role === 'assistant') + 1);
-  const matched = currentTurn.some(m => {
-    if (m?.role !== 'user') return false;
+  for (const m of currentTurn) {
+    if (m?.role !== 'user') continue;
     const parts = Array.isArray(m.content) ? m.content.filter(p => p?.type === 'text').map(p => p.text) : [m.content];
-    return parts.some(text => typeof text === 'string' && text.replace(envelope, '').trim() === question);
-  });
-  return matched ? answerStream(input.model, '17') : null;
+    for (const part of parts) {
+      if (typeof part !== 'string') continue;
+      const text = part.replace(envelope, '').trim();
+      if (text === question) return answerStream(input.model, '17');
+      if (question === arithmetic && text.startsWith(prefix)) {
+        const nonce = text.slice(prefix.length);
+        if (noncePattern.test(nonce)) return answerStream(input.model, challenge(nonce).expected);
+      }
+    }
+  }
+  return null;
 }
 
 function answerStream(model, answer) {
