@@ -83,6 +83,29 @@ pub fn decode_jwt(secret: &str, token: &str) -> Result<Identity, AuthError> {
     decode_session_claims(secret, token).map(identity_of)
 }
 
+/// Origin check for preventing outbound disclosure, **never** an authentication
+/// decision. Deliberately independent of token class, audience, expiry and revocation.
+pub fn has_hmac_issuer_signature(
+    token: &str,
+    secret: &str,
+    algorithm: jsonwebtoken::Algorithm,
+) -> bool {
+    use jsonwebtoken::Algorithm::{HS256, HS384, HS512};
+    if secret.is_empty() || !matches!(algorithm, HS256 | HS384 | HS512) {
+        return false;
+    }
+    let mut validation = Validation::new(algorithm);
+    validation.required_spec_claims.clear();
+    validation.validate_exp = false;
+    validation.validate_aud = false;
+    decode::<serde::de::IgnoredAny>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .is_ok()
+}
+
 /// Like `decode_jwt` but also returns the `jti` claim for token revocation use.
 pub fn decode_jwt_with_jti(secret: &str, token: &str) -> Result<(Identity, String), AuthError> {
     let claims = decode_session_claims(secret, token)?;

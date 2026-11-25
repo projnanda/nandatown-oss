@@ -19,6 +19,7 @@ const TEXT_BYTES: usize = 16 * 1024;
 const UNKNOWN: &str = "a2a_submission_unknown";
 const UNCONFIRMED: &str = "a2a_task_unconfirmed";
 const INVALID: &str = "a2a_invalid_result";
+const PROTOCOL_VERSION: &str = "1.0";
 
 #[derive(Debug)]
 pub(super) struct Card {
@@ -39,6 +40,12 @@ fn bounded_label(v: &Value) -> Option<&str> {
     (!s.trim().is_empty() && s.len() <= 256 && !s.chars().any(char::is_control)).then_some(s)
 }
 
+fn utf8_params(mode: &mime_guess::mime::Mime) -> bool {
+    mode.params().all(|(name, value)| {
+        name == mime_guess::mime::CHARSET && value.as_str().eq_ignore_ascii_case("utf-8")
+    })
+}
+
 fn check_text_modes(card: &Value, field: &str) -> Result<(), &'static str> {
     use mime_guess::mime;
     let Some(declared) = card.get(field) else {
@@ -54,10 +61,7 @@ fn check_text_modes(card: &Value, field: &str) -> Result<(), &'static str> {
             .parse()
             .map_err(|_| CARD_INVALID)?;
         let plain = matches!(mode.essence_str(), "text/plain" | "text/*" | "*/*");
-        compatible |= plain
-            && mode.params().all(|(name, value)| {
-                name == mime::CHARSET && value.as_str().eq_ignore_ascii_case("utf-8")
-            });
+        compatible |= plain && utf8_params(&mode);
     }
     if compatible {
         Ok(())
@@ -122,7 +126,18 @@ fn card_security(body: &Value) -> Result<bool, &'static str> {
     }
 }
 
-fn parse_card(url: &Url, body: &Value) -> Result<Card, &'static str> {
+fn compatible_version(v: &Value) -> bool {
+    v.as_str().is_some_and(|s| {
+        s == PROTOCOL_VERSION
+            || s.rsplit_once('.').is_some_and(|(version, patch)| {
+                version == PROTOCOL_VERSION
+                    && !patch.is_empty()
+                    && patch.bytes().all(|b| b.is_ascii_digit())
+            })
+    })
+}
+
+fn parse_card(approved: &Url, body: &Value) -> Result<Card, &'static str> {
     let name = bounded_label(&body["name"]).ok_or(CARD_INVALID)?;
     let requires_bearer = card_security(body)?;
     check_text_modes(body, "defaultInputModes")?;
@@ -141,37 +156,35 @@ fn parse_card(url: &Url, body: &Value) -> Result<Card, &'static str> {
     {
         return Err(CARD_UNSUPPORTED);
     }
-    let mut interfaces = body["supportedInterfaces"]
+    let interfaces = body["supportedInterfaces"]
         .as_array()
         .ok_or(CARD_UNSUPPORTED)?
         .iter()
         .filter(|i| {
             i["protocolBinding"] == "JSONRPC"
-                && i["protocolVersion"] == "1.0"
+                && compatible_version(&i["protocolVersion"])
                 && i.get("tenant")
                     .is_none_or(|tenant| tenant.as_str() == Some(""))
         });
-    let interface = interfaces.next().ok_or(CARD_UNSUPPORTED)?;
-    if interfaces.next().is_some() {
-        return Err(CARD_UNSUPPORTED);
+    let mut no_match = CARD_UNSUPPORTED;
+    for interface in interfaces {
+        // Backups are descriptions, not fallback destinations. net::target
+        // already validated this exact same-origin endpoint and pinned its host.
+        if interface["url"]
+            .as_str()
+            .and_then(|s| Url::parse(s).ok())
+            .as_ref()
+            == Some(approved)
+        {
+            return Ok(Card {
+                name: name.to_owned(),
+                endpoint: approved.clone(),
+                requires_bearer,
+            });
+        }
+        no_match = "a2a_endpoint_changed";
     }
-    let endpoint =
-        Url::parse(interface["url"].as_str().ok_or(CARD_INVALID)?).map_err(|_| CARD_INVALID)?;
-    if !matches!(endpoint.scheme(), "https" | "http")
-        || endpoint.origin() != url.origin()
-        || endpoint.cannot_be_a_base()
-        || !endpoint.username().is_empty()
-        || endpoint.password().is_some()
-        || endpoint.query().is_some()
-        || endpoint.fragment().is_some()
-    {
-        return Err("a2a_endpoint_not_allowed");
-    }
-    Ok(Card {
-        name: name.to_owned(),
-        endpoint,
-        requires_bearer,
-    })
+    Err(no_match)
 }
 
 async fn limited_body(mut response: reqwest::Response) -> Result<Vec<u8>, ()> {
@@ -197,24 +210,37 @@ async fn limited_body(mut response: reqwest::Response) -> Result<Vec<u8>, ()> {
     Ok(result)
 }
 
-pub(super) async fn inspect_card(client: &Client, card: &Url) -> Result<Card, &'static str> {
+pub(super) async fn inspect_card(
+    client: &Client,
+    card: &Url,
+    approved: &Url,
+) -> Result<Card, &'static str> {
     let unavailable = "a2a_card_unavailable";
     let response = client
         .get(card.clone())
         .timeout(RPC_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json")
+        .header("A2A-Version", PROTOCOL_VERSION)
         .send()
         .await
         .map_err(|_| unavailable)?;
     let bytes = limited_body(response).await.map_err(|_| unavailable)?;
     let value = serde_json::from_slice(&bytes).map_err(|_| CARD_INVALID)?;
-    parse_card(card, &value)
+    parse_card(approved, &value)
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ResultKind {
+    Message,
+    Task,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub(super) struct Answer {
+    result_kind: ResultKind,
     pub text: String,
-    pub context_id: String,
+    pub context_id: Option<String>,
     pub task_id: Option<String>,
 }
 
@@ -260,7 +286,7 @@ fn rpc_request(
         .post(endpoint.clone())
         .timeout(RPC_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json")
-        .header("A2A-Version", "1.0")
+        .header("A2A-Version", PROTOCOL_VERSION)
         .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}));
     if let Some(token) = bearer {
         request = request.bearer_auth(token);
@@ -280,6 +306,16 @@ async fn rpc(
         .send()
         .await
         .map_err(|_| UNKNOWN)?;
+    // These statuses explicitly reject the send. A refused GetTask after an
+    // accepted send cannot establish that the task itself was rejected.
+    if method == "SendMessage"
+        && matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        )
+    {
+        return Err("a2a_peer_access_denied");
+    }
     let bytes = limited_body(response).await.map_err(|_| UNKNOWN)?;
     envelope(&bytes, &id)
 }
@@ -288,6 +324,16 @@ fn text_parts(parts: &Value) -> Result<String, &'static str> {
     let mut text = String::new();
     for part in parts.as_array().ok_or(INVALID)? {
         let piece = part["text"].as_str().ok_or(INVALID)?;
+        if let Some(media) = part.get("mediaType") {
+            let mode: mime_guess::mime::Mime = media
+                .as_str()
+                .ok_or(INVALID)?
+                .parse()
+                .map_err(|_| INVALID)?;
+            if mode.essence_str() != "text/plain" || !utf8_params(&mode) {
+                return Err(INVALID);
+            }
+        }
         if ["data", "raw", "url", "file"]
             .iter()
             .any(|field| part.get(field).is_some())
@@ -341,26 +387,27 @@ where
         return Err("a2a_invalid_input");
     }
     let deadline = tokio::time::Instant::now() + TOTAL_TIMEOUT;
-    let context_id = uuid::Uuid::new_v4().to_string();
     let message_id = uuid::Uuid::new_v4().to_string();
     let result = call("SendMessage", json!({
-        "message":{"role":"ROLE_USER","messageId":message_id,"contextId":context_id,"parts":[{"text":text}]},
+        "message":{"role":"ROLE_USER","messageId":message_id,"parts":[{"text":text}]},
         "configuration":{"acceptedOutputModes":["text/plain"],"returnImmediately":true,"historyLength":0}
     })).await?;
     match (result.get("message"), result.get("task")) {
         (Some(message), None) => {
             let id = bounded_label(&message["messageId"]).ok_or(INVALID)?;
-            if message["role"] != "ROLE_AGENT"
-                || message["contextId"] != context_id
-                || id == message_id
-            {
+            if message["role"] != "ROLE_AGENT" || id == message_id {
                 return Err(INVALID);
             }
+            let context_id = message
+                .get("contextId")
+                .map(|v| bounded_label(v).map(str::to_owned).ok_or(INVALID))
+                .transpose()?;
             let task_id = message
                 .get("taskId")
                 .map(|t| bounded_label(t).map(str::to_owned).ok_or(INVALID))
                 .transpose()?;
             Ok(Answer {
+                result_kind: ResultKind::Message,
                 text: text_parts(&message["parts"])?,
                 context_id,
                 task_id,
@@ -368,7 +415,8 @@ where
         }
         (None, Some(task)) => {
             let id = bounded_label(&task["id"]).ok_or(UNKNOWN)?;
-            let mut answer = task_result(task, id, &context_id)?;
+            let context_id = bounded_label(&task["contextId"]).ok_or(UNCONFIRMED)?;
+            let mut answer = task_result(task, id, context_id)?;
             for _ in 0..polls {
                 if answer.is_some() {
                     break;
@@ -383,11 +431,12 @@ where
                 .await
                 .map_err(|_| UNCONFIRMED)?
                 .map_err(|_| UNCONFIRMED)?;
-                answer = task_result(&read, id, &context_id)?;
+                answer = task_result(&read, id, context_id)?;
             }
             Ok(Answer {
+                result_kind: ResultKind::Task,
                 text: answer.ok_or("a2a_task_pending")?,
-                context_id,
+                context_id: Some(context_id.to_owned()),
                 task_id: Some(id.to_owned()),
             })
         }
@@ -407,7 +456,12 @@ pub(super) async fn invoke(
     .await?;
     // Never pass a reflected transport credential on to the API caller.
     if bearer.is_some_and(|s| {
-        answer.text.contains(s) || answer.task_id.as_deref().is_some_and(|id| id.contains(s))
+        answer.text.contains(s)
+            || answer.task_id.as_deref().is_some_and(|id| id.contains(s))
+            || answer
+                .context_id
+                .as_deref()
+                .is_some_and(|id| id.contains(s))
     }) {
         return Err(INVALID);
     }
@@ -420,7 +474,7 @@ mod tests {
     use serde_json::json;
 
     fn location() -> Url {
-        Url::parse("https://agent.example/.well-known/agent-card.json").unwrap()
+        Url::parse("https://agent.example/rpc").unwrap()
     }
 
     fn card() -> Value {
@@ -441,6 +495,184 @@ mod tests {
         assert_eq!(parsed.endpoint.as_str(), "https://agent.example/rpc");
         assert_eq!(parsed.name, "Counting agent");
         assert!(!parsed.requires_bearer);
+    }
+
+    #[test]
+    fn selects_only_the_approved_interface_among_backups_and_ignores_patch() {
+        let mut c = card();
+        c["supportedInterfaces"][1]["protocolVersion"] = json!("1.0.7");
+        c["supportedInterfaces"].as_array_mut().unwrap().insert(0,
+            json!({"protocolBinding":"JSONRPC","protocolVersion":"1.0","url":"https://agent.example/backup"}));
+        assert_eq!(
+            parse_card(&location(), &c).unwrap().endpoint.as_str(),
+            "https://agent.example/rpc"
+        );
+        for incompatible in ["1.1", "1.00", "1.0.", "1.0.a", "1.0.1.2", "1.0.1-beta"] {
+            c["supportedInterfaces"][2]["protocolVersion"] = json!(incompatible);
+            assert!(parse_card(&location(), &c).is_err(), "{incompatible}");
+        }
+    }
+
+    #[test]
+    fn returned_parts_must_be_concrete_plain_utf8_text() {
+        for media in [
+            json!("text/html"),
+            json!("text/*"),
+            json!("*/*"),
+            json!("text/plain; charset=iso-8859-1"),
+            json!("text/plain; x=7"),
+            json!(4),
+            Value::Null,
+        ] {
+            assert_eq!(
+                text_parts(&json!([{"text":"x","mediaType":media}])),
+                Err(INVALID),
+                "{media}"
+            );
+        }
+        assert_eq!(
+            text_parts(
+                &json!([{"text":"plain"},{"text":" text","mediaType":"TEXT/PLAIN; charset=UTF-8"}])
+            )
+            .unwrap(),
+            "plain text"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_distinguishes_peer_access_refusal_from_uncertain_delivery() {
+        use axum::{Router, http::StatusCode, routing::post};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let origin = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let app = Router::new()
+            .route(
+                "/anonymous",
+                post(|| async { (StatusCode::UNAUTHORIZED, "private detail") }),
+            )
+            .route(
+                "/forbidden",
+                post(|| async { (StatusCode::FORBIDDEN, "private detail") }),
+            )
+            .route(
+                "/unavailable",
+                post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::builder().no_proxy().build().unwrap();
+        for (path, expected) in [
+            ("anonymous", "a2a_peer_access_denied"),
+            ("forbidden", "a2a_peer_access_denied"),
+            ("unavailable", "a2a_submission_unknown"),
+        ] {
+            assert_eq!(
+                invoke(&client, &origin.join(path).unwrap(), None, "text")
+                    .await
+                    .unwrap_err(),
+                expected,
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn independent_http_peer_requires_version_and_owns_the_initial_context() {
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, StatusCode},
+            routing::{get, post},
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let card_url = base.join(".well-known/agent-card.json").unwrap();
+        let endpoint = base.join("rpc").unwrap();
+        let mut document = card();
+        document["supportedInterfaces"] = json!([
+            {"protocolBinding":"JSONRPC","protocolVersion":"1.0","url":base.join("backup").unwrap().as_str()},
+            {"protocolBinding":"JSONRPC","protocolVersion":"1.0.3","url":endpoint.as_str()}
+        ]);
+        fn version_one(h: &HeaderMap) -> bool {
+            h.get("a2a-version").and_then(|s| s.to_str().ok()) == Some("1.0")
+        }
+        async fn peer_rpc(h: HeaderMap, Json(v): Json<Value>) -> Result<Json<Value>, StatusCode> {
+            if !version_one(&h) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let msg = &v["params"]["message"];
+            let result = match v["method"].as_str() {
+                Some("SendMessage")
+                    if msg.get("contextId").is_none()
+                        && msg.get("taskId").is_none()
+                        && msg["role"] == "ROLE_USER"
+                        && msg["messageId"].is_string() =>
+                {
+                    match msg["parts"][0]["text"].as_str() {
+                        Some("direct") => {
+                            json!({"message":{"role":"ROLE_AGENT","messageId":"reply","taskId":"referenced","parts":[{"text":"direct reply"}]}})
+                        }
+                        Some("task") => {
+                            json!({"task":{"id":"assigned","contextId":"group","status":{"state":"TASK_STATE_WORKING"}}})
+                        }
+                        Some("reflection") => {
+                            json!({"message":{"role":"ROLE_AGENT","messageId":"reply","contextId":"echo-secret","parts":[{"text":"reply"}]}})
+                        }
+                        _ => return Err(StatusCode::BAD_REQUEST),
+                    }
+                }
+                Some("GetTask") if v["params"]["id"] == "assigned" => {
+                    json!({"id":"assigned","contextId":"group","status":{"state":"TASK_STATE_COMPLETED"},
+                    "artifacts":[{"artifactId":"output","parts":[{"text":"task artifact","mediaType":"text/plain"}]}]})
+                }
+                _ => return Err(StatusCode::BAD_REQUEST),
+            };
+            Ok(Json(json!({"jsonrpc":"2.0","id":v["id"],"result":result})))
+        }
+        let discovery = get(move |h: HeaderMap| async move {
+            if !version_one(&h) || h.contains_key("authorization") {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(Json(document))
+        });
+        let peer = Router::new()
+            .route("/.well-known/agent-card.json", discovery)
+            .route("/rpc", post(peer_rpc));
+        let server = tokio::spawn(async move { axum::serve(listener, peer).await.unwrap() });
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let selected = inspect_card(&client, &card_url, &endpoint).await.unwrap();
+        assert_eq!(selected.endpoint, endpoint);
+        let direct = invoke(&client, &selected.endpoint, None, "direct")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(direct).unwrap(),
+            json!({"result_kind":"message","text":"direct reply","task_id":"referenced","context_id":null})
+        );
+        let completed = invoke(&client, &selected.endpoint, None, "task")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(completed).unwrap(),
+            json!({"result_kind":"task","text":"task artifact","task_id":"assigned","context_id":"group"})
+        );
+        assert_eq!(
+            invoke(
+                &client,
+                &selected.endpoint,
+                Some("echo-secret"),
+                "reflection"
+            )
+            .await
+            .unwrap_err(),
+            INVALID
+        );
+        server.abort();
     }
 
     #[test]
@@ -631,26 +863,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_actual_agent_text_only_from_the_submitted_context() {
-        for (role, same, expected) in [
-            ("ROLE_AGENT", true, Some("seventeen")),
-            ("ROLE_USER", true, None),
-            ("ROLE_AGENT", false, None),
+    async fn accepts_only_a_distinct_agent_message_with_an_optional_peer_context() {
+        for (role, context, expected) in [
+            ("ROLE_AGENT", json!("remote"), Some("seventeen")),
+            ("ROLE_USER", json!("remote"), None),
+            ("ROLE_AGENT", Value::Null, None),
+            ("ROLE_AGENT", json!(""), None),
         ] {
             let reply = exchange("add eight and nine", 1, Duration::ZERO, |method, params| {
                 assert_eq!(method, "SendMessage");
                 let msg = &params["message"];
                 assert_eq!(msg["role"], "ROLE_USER");
                 assert_eq!(msg["parts"], json!([{"text":"add eight and nine"}]));
-                for field in ["contextId", "messageId"] {
-                    assert!(uuid::Uuid::parse_str(msg[field].as_str().unwrap()).is_ok());
-                }
-                assert_ne!(msg["contextId"], msg["messageId"]);
-                let context = if same {
-                    &msg["contextId"]
-                } else {
-                    &Value::Null
-                };
+                assert!(uuid::Uuid::parse_str(msg["messageId"].as_str().unwrap()).is_ok());
+                assert!(msg.get("contextId").is_none());
                 std::future::ready(Ok(
                     json!({"message":{"role":role,"messageId":"answer-1","contextId":context,
                     "parts":[{"text":"seven"},{"text":"teen"}]}}),
@@ -663,7 +889,10 @@ mod tests {
             );
             if let Ok(answer) = reply {
                 assert!(answer.task_id.is_none());
-                assert!(!answer.context_id.is_empty());
+                assert_eq!(
+                    serde_json::to_value(answer).unwrap()["context_id"],
+                    "remote"
+                );
             }
         }
     }
@@ -671,11 +900,11 @@ mod tests {
     #[tokio::test]
     async fn submits_once_and_polls_only_the_acknowledged_task() {
         let mut calls = Vec::new();
-        let mut context = Value::Null;
+        let context = json!("peer-context");
         let answer = exchange("probe", 2, Duration::ZERO, |method, params| {
             calls.push(method);
             std::future::ready(Ok(if method == "SendMessage" {
-                context = params["message"]["contextId"].clone();
+                assert!(params["message"].get("contextId").is_none());
                 json!({"task":{"id":"t-1","contextId":context,"status":{"state":"TASK_STATE_SUBMITTED"}}})
             } else {
                 assert_eq!(params["id"], "t-1");
@@ -686,7 +915,7 @@ mod tests {
         assert_eq!(calls, ["SendMessage", "GetTask"]);
         assert_eq!(answer.text, "17");
         assert_eq!(answer.task_id.as_deref(), Some("t-1"));
-        assert_eq!(context, answer.context_id);
+        assert_eq!(context, serde_json::to_value(answer).unwrap()["context_id"]);
     }
 
     #[tokio::test]
@@ -701,10 +930,10 @@ mod tests {
         assert_eq!(sends, 1);
         let mut calls = Vec::new();
         let mut task = Value::Null;
-        let pending = exchange("probe", 2, Duration::ZERO, |method, p| {
+        let pending = exchange("probe", 2, Duration::ZERO, |method, _| {
             calls.push(method);
             std::future::ready(Ok(if method=="SendMessage" {
-                task=json!({"id":"t","contextId":p["message"]["contextId"],"status":{"state":"TASK_STATE_WORKING"}});
+                task=json!({"id":"t","contextId":"peer-context","status":{"state":"TASK_STATE_WORKING"}});
                 json!({"task":task})
             } else {task.clone()}))
         }).await;
@@ -718,15 +947,16 @@ mod tests {
             "mixed",
             "wrong-id",
             "wrong-context",
+            "missing-context",
             "failed",
             "no-artifact",
             "ambiguous",
         ] {
-            let mut context = Value::Null;
-            let answer = exchange("probe",1,Duration::ZERO, |method, params| {
+            let context = json!("peer-context");
+            let answer = exchange("probe",1,Duration::ZERO, |method, _| {
                 std::future::ready(Ok(if method=="SendMessage" {
-                    context = params["message"]["contextId"].clone();
                     let mut r=json!({"task":{"id":"t","contextId":context,"status":{"state":"TASK_STATE_WORKING"}}});
+                    if variant=="missing-context" {r["task"].as_object_mut().unwrap().remove("contextId");}
                     if variant=="ambiguous" {r["message"]=json!({});} r
                 } else {
                     let mut t=json!({"id":"t","contextId":context,"status":{"state":"TASK_STATE_COMPLETED"},
@@ -742,7 +972,13 @@ mod tests {
                     t
                 }))
             }).await;
-            assert!(answer.is_err(), "{variant}");
+            let expected = match variant {
+                "wrong-id" | "wrong-context" | "missing-context" => UNCONFIRMED,
+                "failed" => "a2a_task_failed",
+                "ambiguous" => UNKNOWN,
+                _ => INVALID,
+            };
+            assert_eq!(answer.unwrap_err(), expected, "{variant}");
         }
     }
 }

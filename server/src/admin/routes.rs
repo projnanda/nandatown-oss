@@ -80,7 +80,22 @@ async fn deploy(
 
     // Resolve the catalog agent (if any) once — used for both secret resolution and
     // UUID-keying so this ad-hoc deploy converges with the upload/update/import paths.
-    let resolved_agent_id = resolve_agent_id_by_name(&state, &req.name).await;
+    // Resolve identity, ownership and external classification in ONE snapshot.
+    // External registration mints a fresh UUID; it can never add a binding to
+    // an existing ordinary agent after this lookup. A disconnect that wins
+    // first leaves a tombstone, not an unclaimed ad-hoc container identity.
+    let target = sqlx::query_as::<_, (Uuid, Uuid, bool, bool)>(
+        "SELECT a.id, a.owner_id, a.deleted_at IS NOT NULL,
+                EXISTS (SELECT 1 FROM nanda_external_connections c WHERE c.agent_id = a.id)
+         FROM agents a
+         WHERE (a.id = $1 OR ($1 IS NULL AND a.name = $2))
+           AND (a.deleted_at IS NULL OR a.id = $1 OR a.name = 'external-' || a.id::text)
+         ORDER BY a.deleted_at NULLS FIRST LIMIT 1",
+    )
+    .bind(req.name.parse::<Uuid>().ok())
+    .bind(&req.name)
+    .fetch_optional(&state.db)
+    .await;
 
     // If this name maps to an existing catalog agent, the caller must own it (or
     // be superuser) before we resolve and inject ITS secrets (`agent_secrets`,
@@ -90,11 +105,25 @@ async fn deploy(
     // image under that agent's name and reading them back out. A name with no
     // catalog entry has no owner to check (first-deploy-wins, same reasoning as
     // the ad-hoc `restart` fallback below).
-    if let Some(agent_id) = resolved_agent_id
-        && !crate::acl::can_manage_agent(&state, &claims, agent_id).await
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
+    let resolved_agent_id = match target {
+        Err(e) => {
+            tracing::error!(%e, "deploy: catalog lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Ok(Some((_, _, true, _))) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Some((_, owner, _, _))) if owner != owner_id && !claims.is_superuser => {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        Ok(Some((_, _, _, true))) => {
+            return (
+                StatusCode::CONFLICT,
+                "external connections have no managed workload",
+            )
+                .into_response();
+        }
+        Ok(Some((id, _, _, _))) => Some(id),
+        Ok(None) => None,
+    };
     if let Some(agent_id) = resolved_agent_id
         && let Some(refusal) = refuse_harness_agent(&state, agent_id).await
     {
@@ -277,7 +306,7 @@ async fn deploy(
     match outcome {
         Ok(status) => {
             // Update the catalog URL + record deployment (fire-and-forget).
-            if let Some(agent_id) = resolve_agent_id_by_name(&state, &req.name).await {
+            if let Some(agent_id) = resolved_agent_id {
                 let db = state.db.clone();
                 // Readiness-independent (a fresh k8s Deployment is never
                 // Ready by the time deploy() returns) — same fix as the
@@ -319,7 +348,7 @@ async fn deploy(
                     // the catalog, so restart (which needs `image` to redeploy) works
                     // for agents deployed through this ad-hoc path too.
                     let _ = sqlx::query(
-                        "UPDATE agents SET url = COALESCE(NULLIF($1, ''), url), image = $2, status = 'running', writable = $4, writable_path = $5, updated_at = now() WHERE id = $3",
+                        "UPDATE agents SET url = COALESCE(NULLIF($1, ''), url), image = $2, status = 'running', writable = $4, writable_path = $5, updated_at = now() WHERE id = $3 AND deleted_at IS NULL",
                     )
                     .bind(&endpoint)
                     .bind(&image)

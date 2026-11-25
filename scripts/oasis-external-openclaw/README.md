@@ -36,13 +36,13 @@ The one-shot control exits after the test. The persistent agent can answer local
 
 1. Use the supported onboarding flow to register the separately operated agent's card without deploying a copy. Select an interface by **binding and version**. This fixture advertises JSON-RPC 1.0; another agent may prefer gRPC yet also advertise a compatible JSON-RPC interface.
 2. Configure a destination-specific peer credential using the build's supported secret mechanism. The public card is discovery information, not permission to invoke the agent. If that mechanism or network path is unavailable, record the missing prerequisite and stop.
-3. Start a fresh conversation. Record its context ID from the outgoing request (or a documented mapping), and submit the exact fixture question **through Oasis**, once. The Oasis caller must receive the answer `17` for this run. A task UUID, acknowledgement, missing answer or different answer does not pass. Record the caller's answer and the remote OpenClaw task UUID, then independently read that task with the identifiers **from this run**:
+3. For the offline fixture, use the [native onboarding proof](../../docs/NANDA_EXTERNAL_A2A.md#local-proof-with-openclaw-no-model-account). It submits one addition question **through Oasis** with a new UUIDv4 challenge. It requires `17 / <challenge>` and the same answer on a separate read of OpenClaw's task store. To repeat only the read:
 
    ```sh
-   docker compose exec -T agent node /fixture.mjs verify 'paste-remote-task-uuid' 'paste-original-context-id'
+   docker compose exec -T agent node /fixture.mjs verify 'remote-task-id' 'remote-context-id' 'original-challenge'
    ```
 
-   Replace the placeholders with the actual IDs before running. This sends only `GetTask`. It requires matching IDs, a completed state and one matching text artifact (`17`). If the task is pending, repeat the read later, not the original request. If Oasis can't expose the corresponding identifiers, report that correlation is unverified. The fixture read alone cannot tell who submitted the task: retain the Oasis-side result too. Earlier direct-control IDs are not evidence for a later Oasis run. For another agent, use its own expected outcome and independent readback.
+   Use the actual IDs from that run. This sends only `GetTask`. A prior passing task cannot satisfy a new challenge. Keep the Oasis-side answer as well: the storage read alone does not identify the caller. For a different agent, choose a known semantic outcome and an independent way to verify it.
 4. Capture the first step that failed, or the successful result and rerun instructions. Include only synthetic inputs, non-secret identifiers and the observed result. If the remote outcome is unknown, look up the existing task rather than sending the question again.
 
 ## If the external agent wants to use the Oasis model or tool gateway
@@ -52,7 +52,7 @@ This traffic runs in the opposite direction. On a disposable developer machine, 
 - **Model calls:** the [sample LangGraph planner](../a2a-discovery-e2e/langgraph/graph.py) needs no code change. Restart it with `OPENAI_BASE_URL=<Oasis origin>/v1` and the **agent-specific Oasis token** as `OPENAI_API_KEY`, supplied through its private environment. Send one message to the planner. As the owner, check its answer and the input/output token counts for that catalog agent in FinOps. The agent does not need the platform's provider key.
 - **Tool calls:** load the separate `MCP_GATEWAY_URL` and `MCP_GATEWAY_TOKEN` into an MCP client, as in the [LangGraph snippet](../a2a-discovery-e2e/mcp_langgraph.py). A successful tool list is not a successful tool invocation; check the result of a known, permitted tool.
 
-Neither configuration lets Oasis invoke the external agent. These checks do not require a public OpenTelemetry collector or establish lower costs.
+The gateway enrollment has its own discovered agent ID, separate from the inbound A2A connection ID. Look up model usage under the discovered ID. Revoking one direction does not revoke the other's credentials. Neither configuration lets Oasis invoke the external agent; these checks do not require a public OpenTelemetry collector or establish lower costs.
 
 ## Optional: one real model answer
 

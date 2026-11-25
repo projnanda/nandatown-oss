@@ -103,6 +103,11 @@ pub struct Identity {
 #[async_trait]
 pub trait AuthService: Send + Sync + 'static {
     async fn validate_token(&self, token: &str) -> Result<Identity, AuthError>;
+    /// Did this auth service issue this credential? Used only to refuse forwarding
+    /// to an external peer; an edition without a local classifier must fail closed.
+    fn has_local_issuer_signature(&self, _token: &str) -> Result<bool, AuthError> {
+        Err(AuthError::Unsupported)
+    }
     async fn issue_token(&self, identity: &Identity) -> Result<String, AuthError>;
     /// Mint a short-lived, scoped, audience-bound token FROM an authenticated
     /// session (ui/docs/adr/0001a). The token is recorded like a session so
@@ -471,6 +476,14 @@ impl SimpleJwtAuth {
 
 #[async_trait]
 impl AuthService for SimpleJwtAuth {
+    fn has_local_issuer_signature(&self, token: &str) -> Result<bool, AuthError> {
+        Ok(jwt::has_hmac_issuer_signature(
+            token,
+            &self.secret,
+            jsonwebtoken::Algorithm::HS256,
+        ))
+    }
+
     async fn validate_token(&self, token: &str) -> Result<Identity, AuthError> {
         jwt::decode_jwt(&self.secret, token)
     }

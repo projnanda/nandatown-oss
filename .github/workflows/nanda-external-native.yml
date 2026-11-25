@@ -18,11 +18,14 @@ on:
       - 'server/src/lib.rs'
       - 'server/src/state.rs'
       - 'server/tests/nanda_external_registration.rs'
+      - 'server/tests/agent_update_rollback.rs'
       - 'server/tests/common/**'
       - 'server/build.rs'
       - 'server/Cargo.toml'
       - 'spa/**'
       - 'auth/**'
+      - 'mcp-gateway/src/agent_tokens.rs'
+      - 'session-token/src/lib.rs'
       - 'config/**'
       - 'secrets/**'
       - 'migrations/**'
@@ -111,6 +114,7 @@ jobs:
           cargo build --locked -p nasiko-server --bin nasiko-server
           cargo test --locked -p nasiko-server --lib nanda_external::
           cargo test --locked -p nasiko-server --test nanda_external_registration -- --test-threads=1
+          cargo test --locked -p nasiko-server --test agent_update_rollback update_by_different_superuser_queues_job_with_real_owner -- --exact
       - name: Run a real member's browser against Oasis and offline OpenClaw
         env:
           ADMIN_USERNAME: oasis-ci

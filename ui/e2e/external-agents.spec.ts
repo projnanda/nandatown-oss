@@ -268,3 +268,35 @@ test('a non-loopback HTTP Town never accepts a peer token', async ({ page }) => 
   await expect(page.getByRole('button', { name: 'Connect agent' })).toBeDisabled()
   await expect(page.getByText(/open Town over HTTPS/i)).toBeVisible()
 })
+
+test('a refused transport or peer credential has a specific recovery without logging out', async ({
+  page,
+}) => {
+  const peer = { id: 'one', name: 'Fixture', card_url: card, endpoint, auth_mode: 'bearer' }
+  let sends = 0
+  await page.route('https://town.example/**', (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === api && route.request().method() === 'GET') return route.fulfill({ json: [peer] })
+    if (path === api + '/preview')
+      return route.fulfill({ json: { name: peer.name, endpoint, requires_bearer: true } })
+    if (path === api)
+      return route.fulfill({ status: 400, json: { error: 'secure_transport_required' } })
+    if (path === api + '/one/tasks') {
+      sends++
+      return route.fulfill({ status: 422, json: { error: 'a2a_peer_access_denied' } })
+    }
+    return route.fulfill({ contentType: 'text/html', body: standalone() })
+  })
+  await page.goto('https://town.example/nanda/external-agents')
+  await page.getByLabel('Agent card URL').fill(card)
+  await page.getByRole('button', { name: 'Preview card' }).click()
+  await page.getByLabel('Dedicated peer bearer token').check()
+  await page.getByLabel('Peer token', { exact: true }).fill('synthetic-only')
+  await page.getByRole('button', { name: 'Connect agent', exact: true }).click()
+  await expect(page.locator('#add-status')).toContainText('trusted proxy')
+  await page.getByLabel('Task to send').fill('hello')
+  await page.getByRole('button', { name: 'Send one task' }).click()
+  await expect(page.locator('#task-status')).toContainText('peer refused access')
+  await expect(page.locator('#signin')).toBeHidden()
+  expect(sends).toBe(1)
+})

@@ -233,16 +233,19 @@
         a2a_card_invalid: 'The response was not a valid supported agent card.',
         a2a_card_unsupported: 'The card must offer one supported A2A 1.0 JSON-RPC interface.',
         a2a_security_unsupported: 'The card requires an authentication scheme this connector does not support.',
+        a2a_peer_access_denied: 'The peer refused access to this task. Check the required permissions with its operator; to change the peer credential, disconnect and reconnect with a dedicated bearer. Town did not resend the task.',
         a2a_invalid_result: 'The agent returned an ambiguous or invalid result; no answer was confirmed.',
         a2a_task_pending: 'The task remained pending; no answer was confirmed.',
         a2a_task_unconfirmed: 'The remote task could not be confirmed.',
         invalid_peer_auth: 'Check the connection mode and re-enter a dedicated peer token if needed.',
+        secure_transport_required: 'Town could not verify a secure connection. Open the HTTPS operator URL, or ask your administrator to check the trusted proxy.',
         connection_exists: 'Already connected. Refresh your connections to select the existing agent.',
         connection_busy: 'This connection is busy. Wait for the in-flight task to finish.',
       };
       const code = payload?.error;
-      const message = typeof code === 'string' && Object.hasOwn(codes, code) ? codes[code] : reasons[r.status];
-      throw new Error((message || 'Town could not finish the request.') + ' (HTTP ' + r.status + ')');
+      const known = typeof code === 'string' && Object.hasOwn(codes, code) ? code : undefined;
+      const message = known ? codes[known] : reasons[r.status];
+      throw new Error((message || 'Town could not finish the request.') + ' (HTTP ' + r.status + ')', {cause: known});
     }
     return payload;
   }
@@ -256,7 +259,7 @@
     catch (e) {
       if (active !== request) return;
       const reason = e instanceof TypeError || e instanceof SyntaxError ? 'No usable response from Town.' : e.message;
-      show(status, [reason, caution].filter(Boolean).join(' '));
+      show(status, [reason, e.cause === 'a2a_peer_access_denied' ? '' : caution].filter(Boolean).join(' '));
     } finally {
       if (active === request) { active = null; busy = false; controls(); focus?.focus(); }
     }

@@ -1,8 +1,11 @@
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Request, State, rejection::JsonRejection},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware,
     response::{IntoResponse, Response},
@@ -10,6 +13,7 @@ use axum::{
 };
 use nasiko_secrets::SecretsCrypto;
 use serde::{Deserialize, Serialize};
+use sqlx::Connection as _;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
@@ -109,6 +113,8 @@ fn external_error(code: &'static str) -> Failure {
         | "a2a_security_unsupported"
         | "a2a_card_unsupported"
         | "a2a_card_invalid" => StatusCode::BAD_REQUEST,
+        // The caller's Town session is valid; it is the peer that denied the send.
+        "a2a_peer_access_denied" => StatusCode::UNPROCESSABLE_ENTITY,
         "a2a_task_pending" | "a2a_task_unconfirmed" => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::BAD_GATEWAY,
     };
@@ -161,12 +167,12 @@ struct Preview {
 
 async fn checked_card(raw: &str) -> Out<(reqwest::Client, reqwest::Url, wire::Card)> {
     let (client, card_url, approved) = net::target(raw).await.map_err(external_error)?;
-    let card = wire::inspect_card(&client, &card_url)
+    let card = wire::inspect_card(&client, &card_url, &approved)
         .await
-        .map_err(external_error)?;
-    if card.endpoint != approved {
-        return Err(endpoint_changed());
-    }
+        .map_err(|code| match code {
+            "a2a_endpoint_changed" => endpoint_changed(),
+            _ => external_error(code),
+        })?;
     Ok((client, card_url, card))
 }
 
@@ -204,12 +210,69 @@ async fn preview(
 fn credential_aad(owner_id: Uuid, endpoint: &str) -> Vec<u8> {
     format!("nanda/external-peer/v1\0{owner_id}\0{endpoint}").into_bytes()
 }
+
+// The native server does not terminate TLS. Trust exactly one immediate
+// proxy configured by the operator, and only its single, overwritten scheme.
+fn secure_ingress(
+    proxy: Option<&str>,
+    peer: IpAddr,
+    bind: &str,
+    domain: Option<&str>,
+    headers: &HeaderMap,
+) -> bool {
+    if let Some(proxy) = proxy {
+        let mut schemes = headers.get_all("x-forwarded-proto").iter();
+        return proxy.parse::<IpAddr>().ok() == Some(peer)
+            && schemes.next().is_some_and(|h| h == "https")
+            && schemes.next().is_none();
+    }
+    cfg!(debug_assertions)
+        && domain.is_none()
+        && peer.is_loopback()
+        && bind
+            .parse::<SocketAddr>()
+            .is_ok_and(|addr| addr.ip().is_loopback())
+        && !headers
+            .keys()
+            .any(|k| k == "forwarded" || k.as_str().starts_with("x-forwarded-"))
+        && headers
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.parse::<axum::http::uri::Authority>().ok())
+            .is_some_and(|a| {
+                a.host().eq_ignore_ascii_case("localhost")
+                    || a.host()
+                        .trim_matches(['[', ']'])
+                        .parse::<IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            })
+}
+
+fn reject_town_credential(s: &AppState, candidate: &str) -> Out<()> {
+    // A login validator would reject a locally signed service/delegated JWT
+    // as the wrong kind of session; that does not make it a peer credential.
+    if nasiko_mcp_gateway::agent_tokens::has_scoped_token_format(candidate)
+        || s.auth
+            .has_local_issuer_signature(candidate)
+            .map_err(|_| crypto_unavailable())?
+        || nasiko_auth::jwt::has_hmac_issuer_signature(
+            candidate,
+            &s.config.agent_jwt_secret,
+            nasiko_session_token::parse_algorithm(&s.config.agent_jwt_algorithm),
+        )
+    {
+        return Err(auth_invalid());
+    }
+    Ok(())
+}
+
 async fn register(
     State(s): State<AppState>,
     claims: Claims,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     input: Result<Json<Registration>, JsonRejection>,
-) -> Out<(StatusCode, Json<Connection>)> {
+) -> Out<Response> {
     let owner_id = owner(&claims)?;
     let input = body(input)?;
     let token = input.peer_token.as_deref();
@@ -218,6 +281,22 @@ async fn register(
             .is_some_and(|t| crate::auth::middleware::extract_token(&headers).as_deref() == Some(t))
     {
         return Err(auth_invalid());
+    }
+    if let Some(token) = token {
+        let proxy = std::env::var_os("NANDA_EXTERNAL_A2A_TLS_PROXY_IP");
+        if !secure_ingress(
+            proxy.as_ref().map(|v| v.to_str().unwrap_or("")),
+            peer.ip(),
+            &s.config.bind,
+            s.config.domain.as_deref(),
+            &headers,
+        ) {
+            return Err(Failure(
+                StatusCode::BAD_REQUEST,
+                "secure_transport_required",
+            ));
+        }
+        reject_town_credential(&s, token)?;
     }
     let _permit = outbound_slot()?;
     let (_, card_url, card) = checked_card(&input.card_url).await?;
@@ -238,10 +317,11 @@ async fn register(
         .transpose()?;
     let mut tx = s.db.begin().await.map_err(db_error)?;
     let slug = format!("external-{id}");
-    s.agent_admission
-        .admit(&mut tx, owner_id, &slug)
-        .await
-        .map_err(|(status, _)| Failure(status, "catalog_admission_refused"))?;
+    // AgentAdmission returns the edition's caller-facing refusal; it only
+    // receives the generated slug and owner, never the peer URL or credential.
+    if let Err(refusal) = s.agent_admission.admit(&mut tx, owner_id, &slug).await {
+        return Ok(refusal.into_response());
+    }
     // Stable unique internal slug; no runtime address, loadable peer card,
     // credentials, deployment request, or generic access grants on the agent.
     sqlx::query(
@@ -287,7 +367,8 @@ async fn register(
             endpoint: endpoint.to_owned(),
             auth_mode: input.auth_mode,
         }),
-    ))
+    )
+        .into_response())
 }
 
 // Lock the catalog row too: a successful generic soft delete / ownership
@@ -331,7 +412,17 @@ async fn task(
         return Err(Failure(StatusCode::BAD_REQUEST, "invalid_task_text"));
     }
     let _permit = outbound_slot()?;
-    let mut tx = s.db.begin().await.map_err(db_error)?;
+    // Preserve the lock/disconnect ordering without holding a general-purpose
+    // pool slot for an external service's entire response window. At most two
+    // dedicated connections exist per server process, both scoped to requests.
+    let mut outbound_db = tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::PgConnection::connect_with(&s.db.connect_options()),
+    )
+    .await
+    .map_err(|_| Failure(StatusCode::SERVICE_UNAVAILABLE, "a2a_capacity"))?
+    .map_err(db_error)?;
+    let mut tx = outbound_db.begin().await.map_err(db_error)?;
     let binding = lock_binding(&mut tx, id, owner_id).await?;
     let (client, _, card) = checked_card(&binding.card_url).await?;
     if card.endpoint.as_str() != binding.endpoint {
@@ -349,6 +440,9 @@ async fn task(
         ),
         _ => return Err(crypto_unavailable()),
     };
+    if let Some(token) = token.as_deref() {
+        reject_town_credential(&s, token)?;
+    }
     let answer = wire::invoke(&client, &card.endpoint, token.as_deref(), &input.text)
         .await
         .map_err(external_error)?;
@@ -367,7 +461,7 @@ async fn disconnect(
     let mut tx = s.db.begin().await.map_err(db_error)?;
     lock_binding(&mut tx, id, owner_id).await?;
     sqlx::query(
-        "UPDATE agents SET deleted_at=now(),updated_at=now()
+        "UPDATE agents SET deleted_at=now(),updated_at=now(),status='stopped'
                  WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL",
     )
     .bind(id)
@@ -378,6 +472,7 @@ async fn disconnect(
     // The migration's trigger destroys the binding+secret in this same
     // transaction, including when a caller uses the generic catalog delete.
     tx.commit().await.map_err(db_error)?;
+    crate::agent_lifecycle::after_soft_delete(&s, id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -398,6 +493,79 @@ fn credentials_match(mode: &str, token: Option<&str>, required: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tls_proxy_is_one_socket_peer_with_one_https_scheme() {
+        let proxy = "192.0.2.5";
+        let peer = proxy.parse().unwrap();
+        let mut headers = HeaderMap::new();
+        assert!(!secure_ingress(
+            Some(proxy),
+            peer,
+            "0.0.0.0:8080",
+            None,
+            &headers
+        ));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(secure_ingress(
+            Some(proxy),
+            peer,
+            "0.0.0.0:8080",
+            None,
+            &headers
+        ));
+        assert!(!secure_ingress(
+            Some(proxy),
+            "192.0.2.6".parse().unwrap(),
+            "0.0.0.0:8080",
+            None,
+            &headers
+        ));
+        headers.append("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert!(!secure_ingress(
+            Some(proxy),
+            peer,
+            "0.0.0.0:8080",
+            None,
+            &headers
+        ));
+    }
+
+    #[test]
+    fn debug_local_exception_requires_a_direct_local_listener_and_host() {
+        let peer = "127.0.0.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("[::1]:8080"));
+        assert_eq!(
+            secure_ingress(None, peer, "127.0.0.1:8080", None, &headers),
+            cfg!(debug_assertions)
+        );
+        assert!(!secure_ingress(None, peer, "0.0.0.0:8080", None, &headers));
+        assert!(!secure_ingress(
+            None,
+            peer,
+            "127.0.0.1:8080",
+            Some("example.invalid"),
+            &headers
+        ));
+        headers.insert(header::HOST, HeaderValue::from_static("example.invalid"));
+        assert!(!secure_ingress(
+            None,
+            peer,
+            "127.0.0.1:8080",
+            None,
+            &headers
+        ));
+        headers.insert(header::HOST, HeaderValue::from_static("localhost:8080"));
+        headers.insert("forwarded", HeaderValue::from_static("proto=http"));
+        assert!(!secure_ingress(
+            None,
+            peer,
+            "127.0.0.1:8080",
+            None,
+            &headers
+        ));
+    }
 
     #[test]
     fn accepts_only_the_explicitly_chosen_peer_auth() {
