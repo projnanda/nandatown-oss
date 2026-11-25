@@ -98,9 +98,9 @@
 Running more than a couple of agents quickly turns into an operations problem: *who calls whom*,
 *which key does each agent hold*, *what did that call cost*, *why did it fail?*
 
-Nandatown is a **single control-plane process** that sits in front of every agent and answers all of that.
-It terminates TLS, authenticates every request, and proxies all agent-to-agent traffic itself, so agents
-are **never publicly reachable** — every hop is a checkpoint for rate limits, ACLs, and tracing.
+Nandatown runs a control plane for agents. For agents it hosts, Town handles incoming calls so
+the agents don't need public endpoints of their own. **Already run your own agent?**
+[Connect it to Town and send your first task](docs/NANDA_EXTERNAL_A2A.md). Your agent stays on your server.
 
 **Different language, same A2A protocol** — bring your own agents in Python, Rust, Go, or TypeScript.
 No proprietary agent format, no lock-in.
@@ -201,9 +201,8 @@ flowchart LR
     OTEL --> LOKI
 ```
 
-> Every request to an agent is either dispatched by the routing engine or proxied generically — both
-> paths originate **inside** the server. Agents never receive a direct, public request, and both call
-> back out into the LLM Router and MCP Gateway rather than holding real API keys or tool credentials.
+> This diagram shows agents hosted by Town. An external agent has its own endpoint: Town can send
+> it a task, but its owner still decides whether its model and tool calls go through Town.
 
 ---
 
@@ -636,7 +635,7 @@ docs/           Design docs (architecture, protocol, conventions)
 
 - **Official docs** — **[docs.nasiko.com](https://docs.nasiko.com)** — guides, API reference, and concepts
 - **Design docs** — [`docs/`](docs/): architecture, the A2A protocol, agent lifecycle, MCP Gateway internals, CLI design, networking
-- **Bring your own agent** — [connect an external A2A agent to Town without redeploying it](docs/NANDA_EXTERNAL_A2A.md), [verify the round trip with offline OpenClaw](scripts/oasis-external-openclaw/README.md), or [let a local agent use the Nasiko model and tool gateways](scripts/a2a-discovery-e2e/MANUAL.md).
+- **Bring your own agent:** [setup guide for agent developers](docs/NANDA_EXTERNAL_A2A.md) and [a local example you can run without a model account](scripts/oasis-external-openclaw/README.md#run-a-task-through-town).
 - **A2A protocol** — https://github.com/a2aproject/a2a-spec
 - **Rust toolchain** — https://rustup.rs
 - **Docker** — https://docs.docker.com/get-docker/

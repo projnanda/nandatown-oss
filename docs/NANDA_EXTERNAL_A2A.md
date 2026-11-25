@@ -1,67 +1,114 @@
-# Connect an independently running A2A agent to Town
+# Connect your existing A2A agent to Town
 
-Use **Agents → Connect external A2A agent** (or open `/nanda/external-agents` on your Town server) to try a text task without uploading the agent, moving its model credentials, or changing who runs it. This is a private, operator-enabled NANDA integration. The agent stays on its own host; disconnecting does not stop it.
+If you already run an agent that speaks the Agent-to-Agent (A2A) protocol, you can send it a text task from Town's **Agents** page. It stays on your server. You do not need to upload its code, deploy a container to Town, give Town your model key, or install the Nasiko CLI.
 
-## Enable a destination
+## 1. Give your Town operator two URLs
 
-The Town operator approves a **destination**, not an individual caller: any signed-in workspace member may make their own private connection to an approved pair. Approve both the public card URL and its exact invocation URL. URLs containing a username, password, query string or fragment are not accepted.
+Send the URL of your **public Agent Card** and the **task endpoint** listed in that card. The card tells Town how to reach your agent; it does not grant access. For example:
 
-```sh
-export NANDA_EXTERNAL_A2A_TARGETS='[{"card_url":"https://your-agent.example/.well-known/agent-card.json","endpoint":"https://your-agent.example/a2a/v1"}]'
-```
+| What to send | Example (replace with your own) |
+| --- | --- |
+| Agent Card | `https://your-agent.example/.well-known/agent-card.json` |
+| Task endpoint | `https://your-agent.example/a2a/v1` |
 
-Without a configured destination, new previews, registrations and calls are disabled. Existing owners can still list and disconnect their connections. For a real deployment the endpoints must use HTTPS on the same origin, with public addresses. DNS answers are checked and pinned for each operation. The client does not follow redirects or use a system HTTP proxy. Start with independently operated agents whose operators consent to receiving test traffic.
+Town supports **A2A 1.0 over JSON-RPC with text input and output**. Both URLs must use public HTTPS on the same origin (scheme, host and port). Use the final URLs, without redirects, credentials, query strings or fragments. Ask the operator to [approve the pair](#for-town-operators-approve-a-destination). Do not send them a token in chat.
 
-For Compose, put the setting in the server's `.env`, then run `docker compose up -d --no-deps --force-recreate server` after adding **or removing** a pair. A [plain Compose restart](https://docs.docker.com/reference/cli/docker/compose/restart/) does not reload that file. For a native process, restart it with the changed environment.
-
-**Receiving peer credentials:** serve the operator UI and API over HTTPS. Set `NANDA_EXTERNAL_A2A_TLS_PROXY_IP` to the exact immediate reverse proxy IP, restrict access to the backend to that proxy, and have the proxy overwrite `X-Forwarded-Proto` from the actual inbound connection. Reject plaintext at the edge before it receives a bearer. The native server does not terminate TLS. The only plaintext exception is direct debug use on loopback.
-
-## Use it
-
-1. Sign in, open the external-agent page, enter the card URL, and preview it. Check the agent name and **entire invocation URL**. Preview fetches only the public card; it sends no credential or task.
-2. Choose anonymous access or enter a bearer issued specifically for this peer. Some cards omit auth information even though their agents require a token. Town refuses JWTs signed with its current login or agent-runtime keys and the reserved formats for its gateway and state tokens. It cannot identify arbitrary provider keys or other opaque credentials: never enter a model-provider key or the agent's admin token. Town encrypts the peer token and never shows it in the catalog.
-3. Connect and send one text task. To return later, open the agent in the regular catalog and choose **Send a task**. A **Task** result confirms a completed text artifact and shows the [peer-assigned context](https://a2a-protocol.org/v1.0.0/specification/#341-context-identifier-semantics) and task ID. A **Message** is a direct reply: it may omit a context or reference a task ID, but doesn't prove that task completed.
-4. Disconnect to remove the binding and its stored peer credential. Revoke that credential at the independently operated agent if appropriate. To change a connection's endpoint or credential, disconnect and register again.
-
-If the **peer** refuses access, check the dedicated credential and the permission its operator granted. Signing out of Town won't fix a peer refusal. If the transport instead loses the result, do not automatically send the task again.
-
-**Supported in this version:** a non-tenant A2A 1.0 JSON-RPC interface; explicit anonymous or dedicated bearer authentication; one text message or one completed text artifact. Pending tasks are read with `GetTask`. No streaming, OAuth negotiation, automatic resubmission, or scheduling. If the call times out or the return path breaks, the agent may already have done the work. Check with its operator before sending it again.
-
-This is a bounded interactive call, not an asynchronous job store. At most two outbound operations can run per server process. On timeout or a lost reply, this version does not provide a resumable task handle; correlate the time and task with the peer operator. The ordinary catalog URL is not a forwarding endpoint. The catalog's `is_external_connection` field represents a current binding; descriptive card metadata alone does not authorize an operation.
-
-### Local proof with OpenClaw, no model account
-
-Start the [isolated offline OpenClaw fixture](../scripts/oasis-external-openclaw/README.md#persistent-local-agent-and-relay). On the same machine, run the **native debug** Oasis server with the following configuration and a dedicated local test user:
+To check what your card actually serves, replace the example URL and run:
 
 ```sh
-unset CP_DOMAIN NANDA_EXTERNAL_A2A_TLS_PROXY_IP
-export CP_BIND=127.0.0.1:8080
-export NANDA_EXTERNAL_A2A_TARGETS='[{"card_url":"http://127.0.0.1:18916/.well-known/agent-card.json","endpoint":"http://127.0.0.1:18916/a2a/v1"}]'
+curl -i -H 'Accept: application/json' -H 'A2A-Version: 1.0' \
+  https://your-agent.example/.well-known/agent-card.json
 ```
 
-This exact pair is an opt-in exception for the offline fixture in debug builds. It is not a tunnel or a production setting. A hosted or containerized Oasis cannot use the host's loopback address to reach this fixture.
+Look for HTTP `200`, a JSON content type, and a matching entry in `supportedInterfaces`. Here is the relevant **excerpt**, not a complete Agent Card:
 
-With `OASIS_TEST_USERNAME` and `OASIS_TEST_PASSWORD` set privately for that disposable account, and Docker pointed at the fixture's engine:
+```json
+{
+  "supportedInterfaces": [
+    {"protocolBinding": "JSONRPC", "protocolVersion": "1.0", "url": "https://your-agent.example/a2a/v1"}
+  ],
+  "defaultInputModes": ["text/plain"],
+  "defaultOutputModes": ["text/plain"]
+}
+```
+
+## 2. Connect and send a task
+
+1. Sign in to Town. Open **Agents → Connect external A2A agent** (or `/nanda/external-agents`). Paste your card URL and choose **Preview card**. Check the name and the full **Task destination**. Town hasn't sent a task or credential yet.
+2. Choose **Anonymous (no token)** or **Dedicated peer bearer token**, then **Connect agent**. If your agent requires a token, use one issued just for calls to that endpoint. Never use a Town login, model-provider key, or agent admin token. Only you can use your connection.
+3. Enter a task with a known answer and choose **Send one task**. For an addition agent, try “What is 8 + 9?” Check that it answers **17**. A successful network request alone doesn't tell you whether the agent did the right thing.
+4. To use it again, find the agent in your catalog and choose **Send a task**. To remove it, choose **Disconnect**. Town removes its saved connection and credential; your agent keeps running. To rotate a token, disconnect first, revoke the old token at your agent, then connect again with the new token.
+
+**Reading the result:** A *Task* result includes the completed task's text and identifiers. A *Message* is a direct reply. It can mention a task ID without proving the task finished. Town checks pending tasks by ID; it never automatically sends the original request again.
+
+| If you see this | What to do |
+| --- | --- |
+| Town won't preview the card | Check that both URLs match the operator's approved pair and the card advertises a compatible interface. An HTTP redirect does not count. |
+| The agent refuses the task | Check the agent's token and permissions with its owner. Signing in to Town again won't fix permission at the other end. |
+| Town times out or loses the reply | Check the agent's task history before retrying. It may already have done the work. Town can't resume that call for you. |
+
+## Optional: let your agent use Town's model and tool gateways
+
+This is the **other direction**: your agent calls Town for a model or a tool. Skip it if you only want Town to send tasks to your agent. Connecting a card does not change how your agent spends tokens, grant tool access, or turn on traces.
+
+On a development machine you control, with a locally discoverable HTTP agent already running, use the [Nasiko CLI](CLI_INSTALL.md). Replace `town.example` and `planner` with your Town address and the name discovery reports:
 
 ```sh
-# From the repository root. Change the port only if your local server uses another one.
-OASIS_TEST_PORT=8080 node scripts/oasis-external-openclaw/oasis-proof.mjs
+nasiko connect oasis --url https://town.example
+nasiko agents discover
+nasiko connect planner
+nasiko status
 ```
 
-The check logs in, previews the card, creates a new private connection, and asks for the sum of 8 and 9 **through Oasis** with a fresh random run ID. It requires the answer and run ID to match both in Oasis and in an independent read of the OpenClaw task store, then disconnects. A previous successful task cannot pass. It refuses to replace a pre-existing connection. The model is a local test double; the A2A agent, Oasis server, authenticated request, storage and return path are real. This exercises the local debug destination, not a hosted HTTPS deployment.
+Run this in a private terminal: discovery reports local agents to the selected cluster, and setup can display or write credentials. Choose the model provider you want to route and, if needed, opt in to MCP tools. Keep the generated settings out of Git and logs. Restart your agent so it picks up the changes.
 
-## API and scope
+- **Models:** An OpenAI-compatible client uses `OPENAI_BASE_URL` (Town's `/v1`) and `OPENAI_API_KEY` (the agent-specific Town token). Send one synthetic model request. In **Connect → LLM router → Agents**, look up the **discovered agent**, not the incoming connection. With usage reporting enabled, check its token counts in **TokenOps → Monitor**. **TokenOps → Optimize** shows available optimization data; connecting an agent doesn't by itself save tokens.
+- **Tools:** The [MCP client example](../scripts/a2a-discovery-e2e/mcp_langgraph.py) reads `MCP_GATEWAY_URL` and its own `MCP_GATEWAY_TOKEN`. Call a harmless tool your agent is allowed to use and check its answer. The gateway tracks actual tool calls separately from model tokens; listing tools alone doesn't test a call.
 
-All routes are relative to `/api/nanda/external-agents` and require a regular signed-in owner. JSON mutations use `Content-Type: application/json`.
+This enrollment has its own agent ID and credentials, separate from your **incoming** A2A connection. Disconnecting one does not revoke the other. The [gateway walkthrough](../scripts/a2a-discovery-e2e/MANUAL.md) shows both checks and how to undo them. Its mock provider logs authorization headers; use throwaway credentials only.
 
-| Action | Request | Result |
+**OpenTelemetry (OTel):** You don't need it to send a task. This change does not provide a public receiver for an external agent's traces. If your operator offers one, ask for the authenticated OTLP endpoint for your tenant and which fields you may send. Don't expose the internal collector ports or reuse your A2A token.
+
+## For Town operators: approve a destination
+
+Only approve agents whose owners expect your traffic. Approval lets any signed-in member create their **own** connection to that destination; it does not share one member's token with another.
+
+With Docker Compose, add this line to the **repository-root `.env`**, beside `docker-compose.yml`, using the real URLs:
+
+```dotenv
+NANDA_EXTERNAL_A2A_TARGETS='[{"card_url":"https://your-agent.example/.well-known/agent-card.json","endpoint":"https://your-agent.example/a2a/v1"}]'
+```
+
+Run `docker compose up -d --no-deps --force-recreate server` after adding **or removing** a pair. A plain restart doesn't reload this file. For a native server, change its environment and restart the process. With no approved destinations, members can still list and disconnect existing connections, but cannot preview or call an agent.
+
+Serve the UI and API over HTTPS. The native server does not terminate TLS. Set `NANDA_EXTERNAL_A2A_TLS_PROXY_IP` to the IP of the proxy directly in front of Town, restrict backend access to that proxy, and have it overwrite `X-Forwarded-Proto` from the actual connection. Reject plaintext at the edge before a user submits a bearer. Town encrypts the saved peer token and never returns it in the catalog.
+
+Town rechecks the card before sending a task, pins DNS results per operation, and doesn't follow redirects or system HTTP proxies. It allows two outbound operations per server process. This path does not support streaming, OAuth negotiation, tenant-specific A2A interfaces, or scheduling.
+
+## Local proof with OpenClaw, no model account
+
+Don't have a public test agent? [Run the offline OpenClaw check](../scripts/oasis-external-openclaw/README.md#run-a-task-through-town) on your own machine. It sends a task through a native debug Town server and checks the answer against OpenClaw's own task record. It needs neither a model account nor a public endpoint.
+
+## API reference
+
+Start at `/api/nanda/external-agents`. Each request needs the owner's Town login token. Send JSON bodies with `Content-Type: application/json`. The Town login token authenticates **to Town**; the optional `peer_token` is only for the external agent.
+
+| Action | Method and path | Body or result |
 | --- | --- | --- |
-| Preview | `POST /preview` with `card_url` | Name, full endpoint and whether the card declares required bearer auth |
-| Register | `POST` with `card_url`, `expected_endpoint`, `auth_mode` and optional `peer_token` | New private connection and catalog ID (`201`); duplicate registration conflicts |
-| List | `GET` | This owner's connections, without credentials |
-| Invoke | `POST /{id}/tasks` with `text` | `text`, `result_kind` (`task` or `message`), nullable `context_id` and `task_id` |
-| Disconnect | `DELETE /{id}` | `204` |
+| Preview | `POST /preview` | Send `card_url`. Read `name`, `endpoint` and `requires_bearer`. This reads the public card; it doesn't try the credential. |
+| Connect | `POST` to the base path | Send `card_url`, the exact preview `endpoint` as `expected_endpoint`, and `auth_mode` (`none` or `bearer`). Include `peer_token` only for bearer mode. Returns `201`; a duplicate conflicts. |
+| List yours | `GET` on the base path | Returns your connections without credentials. |
+| Send text | `POST /{id}/tasks` | Send `text`. Read `text`, `result_kind` (`task` or `message`), `context_id` and `task_id`. IDs can be null on a direct reply. |
+| Disconnect | `DELETE /{id}` | Returns `204`. |
 
-The generic managed-agent proxy is not changed into an external URL forwarder. A card cannot reroute the outside agent's own model calls or grant MCP access. For the reverse direction, see the [agent-side model and tool gateway instructions](../scripts/oasis-external-openclaw/README.md#if-the-external-agent-wants-to-use-the-oasis-model-or-tool-gateway). Registering an agent does not prove model spend or token savings. This integration does not publish an OpenTelemetry collector.
+For example, once you've connected an addition agent, you can send it a task from a terminal. Set `TOWN_ORIGIN` to your trusted Town HTTPS address, `CONNECTION_ID` to the ID from your connection, and `TOWN_TOKEN` privately to your own Town session token. This example passes the login header through standard input so the token isn't in curl's command line.
 
-If the peer also needs to export its own spans, request a tenant-specific, authenticated OTLP ingestion URL from the hosting operator. Do not point it at internal collector ports or reuse the agent's A2A bearer as a telemetry credential. Public intake, tenant attribution, redaction, rate limits and retention are separate hosting work; sending a task does not depend on them.
+```sh
+printf 'Authorization: Bearer %s\n' "$TOWN_TOKEN" |
+  curl --proto '=https' --fail --silent --show-error --max-time 150 \
+    --header @- --header 'Content-Type: application/json' \
+    --data '{"text":"What is 8 + 9?"}' \
+    "$TOWN_ORIGIN/api/nanda/external-agents/$CONNECTION_ID/tasks"
+```
+
+Read the returned `text` and compare it with the expected answer. If the request times out, check the existing task at the agent before sending another.

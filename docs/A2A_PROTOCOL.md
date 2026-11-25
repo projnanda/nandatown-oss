@@ -2,6 +2,8 @@
 
 Reference for the A2A (Agent-to-Agent) protocol v1.0 as used in Nasiko. Covers the wire protocol, type system, streaming, agent discovery, and how our codebase maps to the spec.
 
+Already have an agent on your own server? [Connect it to Town and send a text task](NANDA_EXTERNAL_A2A.md). That guide lists the parts of A2A supported for external calls.
+
 **Spec version:** 1.0 (Linux Foundation, formerly Google)
 **Rust library:** `a2a-lf` 0.3.0 + `a2a-server-lf` 0.4.0 from [a2aproject/a2a-rs](https://github.com/a2aproject/a2a-rs)
 

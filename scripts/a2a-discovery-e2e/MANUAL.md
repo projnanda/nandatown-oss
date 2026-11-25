@@ -5,18 +5,20 @@ step on your own machine (written for macOS; Linux works the same). Everything s
 scratch folder: a separate `HOME` for the CLI and a separate database, so your `~/.nasiko` and
 your dev database are not touched.
 
+Use only throwaway credentials. The mock provider deliberately logs authorization headers so you can check which test key it received.
+
 To run it all unattended instead: `just infra && just test-discovery`.
 
 ## 0. Once: infra, UI, binaries, scratch folder
 
-Run from the repo's `oss/` folder.
+Start at the root of `nandatown-oss`, with the [native build tools](../../CONTRIBUTING.md), the [project's Node version](../../ui/.nvmrc), and pnpm installed.
 
 ```sh
 export PYTHON=${PYTHON:-python3}
 "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 10), "need Python 3.10+, got " + sys.version'
 
 just infra
-(cd .. && just build-ui)
+(cd ui && pnpm install --frozen-lockfile && VITE_NASIKO_API_MODE=live node scripts/app.ts build oss)
 cargo build -p nasiko -p nasiko-server
 
 export OSS=$PWD
@@ -32,8 +34,8 @@ LangGraph needs Python 3.10 or newer, and macOS's own `python3` is 3.9: if the c
 first (`just test-discovery` reads `PYTHON` too).
 
 `just infra` starts Postgres, Redis and S3 in containers, plus the trace collector, Tempo and
-Loki the control plane reads calls from. `just build-ui` (from the repo root; it needs Node)
-builds the web UI the server embeds; without it the control plane shows "UI not built". `$T` is
+Loki the control plane reads calls from. The command in `ui` builds the dashboard the server
+embeds; without it the control plane shows "UI not built". `$T` is
 the scratch folder (agent, virtualenv, logs, CLI home). `nasiko` is now a shell function that runs the freshly built CLI
 with the scratch `HOME`. Keep this terminal open for every step below.
 
