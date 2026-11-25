@@ -37,7 +37,14 @@ The one-shot control exits after the test. The persistent agent can answer local
 3. Submit the exact fixture question **through Oasis**, once. Confirm that OpenClaw received that run and the returned task has one text artifact equal to `17`. Correlate the task IDs on both sides (record the mapping if different). For another agent, establish its own expected result first. A direct call or a listing in the UI is not a substitute.
 4. Capture the first step that failed, or the successful result and rerun instructions. Include only synthetic inputs, non-secret identifiers and the observed result. If the remote outcome is unknown, look up the existing task rather than sending the question again.
 
-For model or tool traffic **from** a local agent **into** Oasis, use the existing [LangGraph/CrewAI setup guide](../a2a-discovery-e2e/MANUAL.md#5-connect). On a disposable developer machine, `nasiko agents discover` inventories local agents and reports their cards to the active cluster when logged in. `nasiko connect <discovered-name>` walks the owner through choosing which model calls to route and whether to grant MCP access. Review the target cluster and file before confirming; the generated settings contain credentials. The agent must load those settings and use an MCP client to call tools. Neither command lets Oasis call an arbitrary internet agent. Public OpenTelemetry ingestion is a separate deployment decision; it is not needed to compare the task results.
+## If the external agent wants to use the Oasis model or tool gateway
+
+This traffic runs in the opposite direction. On a disposable developer machine, `nasiko agents discover` inventories local agents and reports their cards to the active cluster when logged in. `nasiko connect <discovered-name>` walks the owner through choosing which model calls to route and whether to grant MCP access. Review the target cluster and file before confirming; the generated settings contain credentials. Use only throwaway credentials with the [sample lab](../a2a-discovery-e2e/MANUAL.md#5-connect): its mock model server logs the authorization header.
+
+- **Model calls:** the [sample LangGraph planner](../a2a-discovery-e2e/langgraph/graph.py) needs no code change. Restart it with `OPENAI_BASE_URL=<Oasis origin>/v1` and the **agent-specific Oasis token** as `OPENAI_API_KEY`, supplied through its private environment. Send one message to the planner. As the owner, check its answer and the input/output token counts for that catalog agent in FinOps. The agent does not need the platform's provider key.
+- **Tool calls:** load the separate `MCP_GATEWAY_URL` and `MCP_GATEWAY_TOKEN` into an MCP client, as in the [LangGraph snippet](../a2a-discovery-e2e/mcp_langgraph.py). A successful tool list is not a successful tool invocation; check the result of a known, permitted tool.
+
+Neither configuration lets Oasis invoke the external agent. These checks do not require a public OpenTelemetry collector or establish lower costs.
 
 ## Optional: one real model answer
 
