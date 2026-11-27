@@ -138,7 +138,7 @@ export function MyAgentsPage({
         <>
           {copy.deployHint}{' '}
           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[0.85em]">
-            nandatown deploy
+            nasiko deploy
           </code>
         </>
       }
@@ -527,7 +527,7 @@ function AgentRow({
             {display !== 'harness' ? (
               <>
                 <DropdownMenuSeparator />
-                <CopyMenuItem text={`nandatown logs ${agent.id}`} />
+                <CopyMenuItem text={`nasiko logs ${agent.id}`} />
               </>
             ) : null}
           </DropdownMenuContent>

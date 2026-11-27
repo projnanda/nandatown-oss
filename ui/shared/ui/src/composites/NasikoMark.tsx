@@ -22,9 +22,13 @@ export function NasikoMark({ className }: { className?: string }) {
  */
 export function NasikoLockup({ className }: { className?: string }) {
   return (
-    <span role="img" aria-label="Nandatown" className={cn('inline-flex items-center gap-[0.35em] text-[1.1em]', className)}>
+    <span
+      role="img"
+      aria-label="Nandatown"
+      className={cn('inline-flex items-center gap-[0.35em] text-[1.1em]', className)}
+    >
       <NasikoMark className="aspect-square h-full w-auto text-logo" />
-      <span aria-hidden className="font-semibold leading-none tracking-tight">
+      <span aria-hidden className="leading-none font-semibold tracking-tight">
         Nandatown
       </span>
     </span>

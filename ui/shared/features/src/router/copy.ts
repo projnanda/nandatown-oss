@@ -157,7 +157,7 @@ export const copy = {
   notRoutable: (p: string) =>
     `The router can’t call ${p}: it isn’t built in or a registered custom provider.`,
   registryTitle: 'Models the router picks per tier',
-  registryWayOut: 'Superusers change these with nandatown model-registry set.',
+  registryWayOut: 'Superusers change these with nasiko model-registry set.',
   registryEmpty: 'No tier models set',
   tierLabels: ['Advanced reasoning', 'Balanced', 'Fast responses'] as const,
   catalogFailed: 'Couldn’t load the provider catalog',

@@ -143,14 +143,14 @@ describe('browser: the command, no consent', () => {
       within(c).getByRole('heading', { name: 'Bring in your coding harnesses' }),
     ).toBeInTheDocument()
     expect(
-      within(c).getByText(`curl -fsSL ${window.location.origin}/install.sh | bash`),
+      within(c).getByText('curl -fsSL https://registry.nasiko.com/r/nasiko/install | bash'),
     ).toBeInTheDocument()
-    expect(within(c).getByText(/^nandatown connect /)).toBeInTheDocument()
+    expect(within(c).getByText(/^nasiko connect /)).toBeInTheDocument()
     expect(within(c).getByRole('button', { name: 'Copy: Install the CLI' })).toBeInTheDocument()
     expect(
       within(c).getByRole('button', { name: 'Copy: Connect it to this server' }),
     ).toBeInTheDocument()
-    expect(within(c).queryByText('nandatown agents setup')).toBeNull()
+    expect(within(c).queryByText('nasiko agents setup')).toBeNull()
     expect(within(c).queryByRole('button', { name: 'Yes, find my agents' })).toBeNull()
     await summary()
     // The card carries the same command, so the CLI panel steps aside.
@@ -267,7 +267,7 @@ describe('browser: progress from the server', () => {
     expect(
       within(c).getByText(agentRow('Claude Code, Import failed: disk read error')),
     ).toBeInTheDocument()
-    expect(within(c).getByText('nandatown agents setup')).toBeInTheDocument()
+    expect(within(c).getByText('nasiko agents setup')).toBeInTheDocument()
   })
 
   it('the live fallback (usage endpoint absent) shows a run too', async () => {

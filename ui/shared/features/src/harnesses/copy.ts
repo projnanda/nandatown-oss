@@ -17,7 +17,7 @@ export const copy = {
   loading: 'Loading harness usage',
   registered: 'Registered',
   registeredTip:
-    'A harness is registered when its agent row exists: `nandatown agents install` creates it, and so does `nandatown connect`, `use` or `auth login` for every harness found on the machine. Uninstalling keeps the row, so registered can overstate real use.',
+    'A harness is registered when its agent row exists: `nasiko agents install` creates it, and so does `nasiko connect`, `use` or `auth login` for every harness found on the machine. Uninstalling keeps the row, so registered can overstate real use.',
   // Not "cost" (user 2026-11-06): a subscription seat pays a flat fee, so this was never spent.
   estCost: 'API value',
   estCostTip:
@@ -64,14 +64,14 @@ export const copy = {
 
   // Onboarding (viewer only).
   connectSteps: (server: string, harness: string) => [
-    `nandatown connect ${server}`,
-    'nandatown auth login',
-    `nandatown agents install ${harness}`,
+    `nasiko connect ${server}`,
+    'nasiko auth login',
+    `nasiko agents install ${harness}`,
   ],
   connectHint:
-    'The harness must be installed on this machine. `nandatown auth login` registers every harness it finds; `agents install` is the fallback.',
+    'The harness must be installed on this machine. `nasiko auth login` registers every harness it finds; `agents install` is the fallback.',
   // FR-11: a local coding agent needs the Nasiko CLI on that machine.
-  needsCli: 'These run in the Nandatown CLI.',
+  needsCli: 'These run in the Nasiko CLI.',
   installCli: 'Install the CLI',
   askToConnect: (name: string, harness: string) => `Ask ${name} to connect ${harness}.`,
 
@@ -86,7 +86,7 @@ export const copy = {
     idle: 'Your coding agents are not being imported right now.',
     // Browser: running the command is the consent.
     commandBody: 'To discover your coding agents and load your previous sessions, run:',
-    command: 'nandatown agents setup',
+    command: 'nasiko agents setup',
     copyCommand: 'Copy command',
     thisComputer: 'This computer',
     actionFailed: (detail: string | null) =>
@@ -186,7 +186,7 @@ export const copy = {
       "Nandatown syncs your coding agents' usage — tokens, cost, latency, models, tools and subagents — never their chat history. Prompts, responses and tool output stay on your computer.",
     localTitle: 'Chat history can sync to this Nandatown',
     localBody:
-      "This Nandatown keeps chat history, so `nandatown connect` asks whether to sync your coding agents' prompts, responses and tool output too. Say no to sync usage only — tokens, cost, latency, models, tools and subagents.",
+      "This Nandatown keeps chat history, so `nasiko connect` asks whether to sync your coding agents' prompts, responses and tool output too. Say no to sync usage only — tokens, cost, latency, models, tools and subagents.",
   },
   // Monitor's note while the desktop app imports coding agents (components/ImportNotice.tsx).
   importNotice: {
@@ -219,7 +219,7 @@ export const copy = {
     routedVia: (config: string) => `Routed through Nandatown · ${config}`,
     routedViaDefault: (config: string) => `Routed through Nandatown · your default (${config})`,
     routed: 'Routed through Nandatown',
-    byCli: 'Connected with the Nandatown CLI. Connecting here takes it over.',
+    byCli: 'Connected with the Nasiko CLI. Connecting here takes it over.',
     changed: 'Its settings changed since it was connected. Connect again to repair them.',
     noMcp: 'MCP tools are not connected.',
     connect: 'Connect',
