@@ -1477,13 +1477,14 @@ pub struct FinopsUserAgentSpend {
 impl ObservabilityService {
     /// Per-turn tokens + cost for a chat session (its A2A contextId), read from
     /// the `token_usage` ledger joined to `flows`, grouped by flow (one row per
-    /// turn). Scoped to `user_id` unless `is_superuser`. This is the authoritative
-    /// per-turn view and does not depend on the Tempo materializer.
+    /// turn). `title` is drawn from the turn's own prompt (`flows.title`), so this is
+    /// conversation content, not an aggregate: scoped to the session's own user,
+    /// never a superuser bypass — same rule as `authorize_session`. This is the
+    /// authoritative per-turn view and does not depend on the Tempo materializer.
     pub async fn get_session_turns(
         &self,
         context_id: &str,
         user_id: &str,
-        is_superuser: bool,
     ) -> Result<SessionTurnsResponse, ObservabilityError> {
         let turns = sqlx::query_as::<_, TurnUsage>(
             r#"SELECT f.title                         AS title,
@@ -1505,13 +1506,12 @@ impl ObservabilityService {
                        FROM trace_totals) t
                JOIN flows f ON f.flow_id = t.session_id
                WHERE f.session_id = $1
-                 AND ($3 OR f.user_id = $2::uuid)
+                 AND f.user_id = $2::uuid
                GROUP BY f.flow_id, f.title, t.session_id
                ORDER BY turn_start"#,
         )
         .bind(context_id)
         .bind(user_id)
-        .bind(is_superuser)
         .fetch_all(&self.db)
         .await
         .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
@@ -1713,6 +1713,10 @@ impl ObservabilityService {
                SELECT s.*, COALESCE(h.platform, false) AS platform
                FROM s LEFT JOIN h USING (agent_name)"#,
         )
+        // Unprepared, like every usage read here with an optional filter: a prepared statement
+        // gets Postgres's generic plan from its sixth run, which can't tell `$n IS NULL` from a
+        // value, never uses the user index, and reads every caller's rows in the window.
+        .persistent(false)
         .bind(start)
         .bind(end)
         .bind(agent_name)
@@ -1838,11 +1842,16 @@ impl ObservabilityService {
         })
     }
 
+    /// A session's own conversation (detail, trace, span, turns) is readable only by the user who
+    /// had it — never a superuser bypass. This is deliberately stricter than `session/list`'s
+    /// scope (`sessions_sql::scope_clause`), which a superuser still queries unscoped for
+    /// ops/cost triage: that endpoint reports `first_input`/`last_output` as "(private)" for a row
+    /// it doesn't own, rather than refusing the row outright, because the fleet-wide status/cost
+    /// view has to keep listing it. This one has nothing to show but that content, so it 404s.
     async fn authorize_session(
         &self,
         session_id: &str,
         user_id: &str,
-        is_superuser: bool,
         resource: &str,
     ) -> Result<(DateTime<Utc>, DateTime<Utc>), ObservabilityError> {
         let caller: uuid::Uuid = user_id
@@ -1850,11 +1859,9 @@ impl ObservabilityService {
             .map_err(|_| ObservabilityError::Internal("invalid user id in claims".into()))?;
         sqlx::query_as(
             r#"SELECT created_at, updated_at FROM chat_sessions
-               WHERE session_id = $1 AND deleted_at IS NULL
-                 AND ($2 OR user_id = $3)"#,
+               WHERE session_id = $1 AND deleted_at IS NULL AND user_id = $2"#,
         )
         .bind(session_id)
-        .bind(is_superuser)
         .bind(caller)
         .fetch_optional(&self.db)
         .await
@@ -1866,9 +1873,8 @@ impl ObservabilityService {
         &self,
         session_id: &str,
         user_id: &str,
-        is_superuser: bool,
     ) -> Result<(), ObservabilityError> {
-        self.authorize_session(session_id, user_id, is_superuser, "session")
+        self.authorize_session(session_id, user_id, "session")
             .await
             .map(|_| ())
     }
@@ -1957,14 +1963,13 @@ impl ObservabilityService {
         cursor: Option<&str>,
         parent: Option<&str>,
     ) -> Result<SessionListResponse, ObservabilityError> {
-        let caller =
-            if is_superuser {
-                None
-            } else {
-                Some(user_id.parse::<uuid::Uuid>().map_err(|_| {
-                    ObservabilityError::Internal("invalid user id in claims".into())
-                })?)
-            };
+        let viewer = user_id
+            .parse::<uuid::Uuid>()
+            .map_err(|_| ObservabilityError::Internal("invalid user id in claims".into()))?;
+        // A superuser's query is unscoped (ops/cost triage needs the whole fleet), but that only
+        // ever widens which ROWS come back — `Row::into_summary` still redacts a row's own
+        // conversation content unless `viewer` is that row's `user_id`.
+        let caller = if is_superuser { None } else { Some(viewer) };
         let limit = limit.unwrap_or(DEFAULT_SESSION_PAGE).clamp(1, 100);
         let status = status
             .map(super::sessions_sql::StatusFilter::parse)
@@ -2012,6 +2017,7 @@ impl ObservabilityService {
             &self.db,
             &super::sessions_sql::SessionListQuery {
                 caller,
+                viewer,
                 start,
                 end,
                 status,
@@ -2117,9 +2123,8 @@ impl ObservabilityService {
         &self,
         session_id: &str,
         user_id: &str,
-        is_superuser: bool,
     ) -> Result<SessionDetailResponse, ObservabilityError> {
-        self.authorize_session(session_id, user_id, is_superuser, "session")
+        self.authorize_session(session_id, user_id, "session")
             .await?;
         // An orchestrator-routed session has no agent of its own; name the one that did the work.
         let ran_agent = super::sessions_sql::ran_agent_name("cs.session_id");
@@ -2319,7 +2324,6 @@ impl ObservabilityService {
         &self,
         trace_id: &str,
         user_id: &str,
-        is_superuser: bool,
     ) -> Result<TraceDetailResponse, ObservabilityError> {
         // Tempo first; when it no longer has the trace (retention, seeded or tiered
         // turns), rebuild it from the flow + `trace_usage` rows, hot + cold.
@@ -2350,7 +2354,7 @@ impl ObservabilityService {
             .spans
             .retain(|span| seen_spans.insert(span.span_id.clone()));
         let project_session_id = self.trace_session_id(trace_id, &trace).await?;
-        self.authorize_session(&project_session_id, user_id, is_superuser, "trace")
+        self.authorize_session(&project_session_id, user_id, "trace")
             .await?;
 
         let from_sql = sql_cost.is_some();
@@ -2435,7 +2439,6 @@ impl ObservabilityService {
         trace_id: &str,
         span_id: &str,
         user_id: &str,
-        is_superuser: bool,
     ) -> Result<SpanDetailResponse, ObservabilityError> {
         // Resolve and authorize the trace's session before looking up the span
         // or its Loki content, so inaccessible traces reveal no span existence.
@@ -2456,8 +2459,7 @@ impl ObservabilityService {
                 }
                 other => other,
             })?;
-        self.authorize_session(&session_id, user_id, is_superuser, "span")
-            .await?;
+        self.authorize_session(&session_id, user_id, "span").await?;
         let details = if from_sql {
             let span = trace
                 .spans
@@ -2670,6 +2672,7 @@ impl ObservabilityService {
                WHERE agent_name = $1 AND started_at >= $2 AND started_at < $3
                  AND ($4::uuid[] IS NULL OR user_id = ANY($4))"#,
         )
+        .persistent(false)
         .bind(agent_id)
         .bind(start)
         .bind(end)
@@ -2777,12 +2780,13 @@ impl ObservabilityService {
         let prev_end = start;
         let prev_start = start - window_len;
 
-        let mut hours_rows = hours_meter::windowed_agent_hours(&self.db, start, now, None)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "container hours aggregation failed");
-                vec![]
-            });
+        let mut hours_rows =
+            hours_meter::windowed_agent_hours(&self.db, start, now, accessible_agent_ids)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "container hours aggregation failed");
+                    vec![]
+                });
         if let Some(accessible) = &accessible {
             hours_rows.retain(|row| accessible.contains(&row.agent_id));
         }
@@ -2796,12 +2800,13 @@ impl ObservabilityService {
         if !dropped_internal.is_empty() {
             hours_rows.retain(|row| !dropped_internal.contains(&row.agent_id));
         }
-        let mut minutes_rows = sandbox_meter::windowed_sandbox_minutes(&self.db, start, now)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "sandbox minutes aggregation failed");
-                vec![]
-            });
+        let mut minutes_rows =
+            sandbox_meter::windowed_sandbox_minutes(&self.db, start, now, accessible_agent_ids)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "sandbox minutes aggregation failed");
+                    vec![]
+                });
         if let Some(accessible) = &accessible {
             minutes_rows.retain(|row| accessible.contains(&row.agent_id));
         }
@@ -2912,6 +2917,7 @@ impl ObservabilityService {
 
         // 1. Current window
         let current_rows: Vec<TraceUsageAgg> = sqlx::query_as(TRACE_USAGE_AGG_QUERY)
+            .persistent(false)
             .bind(start)
             .bind(now)
             .bind(agent_filter)
@@ -2929,6 +2935,7 @@ impl ObservabilityService {
 
         // 2. Previous window (for KPI %-change)
         let prev_rows: Vec<TraceUsageAgg> = sqlx::query_as(TRACE_USAGE_AGG_QUERY)
+            .persistent(false)
             .bind(prev_start)
             .bind(prev_end)
             .bind(agent_filter)
@@ -2962,6 +2969,7 @@ impl ObservabilityService {
                       OR (user_id = $8 AND (agent_name = ANY($9) OR agent_name LIKE $10)))
                GROUP BY agent_name"#,
         )
+        .persistent(false)
         .bind(last_24h)
         .bind(agent_filter)
         .bind(model_filter)
@@ -2993,6 +3001,7 @@ impl ObservabilityService {
                  AND ($8::TEXT[] IS NULL OR agent_name = ANY($8)
                       OR (user_id = $9 AND (agent_name = ANY($10) OR agent_name LIKE $11)))"#,
         )
+        .persistent(false)
         .bind(start)
         .bind(now)
         .bind(agent_filter)
@@ -3033,6 +3042,7 @@ impl ObservabilityService {
                GROUP BY s.user_id, u.username, u.email
                ORDER BY total_cost DESC, total_tokens DESC, s.user_id"#,
         )
+        .persistent(false)
         .bind(start)
         .bind(now)
         .bind(agent_filter)
@@ -3466,6 +3476,7 @@ impl ObservabilityService {
 
         let fetch = |from: DateTime<Utc>, to: DateTime<Utc>| {
             sqlx::query_as::<_, BucketRow>(&query)
+                .persistent(false)
                 .bind(from)
                 .bind(to)
                 .bind(agent_name)
@@ -3582,6 +3593,7 @@ impl ObservabilityService {
         );
 
         let rows: Vec<SeriesRow> = sqlx::query_as(&query)
+            .persistent(false)
             .bind(start)
             .bind(end)
             .bind(agent_name)
@@ -3693,6 +3705,7 @@ impl ObservabilityService {
                GROUP BY DATE(ts)
                ORDER BY date"#,
         )
+        .persistent(false)
         .bind(month_start)
         .bind(next_month)
         .bind(agent_name)
@@ -3785,6 +3798,7 @@ impl ObservabilityService {
                GROUP BY hour, agent_name
                ORDER BY hour"#,
         )
+        .persistent(false)
         .bind(day_start)
         .bind(day_end)
         .bind(agent_name)
@@ -4282,7 +4296,11 @@ Data: {}"#,
 
         let accessible: Option<HashSet<uuid::Uuid>> =
             accessible_agent_ids.map(|ids| ids.iter().copied().collect());
-        let mut rows = hours_meter::windowed_agent_hours(&self.db, start, end, agent_filter)
+        let agents = match &agent_filter {
+            Some(id) => Some(std::slice::from_ref(id)),
+            None => accessible_agent_ids,
+        };
+        let mut rows = hours_meter::windowed_agent_hours(&self.db, start, end, agents)
             .await
             .map_err(|e| ObservabilityError::Internal(e.to_string()))?;
         if let Some(accessible) = &accessible {

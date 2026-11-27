@@ -394,6 +394,10 @@ cli/src/commands/chat.rs
 cli/src/commands/claude.rs
 cli/src/commands/cluster.rs
 cli/src/commands/codex.rs
+cli/src/commands/coding_agent_mcp/claude_mcp.rs
+cli/src/commands/coding_agent_mcp/codex_mcp.rs
+cli/src/commands/coding_agent_mcp/mod.rs
+cli/src/commands/coding_agent_mcp/opencode_mcp.rs
 cli/src/commands/coding_agent_router.rs
 cli/src/commands/context_selection.rs
 cli/src/commands/deploy.rs
@@ -564,6 +568,7 @@ flow/src/events.rs
 flow/src/guard.rs
 flow/src/lib.rs
 flow/tests/flow_context.rs
+flow/tests/flow_events.rs
 flow/tests/flow_guard.rs
 flow/tests/traceparent.rs
 github/Cargo.toml
@@ -586,7 +591,6 @@ harness-shim/src/main.rs
 harness-shim/src/procstats.rs
 harness-shim/src/reaper.rs
 harness-shim/src/server.rs
-harness-shim/src/supervisor/confine.rs
 harness-shim/src/supervisor/mod.rs
 harness-shim/src/supervisor/routes.rs
 harness-shim/src/supervisor/session.rs
@@ -614,6 +618,8 @@ hitl/tests/repo.rs
 hitl/tests/store.rs
 init-databases.sql
 justfile
+leader/Cargo.toml
+leader/src/lib.rs
 llm-router/CLASSIFIER.md
 llm-router/Cargo.toml
 llm-router/Dockerfile
@@ -855,6 +861,9 @@ migrations/0108_cost_usd_over_100.sql
 migrations/0109_tool_calls_agent_index.sql
 migrations/0110_discovered_agents.sql
 migrations/0111_discovered_agent_instances.sql
+migrations/0112_oci_upload_parts.sql
+migrations/0113_oci_upload_staged_parts.sql
+migrations/0114_retire_platform_harness_agents.sql
 migrations/storage-classes.txt
 observability/Cargo.toml
 observability/config/otel-collector.yaml
@@ -966,6 +975,7 @@ runtime/src/docker/sandbox.rs
 runtime/src/docker/stats.rs
 runtime/src/docker_sandbox_connect.rs
 runtime/src/error.rs
+runtime/src/harness_agent.rs
 runtime/src/lib.rs
 runtime/src/sandbox.rs
 runtime/src/sandbox_fake.rs
@@ -1105,6 +1115,7 @@ server/src/coding_agent_usage.rs
 server/src/composio_settings.rs
 server/src/context_selection.rs
 server/src/current_time.rs
+server/src/dashboard_limit.rs
 server/src/embedding_change.rs
 server/src/error_reporting/config.rs
 server/src/error_reporting/mod.rs
@@ -1117,6 +1128,7 @@ server/src/github.rs
 server/src/hitl/continuation.rs
 server/src/hitl/lost_task.rs
 server/src/hitl/mod.rs
+server/src/invalidation.rs
 server/src/lib.rs
 server/src/llm_configs.rs
 server/src/llm_router/custom_providers.rs
@@ -1143,6 +1155,7 @@ server/src/mcp/handlers/webhooks.rs
 server/src/mcp/identity.rs
 server/src/mcp/mod.rs
 server/src/mcp/openapi.rs
+server/src/mcp/search_sync.rs
 server/src/mcp/service.rs
 server/src/mcp/wiring.rs
 server/src/multipart_util.rs
@@ -1198,19 +1211,23 @@ server/src/sessions/keys.rs
 server/src/sessions/live.rs
 server/src/sessions/mod.rs
 server/src/sessions/model.rs
+server/src/sessions/own_agent.rs
 server/src/sessions/pending.rs
 server/src/sessions/profile.rs
+server/src/sessions/readiness.rs
 server/src/sessions/reaper.rs
 server/src/sessions/reaper/agents.rs
 server/src/sessions/reaper/workloads.rs
 server/src/sessions/routes.rs
 server/src/sessions/scratch.rs
+server/src/sessions/start.rs
 server/src/sessions/suspend.rs
 server/src/sessions/tasks.rs
 server/src/sessions/teardown.rs
 server/src/sessions/token.rs
 server/src/sessions/turn.rs
 server/src/settings.rs
+server/src/shutdown.rs
 server/src/spend_gate.rs
 server/src/state.rs
 server/src/telemetry/agent_replicas.rs
@@ -1219,6 +1236,7 @@ server/src/telemetry/context_report.rs
 server/src/telemetry/flow_span.rs
 server/src/telemetry/genai.rs
 server/src/telemetry/mod.rs
+server/src/telemetry/server_load.rs
 server/src/telemetry/setup.rs
 server/src/telemetry/tool_result_savings.rs
 server/src/titling.rs
@@ -1283,6 +1301,7 @@ server/tests/compact_tools_usage.rs
 server/tests/composio_settings.rs
 server/tests/cost_path_differential.rs
 server/tests/cross_origin_writes.rs
+server/tests/custom_provider_access.rs
 server/tests/deploy_env.rs
 server/tests/direct_turn_budget_refusal.rs
 server/tests/discovered_agents.rs
@@ -1306,6 +1325,7 @@ server/tests/harness_turn_e2e.rs
 server/tests/hitl.rs
 server/tests/hitl_agent_lost_task.rs
 server/tests/hitl_agent_proxy_session_id.rs
+server/tests/hitl_continuation_replicas.rs
 server/tests/hitl_cross_user_mirror_hijack.rs
 server/tests/hitl_flow_step_resumed.rs
 server/tests/hitl_orchestrator_pause.rs
@@ -1325,6 +1345,7 @@ server/tests/live_trace_spend.rs
 server/tests/llm_config_cache.rs
 server/tests/llm_owner_transfer.rs
 server/tests/llm_router_body_limits.rs
+server/tests/login_log_line.rs
 server/tests/maf_flow.rs
 server/tests/maf_hitl_discovery.rs
 server/tests/maf_step_flow_retry.rs
@@ -1364,6 +1385,7 @@ server/tests/oci_owner_namespace.rs
 server/tests/oci_pull_credentials.rs
 server/tests/oci_repo_ownership.rs
 server/tests/oci_upload_limits.rs
+server/tests/oci_upload_replicas.rs
 server/tests/orchestrator_session_isolation.rs
 server/tests/orchestrator_usage.rs
 server/tests/overview.rs
@@ -1629,7 +1651,6 @@ ui/shared/app-shell/src/shell/signOut.chunk.test.ts
 ui/shared/app-shell/src/shell/signOut.test.ts
 ui/shared/app-shell/src/shell/signOut.ts
 ui/shared/data-access/package.json
-ui/shared/data-access/src/auth.lockout.test.ts
 ui/shared/data-access/src/auth.ts
 ui/shared/data-access/src/client.test.ts
 ui/shared/data-access/src/client.ts
